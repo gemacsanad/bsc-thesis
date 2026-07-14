@@ -1,0 +1,27 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+# Same CUDA/PyTorch base as the DTGB container (proven on Komondor A100s).
+# torch + CUDA + numpy<2 come from the base — do NOT reinstall them.
+
+%labels
+    Author gemacsanad
+    Description baseline GPU container - ogbn-arxiv abstract generation (8-bit LLM + LoRA)
+
+%environment
+    export LC_ALL=C
+    export PYTHONUNBUFFERED=1
+    export HF_HUB_DISABLE_TELEMETRY=1
+
+%post
+    pip install --no-cache-dir \
+        transformers==4.39.3 \
+        peft==0.10.0 \
+        accelerate==0.29.3 \
+        bitsandbytes==0.43.1 \
+        sentencepiece==0.2.0 \
+        protobuf==4.25.3 \
+        pandas==2.2.2
+
+%runscript
+    cd /app
+    exec python "$@"
