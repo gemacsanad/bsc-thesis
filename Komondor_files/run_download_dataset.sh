@@ -27,13 +27,24 @@ VENV_DIR=$BASE_DIR/.venv_s2_download
 
 mkdir -p "$DATA_DIR" "$BASE_DIR/logs"
 
+# The node's default python3 is too old for duckdb>=0.10 (only wheels up to
+# 0.8.1 are available for it), so load a newer Python module first.
+module load cray-python/3.11.7
+
 # Set up a small venv for the download scripts (requests/duckdb/dotenv only)
 # - lightweight enough not to need the GPU singularity container used by
 # run_generate.sh/run_train_graphsage_full.sh.
-if [ ! -d "$VENV_DIR" ]; then
+# Use a marker file (only touched after a successful `pip install`) rather
+# than just checking the venv directory exists, so a venv left behind by a
+# previous run that failed mid-install (e.g. missing packages) gets rebuilt
+# instead of being reused as-is.
+SETUP_MARKER="$VENV_DIR/.setup_complete"
+if [ ! -f "$SETUP_MARKER" ]; then
+    rm -rf "$VENV_DIR"
     python3 -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --upgrade pip
     "$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
+    touch "$SETUP_MARKER"
 fi
 
 cd "$SCRIPT_DIR"

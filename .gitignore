@@ -3,6 +3,7 @@
 
 # Secrets
 .env
+Download_script/.env
 
 # Python
 __pycache__/
@@ -35,3 +36,5 @@ logs/
 
 # DuckDB scratch space
 duckdb_tmp/
+
+joint_dataset

@@ -7,6 +7,12 @@ shard files themselves are pre-signed URLs and are downloaded directly,
 with byte-level resume support so an interrupted run can just be
 re-executed.
 
+Shard URLs expire (pre-signed S3 URLs, commonly after roughly an hour).
+For datasets with many/large shards, downloading them one after another
+can easily exceed that window, so a fresh URL list is fetched right
+before each shard (not once for the whole dataset up front), and any
+403 (expired URL) encountered mid-download triggers another refetch.
+
 We need three datasets to build a mag_id-keyed (paper -> abstract,
 references) view without any full text:
   - papers     : per-paper metadata, incl. externalids.MAG -> used to
@@ -21,6 +27,7 @@ Usage:
 
 import argparse
 import os
+import time
 
 from s2_common import get_latest_release, get_dataset_files, download_file_resumable
 
@@ -38,20 +45,41 @@ def main():
     args = ap.parse_args()
 
     release_id = args.release or get_latest_release()
-    print(f"Using release: {release_id}")
+    print(f"Using release: {release_id}", flush=True)
 
     for dataset in args.datasets:
-        print(f"\n--- {dataset} ---")
+        print(f"\n--- {dataset} ---", flush=True)
         files = get_dataset_files(release_id, dataset)
+        n_files = len(files)
         raw_dir = os.path.join(args.out_dir, "raw", dataset)
         os.makedirs(raw_dir, exist_ok=True)
-        print(f"  {len(files)} shards -> {raw_dir}")
+        print(f"  {n_files} shards -> {raw_dir}", flush=True)
 
-        for i, url in enumerate(files):
+        dataset_start = time.monotonic()
+        for i in range(n_files):
             dest = os.path.join(raw_dir, f"{i:03d}.jsonl.gz")
-            download_file_resumable(url, dest)
+            label = f"{dataset} {i + 1:03d}/{n_files:03d}"
 
-    print("\nAll requested datasets downloaded.")
+            # Fetch a fresh URL right before downloading this shard rather
+            # than reusing the list fetched at the top of the dataset loop,
+            # since that list can be stale/expired by the time we get here.
+            url = get_dataset_files(release_id, dataset)[i]
+            refresher = lambda i=i: get_dataset_files(release_id, dataset)[i]  # noqa: E731
+
+            download_file_resumable(url, dest, label=label, url_refresher=refresher)
+
+            elapsed = time.monotonic() - dataset_start
+            done = i + 1
+            avg_per_shard = elapsed / done
+            eta = avg_per_shard * (n_files - done)
+            print(f"  {dataset}: {done}/{n_files} shards done "
+                  f"(elapsed {time.strftime('%H:%M:%S', time.gmtime(elapsed))}, "
+                  f"ETA {time.strftime('%H:%M:%S', time.gmtime(eta))})", flush=True)
+
+        print(f"  {dataset}: all {n_files} shards complete "
+              f"in {time.strftime('%H:%M:%S', time.gmtime(time.monotonic() - dataset_start))}", flush=True)
+
+    print("\nAll requested datasets downloaded.", flush=True)
 
 
 if __name__ == "__main__":
