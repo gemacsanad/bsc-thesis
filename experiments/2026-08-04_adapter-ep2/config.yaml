@@ -1,0 +1,32 @@
+# What produced experiments/2026-08-04_adapter-ep2/generations.csv
+run: 2026-08-04_adapter-ep2
+condition: adapter          # GraphSAGE + prefix adapter + frozen Vicuna-7B
+date: 2026-08-04
+
+generation:
+  script: src/adapter/generate.py --mode adapter
+  checkpoint: checkpoints/epoch2.pt      # 2 epochs over the 4,000-node train subset
+  llm: lmsys/vicuna-7b-v1.5              # frozen; the prefix is the only trainable channel
+  dtype: bfloat16
+  decoding: greedy                       # do_sample=False, so reruns reproduce
+  max_new_tokens: 256
+  batch_size: 1
+  prefix_tokens: 10
+  max_length: 4096                       # prefix tokens are charged against the context
+
+data:
+  eval_nodes: data/frozen/eval_nodes.json    # 495 nodes, 45 at each out-degree 5-15
+  graph: data/processed/joint               # nodes.csv, edges.csv, node_embeddings.npy
+  prompt: 1-hop reference titles + abstracts; the target's own title is NOT shown
+
+scoring:
+  script: src/evaluation/evaluate_results.py
+  metrics: [rouge1_f, rouge2_f, rougeL_f, bertscore_p, bertscore_r, bertscore_f1]
+  llm_judge:
+    model: gpt-5.4-mini
+    scores: [llm_accuracy, llm_coherence, llm_language]   # 1-10, each with a free-text reason
+
+results:
+  rows: 495
+  error_rows: 63            # prompt over the 4,096-token context; skipped by the evaluator
+  scorable_rows: 432

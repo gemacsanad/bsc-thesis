@@ -1,0 +1,38 @@
+# What produced experiments/2026-08-04_vicuna-baseline/generations.csv
+#
+# The control for 2026-08-04_adapter-ep2. Same nodes, same prompts, same order, same
+# decoding — the ONLY difference is that no graph-conditioned KV prefix is injected.
+# Regenerated rather than reusing _archive/vicuna-7b-8bit, which sampled at temperature
+# 0.35 in 8-bit and is therefore not a drop-in comparison.
+run: 2026-08-04_vicuna-baseline
+condition: baseline         # frozen Vicuna-7B, no prefix
+date: 2026-08-04
+
+generation:
+  script: src/adapter/generate.py --mode baseline
+  checkpoint: null
+  llm: lmsys/vicuna-7b-v1.5
+  dtype: bfloat16
+  decoding: greedy
+  max_new_tokens: 256
+  batch_size: 1
+  prefix_tokens: 10         # charged against the context in BOTH modes, so the two
+                            # files carry identical ERROR rows and compare on 432 nodes
+  max_length: 4096
+
+data:
+  eval_nodes: data/frozen/eval_nodes.json
+  graph: data/processed/joint
+  prompt: 1-hop reference titles + abstracts; the target's own title is NOT shown
+
+scoring:
+  script: src/evaluation/evaluate_results.py
+  metrics: [rouge1_f, rouge2_f, rougeL_f, bertscore_p, bertscore_r, bertscore_f1]
+  llm_judge:
+    model: gpt-5.4-mini
+    scores: [llm_accuracy, llm_coherence, llm_language]
+
+results:
+  rows: 495
+  error_rows: 63
+  scorable_rows: 432
