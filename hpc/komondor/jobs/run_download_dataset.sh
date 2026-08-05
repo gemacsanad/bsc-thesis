@@ -22,10 +22,12 @@ set -euo pipefail
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SCRIPT_DIR=$BASE_DIR/src/data/s2
-DATA_DIR=$BASE_DIR/data/processed/s2
+RAW_DIR=$BASE_DIR/data/raw/s2
+PROC_DIR=$BASE_DIR/data/processed/s2
+TMP_DIR=$BASE_DIR/duckdb_tmp
 VENV_DIR=$BASE_DIR/.venv_s2_download
 
-mkdir -p "$DATA_DIR" "$BASE_DIR/logs"
+mkdir -p "$RAW_DIR" "$PROC_DIR" "$BASE_DIR/logs"
 
 # The node's default python3 is too old for duckdb>=0.10 (only wheels up to
 # 0.8.1 are available for it), so load a newer Python module first.
@@ -50,15 +52,15 @@ fi
 cd "$SCRIPT_DIR"
 
 echo "[1/2] Downloading raw shards (papers, abstracts, citations)..."
-"$VENV_DIR/bin/python" download_shards.py --out-dir "$DATA_DIR"
+"$VENV_DIR/bin/python" download_shards.py --out-dir "$RAW_DIR"
 
 echo "[2/2] Building consolidated mag_id-keyed papers.parquet / references.parquet..."
 "$VENV_DIR/bin/python" build_dataset.py \
-    --raw-dir "$DATA_DIR/raw" \
-    --out-dir "$DATA_DIR/processed" \
-    --tmp-dir "$DATA_DIR/duckdb_tmp" \
+    --raw-dir "$RAW_DIR" \
+    --out-dir "$PROC_DIR" \
+    --tmp-dir "$TMP_DIR" \
     --threads 16 \
     --memory-limit 48GB
 
-echo "Done. Outputs in $DATA_DIR/processed/"
+echo "Done. Outputs in $PROC_DIR/"
 

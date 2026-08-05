@@ -21,8 +21,8 @@ references) view without any full text:
   - citations  : citingcorpusid -> citedcorpusid edges (the reference graph).
 
 Usage:
-    python download_shards.py --out-dir /path/to/s2_data
-    python download_shards.py --out-dir /path/to/s2_data --datasets papers abstracts
+    python download_shards.py --out-dir /path/to/data/raw/s2
+    python download_shards.py --out-dir /path/to/data/raw/s2 --datasets papers abstracts
 """
 
 import argparse
@@ -37,7 +37,7 @@ DEFAULT_DATASETS = ["papers", "abstracts", "citations"]
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out-dir", required=True,
-                     help="Root output directory; shards are written to <out-dir>/raw/<dataset>/")
+                     help="Output directory; shards are written to <out-dir>/<dataset>/")
     ap.add_argument("--datasets", nargs="+", default=DEFAULT_DATASETS,
                      help=f"Dataset names to download (default: {DEFAULT_DATASETS})")
     ap.add_argument("--release", default=None,
@@ -51,7 +51,7 @@ def main():
         print(f"\n--- {dataset} ---", flush=True)
         files = get_dataset_files(release_id, dataset)
         n_files = len(files)
-        raw_dir = os.path.join(args.out_dir, "raw", dataset)
+        raw_dir = os.path.join(args.out_dir, dataset)
         os.makedirs(raw_dir, exist_ok=True)
         print(f"  {n_files} shards -> {raw_dir}", flush=True)
 

@@ -25,7 +25,9 @@ set -euo pipefail
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SCRIPT_DIR=$BASE_DIR/src/data/s2
-DATA_DIR=$BASE_DIR/data/processed/s2
+RAW_DIR=$BASE_DIR/data/raw/s2
+PROC_DIR=$BASE_DIR/data/processed/s2
+TMP_DIR=$BASE_DIR/duckdb_tmp
 VENV_DIR=$BASE_DIR/.venv_s2_download
 
 mkdir -p "$BASE_DIR/logs"
@@ -44,10 +46,10 @@ fi
 cd "$SCRIPT_DIR"
 
 "$VENV_DIR/bin/python" add_titles_years.py \
-    --raw-dir "$DATA_DIR/raw" \
-    --papers-filtered "$DATA_DIR/processed/papers_filtered.parquet" \
-    --tmp-dir "$DATA_DIR/duckdb_tmp" \
+    --raw-dir "$RAW_DIR" \
+    --papers-filtered "$PROC_DIR/papers_filtered.parquet" \
+    --tmp-dir "$TMP_DIR" \
     --threads 16 \
     --memory-limit 48GB
 
-echo "Done. Updated $DATA_DIR/processed/papers_filtered.parquet with title/year columns."
+echo "Done. Updated $PROC_DIR/papers_filtered.parquet with title/year columns."

@@ -23,7 +23,8 @@ set -euo pipefail
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SCRIPT_DIR=$BASE_DIR/src/data/s2
-DATA_DIR=$BASE_DIR/data/processed/s2
+PROC_DIR=$BASE_DIR/data/processed/s2
+TMP_DIR=$BASE_DIR/duckdb_tmp
 VENV_DIR=$BASE_DIR/.venv_s2_download
 NODES_CSV=$BASE_DIR/data/raw/ogbn_arxiv/nodes.csv
 
@@ -44,11 +45,11 @@ cd "$SCRIPT_DIR"
 
 "$VENV_DIR/bin/python" filter_ogbn_references.py \
     --nodes-csv "$NODES_CSV" \
-    --papers "$DATA_DIR/processed/papers.parquet" \
-    --references "$DATA_DIR/processed/references.parquet" \
-    --out-dir "$DATA_DIR/processed" \
-    --tmp-dir "$DATA_DIR/duckdb_tmp" \
+    --papers "$PROC_DIR/papers.parquet" \
+    --references "$PROC_DIR/references.parquet" \
+    --out-dir "$PROC_DIR" \
+    --tmp-dir "$TMP_DIR" \
     --threads 16 \
     --memory-limit 48GB
 
-echo "Done. Outputs in $DATA_DIR/processed/"
+echo "Done. Outputs in $PROC_DIR/"
