@@ -1184,3 +1184,184 @@ W&B logs.
 - **Whether per-(layer, role) granularity earns its 64 parameters is untested.** A single global
   scalar is the obvious cheaper alternative; the `gate/per_layer` histogram should be checked for
   real spread before claiming the granularity matters.
+
+---
+
+## Stage 1b — the capped-prompt node sets (`prepare_data_capped.py`, `neighbour_cap.py`)
+
+### Goal
+
+Out-degree 5-15 was never a modelling choice. It was the context window: the whole reference
+list went into the prompt, and 15 abstracts is as much as Vicuna's 4,096 tokens will hold. The
+consequence is that the model has only ever been trained where the graph has least to say.
+
+This stage separates the two things the ceiling was doing at once:
+
+| | before | after |
+|---|---|---|
+| nodes the GNN may read | out-degree 5-15 | out-degree 5-100, **whole** neighbourhood |
+| references shown in the prompt | all of them | the closest to the reference centroid, as many as fit |
+| nodes lost to context overflow | ~13% of eval, 6% of train | none |
+
+The GNN's view is now independent of what fits in the prompt. Out-degree becomes a measure of
+available structure rather than a context-window constraint, which is the thing the prefix is
+supposed to exploit.
+
+### Which references, and how many
+
+`neighbour_cap.py` reuses the score from `src/filters/centroid_cosine_distance.py`:
+`(1 - cos(reference, centroid)) / 2` over the L2-normalised voyage embeddings, where the
+centroid is the mean direction of that node's *own* reference set. The smallest distances are
+kept — the references most representative of the bibliography. This is the same direction the
+old filter used (`distance <= threshold`), with a per-node budget instead of a global
+threshold, so the earlier `cosine-centroid-*` runs remain the precedent for the choice.
+
+Two limits apply in order: at most **15** references, then the farthest of those is dropped one
+at a time until the prompt fits
+
+```
+4,096  -  10 prefix tokens  -  max(256, the node's own abstract + EOS)
+```
+
+The reserve is the node's real abstract when that is longer than 256 tokens, so the training
+sequence is always complete, and never less than 256, so generation has room to write —
+matching `generate.py`'s `--max-new-tokens` default. **15 is a ceiling, not a target**, and it
+has to be: measured on the previous freeze, ~45% of full 15-reference prompts did not fit
+4,096 tokens. Trimming is what makes overflow structurally impossible rather than something
+downstream has to handle. Kept references stay in `edges.csv` order, so a trimmed prompt reads
+like an untrimmed one.
+
+Alternatives considered and rejected: keeping the *farthest* references (maximises spread, but
+throws away the core of the bibliography and keeps its outliers); stratifying across the
+distance range (no precedent in this project's earlier filtering results); and dropping any
+node that overflows, which was the first version of this stage and cost 45% of every
+out-degree above 15 — biased, since the survivors are those whose central references happen to
+have short abstracts.
+
+### Sampling, and why the bins are not equal
+
+Quotas are per out-degree, drawn separately from each split: 100 train, 10 valid, 10 eval
+(eval from the test split). These are **ceilings, not guarantees** — the graph does not contain
+enough high-degree nodes to fill them:
+
+| out-degree | train | valid | test |
+|---|---|---|---|
+| 5 | 6,335 | 1,478 | 1,813 |
+| 20 | 814 | 529 | 1,016 |
+| 39 | 104 | 139 | 358 |
+| 40 | 82 | 118 | 374 |
+| 50 | 31 | 47 | 200 |
+| 73 | 10 | 8 | 41 |
+| 99 | 0 | 2 | 4 |
+
+Train falls below 100 per degree from out-degree 40 upward and is empty at 99; valid falls
+below 10 from out-degree 73. Taking everything available caps the sets at **4,597 train /
+806 valid / 945 eval** — the quota arithmetic of 9,600 / 960 / 960 is not reachable. Because
+nothing is now lost to overflow, these availability ceilings are exactly what the freeze
+produced. Every degree above ~40 contributes every node it has, so any per-degree result read
+off the high end rests on tens of nodes, not hundreds.
+
+### What the trimming actually costs
+
+Not nodes — references. Every eligible node is usable; what varies with out-degree is how much
+of its bibliography is shown (measured 2026-08-06, train set):
+
+| out-degree | nodes | references shown | prompt tokens |
+|---|---|---|---|
+| 5-9 | 500 | 7.0 | 2,016 |
+| 10-15 | 600 | 12.1 | 3,315 |
+| 16-29 | 1,400 | 13.9 | 3,724 |
+| 30-39 | 1,000 | 14.1 | 3,704 |
+| 40-59 | 879 | 14.3 | 3,670 |
+| 60-79 | 162 | 14.3 | 3,656 |
+| 80-100 | 56 | 14.4 | 3,495 |
+
+Above out-degree 15 the prompt saturates: ~14 references and ~3,700 tokens regardless of
+whether the paper cites 16 others or 100. Roughly **half of all prompts sit at the 15-reference
+cap** (46% train, 49% valid, 47% eval); the rest were trimmed to 13 or 14 by long abstracts.
+The minimum is 5, which is a node at out-degree 5 keeping everything, not a node trimmed to the
+bone — no node lost so many references that the graph could not be shown.
+
+This is the real shape of the experiment, and it should be said plainly: **beyond out-degree
+~16 the prompt stops growing, so anything the model gains at higher degree has to come through
+the GNN prefix**, which is the only channel still reading the other 85 references. That is
+precisely the effect the adapter is meant to demonstrate, but it also means the text baseline
+is nearly flat across the high-degree range by construction.
+
+### Inputs / outputs
+
+Reads `data/processed/joint/{nodes.csv,edges.csv,splits.json,node_embeddings.npy}`
+(embeddings memory-mapped; only sampled rows are read) and writes to `data/frozen/`:
+
+```
+splits_eligible_capped.json   every eligible node per split (core, out-degree 5-100)
+training_sets_capped.json     {"train": [...], "valid": [...]}
+eval_nodes_capped.json        the eval nodes, from the test split
+```
+
+New files, not overwrites: `eval_nodes.json`, `splits_eligible.json` and `training_sets.json`
+still back the two 495-node runs in `experiments/`, which stay reproducible.
+
+Runs locally in the `DyTAG` env — CPU only, like `prepare_data.py` and `text.py` before it. No
+Komondor job: the cluster is for the GPU stages.
+
+```bash
+cd src/adapter
+python neighbour_cap.py          # check the capping score against the frozen filter column
+python prepare_data_capped.py    # freeze the sets
+```
+
+`neighbour_cap.py` recomputes the distances for the ogbn subset and asserts they match the
+frozen `centroid_cosine_distance` column — largest absolute difference **9.7e-17**, so the
+score is the same quantity the earlier `cosine-centroid-*` runs filtered on. It then checks the
+trimming itself against a synthetic 100-tokens-per-reference budget: 15 kept when the budget is
+generous, 4 when it allows only 4, none when a single reference will not fit, always the
+closest ones and always in edge order. Assertions in `prepare_data_capped.py` cover duplicates,
+core membership, eligibility, test-split membership for eval, pairwise train/valid/eval
+disjointness, and that every frozen sequence really fits `MAX_LENGTH`.
+
+### What was frozen (2026-08-06)
+
+111,538 nodes are eligible (48,479 train / 22,296 valid / 40,763 test). After the quotas:
+
+| set | nodes | mean tokens | median | p99 | max | refs shown | degrees below quota |
+|---|---|---|---|---|---|---|---|
+| train | 4,597 | 3,466 | 3,729 | 4,075 | 4,086 | 13.0 | 61 of 96 |
+| valid | 806 | 3,610 | 3,793 | 4,069 | 4,083 | 13.5 | 26 of 96 |
+| eval | 945 | 3,655 | 3,823 | 4,078 | 4,086 | 13.6 | 3 of 96 |
+
+**No node was lost.** The counts are exactly the availability ceilings from the table above, so
+the only thing limiting these sets is how many high-degree papers the graph contains.
+
+Comparable in size to the old 4,000 / 495, but spread over 96 out-degrees instead of 11, and
+~1,100 tokens longer on average — the old train mean was 2,323, because most of its nodes sat
+at low degree. Sequences now run close to the ceiling by construction, so the A100 time per
+epoch will be worse than Stage 4c's ~1.2 h estimate; budget on ~3,500 tokens per sequence, not
+~2,500.
+
+One train degree (99) and two valid degrees (87, 97) contribute no nodes, because the split
+holds none at all. The eval set covers all 96 degrees and falls short of 10 at only three of
+them. Two eval nodes coincide with the old 495-node set — expected, since both are drawn from
+the same test split.
+
+### Not yet done
+
+Only the node indices are frozen here. Nothing downstream reads them yet: `text.py`,
+`graph.py`, `train.py` and `generate.py` still build uncapped prompts from the old sets, so
+wiring `fit_refs` into the prompt path is the next step and no training has been run. Note that
+`generate.py` computes its own budget (`MAX_LENGTH - prefix - max_new_tokens`) and must end up
+with the same references the freeze measured, or the eval prompts will not be the ones these
+sets were selected under.
+
+### Open questions
+
+- **Whether the top of the range is reportable at all.** Above out-degree 80 the train set holds
+  56 nodes in total and one degree holds none. Any curve up there is anecdote, not measurement,
+  unless the degrees are binned.
+- **Whether a saturated prompt makes the high-degree comparison meaningful.** From out-degree 16
+  upward the text prompt is effectively constant at ~14 references, so degree varies only what
+  the GNN sees. That is the intended design, but it means a flat text baseline is guaranteed
+  rather than measured.
+- **Whether the centroid is the right anchor.** It is the reference set's own mean, so it is
+  defined by the very neighbourhood being summarised; a node whose bibliography is genuinely
+  two-topic gets one of its topics dropped by construction.

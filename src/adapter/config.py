@@ -29,8 +29,21 @@ MIN_OUT_DEGREE = 5
 MAX_OUT_DEGREE = 15
 EVAL_PER_DEGREE = 45
 
+# --- Stage 1b: the capped-prompt node sets -----------------------------------
+# Eligibility is widened to out-degree 5-100; the prompt is capped at 15 references
+# by centroid distance (neighbour_cap.py), so degree no longer has to fit the context.
+# Quotas are ceilings, not guarantees: above out-degree ~39 the graph simply has fewer
+# nodes than that, and those degrees contribute everything they have.
+CAPPED_MIN_OUT_DEGREE = 5
+CAPPED_MAX_OUT_DEGREE = 100
+CAPPED_TRAIN_PER_DEGREE = 100
+CAPPED_VALID_PER_DEGREE = 10
+CAPPED_EVAL_PER_DEGREE = 10
+
 # --- Stage 2: neighbourhood sampling -----------------------------------------
 NUM_NEIGHBORS = [-1, -1]    # all 1-hop and all 2-hop neighbours
+PROMPT_MAX_REFS = 15        # ceiling on references shown in the prompt; the GNN still sees all
+GENERATION_RESERVE = 256    # tokens held back for the abstract, = generate.py's --max-new-tokens
 
 # --- Stage 3a: GraphSAGE encoder ---------------------------------------------
 IN_CHANNELS = 1024          # voyage-4-large embedding dim
