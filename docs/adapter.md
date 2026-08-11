@@ -1365,3 +1365,294 @@ sets were selected under.
 - **Whether the centroid is the right anchor.** It is the reference set's own mean, so it is
   defined by the very neighbourhood being summarised; a node whose bibliography is genuinely
   two-topic gets one of its topics dropped by construction.
+
+---
+
+## Stage 1c — train quota raised to 200 per out-degree
+
+### Goal and change
+
+One constant: `CAPPED_TRAIN_PER_DEGREE` 100 → 200, to enlarge the training set. Valid and eval
+were to stay exactly as frozen in Stage 1b, so any later result can be attributed to training
+data rather than to a moved evaluation target. Nothing else changed — no code, only the config
+value and its comment (the "quotas bind above out-degree ~39" note became ~34, measured).
+
+The Stage 1b tables above describe the superseded 100-per-degree freeze and are kept as the
+record of it; the numbers below are what `data/frozen/*_capped.json` now holds.
+
+### Valid and eval are provably untouched
+
+Worth stating why this was not automatic. All three sets are drawn from a single
+`random.Random(42)` threaded through train → valid → eval, so a bigger train draw could have
+shifted the stream and silently reseeded the other two. It does not: `collect` consumes
+randomness only in `rng.shuffle(pool)`, which depends on the pool size, not on how many nodes
+the quota keeps. Verified against a pre-run backup rather than argued:
+
+```
+valid identical: True (806 nodes)
+eval  identical: True (945 nodes)
+eligibility identical: True          (48,479 / 22,296 / 40,763)
+old train is a subset of new: True   (0 nodes dropped)
+train n valid = 0,  train n eval = 0
+```
+
+### What was frozen (2026-08-11)
+
+| set | nodes | mean tokens | median | p99 | max | refs shown | at the 15-ref cap |
+|---|---|---|---|---|---|---|---|
+| train | **7,750** (was 4,597) | 3,428 | 3,714 | 4,075 | 4,086 | 12.8 | 42% |
+| valid | 806 | 3,610 | 3,793 | 4,069 | 4,083 | 13.5 | 49% |
+| eval | 945 | 3,655 | 3,823 | 4,078 | 4,086 | 13.6 | 47% |
+
++3,153 train nodes, a 69% increase. 7,750 is the exact pool ceiling: every degree contributes
+either 200 or everything it has. The full quota is met at out-degree 5–33 only; from 34 the
+train split runs out (171 at 34, 82 at 40, 31 at 50, 1 at 100, 0 at 99). 67 of 96 degrees are
+below quota, against 61 before.
+
+### The cost: train skews further from eval
+
+The added nodes are not spread across the range — **all 3,153 sit at out-degree ≤ 39**, because
+40 and above was already exhausted at the old quota and had nothing left to give. Doubling the
+quota therefore buys depth only where the graph is already deep:
+
+| | n | mean degree | median | share ≤15 | share ≥40 |
+|---|---|---|---|---|---|
+| old train | 4,597 | 29.1 | 27 | 24% | 24% |
+| **new train** | **7,750** | **25.5** | **24** | **28%** | **14%** |
+| the added nodes | 3,153 | 20.3 | 20 | 35% | **0%** |
+| eval | 945 | 51.8 | 52 | 12% | 63% |
+
+Train's mean out-degree falls 29.1 → 25.5 and its high-degree share is nearly halved
+(24% → 14%), while eval is unchanged at mean 51.8 with 63% of its nodes at degree ≥40. The
+train/eval degree mismatch that already existed is now wider, not narrower. Mean tokens and
+references shown drop slightly (3,466 → 3,428; 13.0 → 12.8) for the same reason.
+
+This is a real tension in the design and should be carried into any result: more training data
+was bought at the price of a training distribution that looks less like the evaluation set. If
+the goal is specifically to train the prefix where the graph has most to say, a quota is the
+wrong instrument above degree ~34 — the nodes simply do not exist, and only reweighting,
+binning, or an eval set matched to train's degree profile can close the gap.
+
+### How to reproduce
+
+```bash
+cd src/adapter && python prepare_data_capped.py    # ~exit 0, rewrites the three *_capped.json
+```
+
+CPU only, in the `DyTAG` env. The HF warning `Token indices sequence length is longer than the
+specified maximum (4491 > 4096)` is expected and harmless — measuring untrimmed prompts in order
+to trim them is exactly the script's job.
+
+### Still not done
+
+Unchanged from Stage 1b: nothing downstream reads these sets. `text.py`, `graph.py`, `train.py`
+and `generate.py` still build uncapped prompts from the old node lists, and `generate.py`'s
+budget mismatch (fixed 256-token reserve vs the freeze's `max(256, len(target)+1)`) is still
+outstanding. No training has been run at this quota.
+
+---
+
+## Stage 1d — one capped-prompt path (`text.capped_example`)
+
+### Goal
+
+Preparation for wiring the filter into training. Three programs need to build the *same*
+prompt for a node — the freeze (which decides whether a node is usable and how many
+references it gets), `train.py`, and `generate.py` — but until now only the freeze had the
+logic, as a private helper inside `prepare_data_capped.py`. The other two still build
+uncapped prompts from the full reference list.
+
+Wiring them up by copying that helper into each would leave three copies free to drift. The
+failure mode is the reason this is a separate stage rather than a detail of the next one:
+**a mismatched budget is silent.** It does not raise; it produces a fluent abstract written
+from a different set of sources than the node was selected under, and nothing downstream can
+tell. One shared function makes the bug impossible instead of something to test for.
+
+### Change
+
+The helper moved from `prepare_data_capped.py` to `text.py` as `capped_example`, next to the
+prompt machinery it belongs with (`build_prompt`, `encode`, `Corpus`). The freeze imports it
+instead of defining it; its two now-unused imports were dropped. `text.py` gained the imports
+the moved code needs. No import cycle — `text` → `neighbour_cap` → `config`.
+
+Behaviour is untouched by construction: the function body is character-for-character what it
+was. No logic, constants or budget arithmetic changed.
+
+### Verification
+
+A pure refactor has to prove it is one, so the freeze was re-run and its output compared
+against a checksum taken beforehand:
+
+```
+data/frozen/eval_nodes_capped.json:      OK
+data/frozen/splits_eligible_capped.json: OK
+data/frozen/training_sets_capped.json:   OK
+```
+
+All three files byte-identical, and every reported statistic (7,750 / 806 / 945 nodes, token
+means, references shown, eval overlap) identical to the pre-refactor run.
+
+### Scope
+
+Nothing downstream behaves differently yet. `train.py` and `generate.py` still read the old
+node lists and still build uncapped prompts; pointing them at `capped_example` and the
+`*_capped.json` sets is the next stage. This one only creates the shared foundation and shows
+the move cost nothing.
+
+---
+
+## Stage 1e — wiring training and generation to the capped sets
+
+### Goal
+
+Stage 1d built the shared prompt path; this stage makes `train.py` and `generate.py` use it.
+Both previously read the legacy node lists and built prompts from the *whole* reference list,
+so the capped sets existed but nothing consumed them.
+
+### The switch
+
+Both scripts take `--sets {capped,legacy}`, defaulting to `capped`:
+
+| | capped (default) | legacy |
+|---|---|---|
+| `train.py` | `training_sets_capped.json` — 7,750 / 806 | `training_sets.json` — 4,000 / 495 |
+| `generate.py` | `eval_nodes_capped.json` — 945 | `eval_nodes.json` — 495 |
+| prompts | `text.capped_example` | `Corpus.example`, untrimmed |
+| overflow | impossible; a violation aborts the run | 63/495 written as `ERROR:` rows |
+
+The flag deliberately controls the node list *and* the prompt builder together. They are not
+independent: the legacy sets were selected on the assumption that a node's whole reference
+list fits, the capped sets on the assumption that it is trimmed. Either list paired with the
+other builder trains or evaluates on prompts nobody measured.
+
+### Three guards, because every failure here is silent
+
+None of these fail loudly on their own, which is why each is checked explicitly.
+
+1. **Checkpoint provenance.** `train.py` records `sets` in every checkpoint; `--resume` and
+   `generate.py` both refuse a checkpoint trained on the other sets. Checkpoints predating
+   the flag have no `sets` key and are read as `legacy`. This is not hypothetical:
+   `run_train_adapter.sh` resumes from whatever checkpoint is newest, and the `epoch2.pt`
+   behind the 2026-08-04 run is still on Komondor. Verified — both a `legacy` checkpoint and
+   a pre-flag one are refused against capped eval nodes.
+
+2. **Generation reserve.** `--max-new-tokens` above `GENERATION_RESERVE` is refused in capped
+   mode. The sets were frozen holding 256 tokens back; asking for more would need references
+   the freeze already dropped. Verified — 512 exits at startup, before the model loads.
+
+3. **Overflow is now an assertion.** In capped mode a prompt over budget means the prompt path
+   has drifted from the freeze, so the run aborts rather than writing another
+   plausible-looking `ERROR` row into a CSV whose earlier rows are then equally suspect.
+
+### Embeddings
+
+The centroid needs the voyage embeddings at prompt-build time. `train.py` reuses `data.x` from
+`load_graph()` via `.numpy()` — a view of the matrix the GNN already holds, so no second load
+and no extra 1.6 GB. `generate.py` memory-maps the file instead, because **baseline mode must
+build byte-identical prompts** to adapter mode and never loads a graph at all.
+
+### Verification (2026-08-11, CPU, local)
+
+100 sampled nodes across train/valid/eval, checked through both code paths:
+
+```
+train   40 nodes: prompts identical across both paths, all fit
+valid   20 nodes: prompts identical across both paths, all fit
+eval    40 nodes: prompts identical across both paths, all fit
+largest prompt seen: 3,824 tokens (budget 3,830)
+```
+
+Prompts, targets and kept references are identical whether the embeddings arrive as a view or
+a memory-map; every training sequence fits `MAX_LENGTH`; kept references are a subsequence of
+`edges.csv` order. The largest prompt lands 6 tokens under budget — tight, as designed, since
+trimming stops as soon as a prompt fits.
+
+Legacy mode re-checked end to end: 495 nodes, 63 overflows (12.7%), exactly the figure the
+existing runs were produced under.
+
+### Open questions
+
+- **Batch memory is untested at this sequence length.** The ~1 GB activation figure in
+  `train.py`'s header was measured at a ~2,300-token mean; the capped train set averages
+  ~3,428 with a 4,086 maximum. Batch 4 may not fit — Stage 2 of the plan lowers it to 2 with
+  `--grad-accum 8` to hold the effective batch at 16, but that is a precaution, not a
+  measurement.
+- **Prompt-build cost now sits in the training loop.** Every batch re-runs the trim, which
+  tokenises the prompt once per candidate reference count. It was free when it happened once
+  at freeze time; whether it is material against a 7B forward pass has not been measured.
+
+---
+
+## Stage 1f — the pre-flight check, early stopping, and the job scripts
+
+### The pre-flight check (`verify_capped_prompts.py`)
+
+Promoted from a scratch script to a pipeline stage, and wired into `run_train_adapter.sh`
+ahead of the GPU work — the same placement, and for the same reason, as
+`verify_generation.py`. It re-proves that the prompts `train.py` will build are the ones the
+frozen sets were selected under, exercising `text.capped_example` itself rather than a
+reimplementation.
+
+On a sample per set it asserts that train's embedding view and generate's memory-map yield
+identical prompts, targets and reference lists; that every node keeps at least one reference;
+that kept references are a *subsequence* of `edges.csv` order (a subset check would pass on
+reordered references — `edges.csv` order is not ascending); that prompt + target + prefix fits
+`MAX_LENGTH`; and that the prompt alone fits generate.py's budget.
+
+```
+train   100 nodes ok
+valid   100 nodes ok
+eval    100 nodes ok
+largest prompt 3,826 tokens, 4 under budget
+```
+
+20 s on a laptop CPU, so gating a multi-hour GPU job on it is free. `--sample 0` checks every
+frozen node.
+
+### Early stopping
+
+`--epochs` becomes an upper bound of 10 rather than a target of 2, with `--patience 2`.
+Validation runs at the end of every epoch — separately from the periodic `--eval-every`
+checks, which exist for the curve — and the run stops after 2 consecutive epochs without a
+better graph-on validation loss. `--patience 0` disables it.
+
+Two consequences that are easy to get wrong, both handled:
+
+- **The last checkpoint is not the best one.** When early stopping fires, the final epoch is by
+  definition worse than the best. `train.py` copies the best epoch to `checkpoints/best.pt`,
+  and `run_generate_eval.sh` now prefers it, falling back to the newest `epoch*.pt` for runs
+  that predate it. Selecting by highest epoch number would have scored a model the run had
+  already decided to abandon.
+- **Patience must survive a resubmit.** 10 epochs does not fit one job. Best loss and the
+  patience counter are stored in every checkpoint and restored on `--resume`; otherwise the
+  counter would reset on each restart and the run could never stop early. A resumed run with
+  nothing left to do now says so and exits, instead of entering an empty epoch loop.
+
+Verified against scripted validation curves: a plateau stops at the right epoch, a noisy dip
+inside the patience window correctly resets the counter, and `--patience 0` runs to the end.
+
+### Job scripts
+
+| | before | after | why |
+|---|---|---|---|
+| `--epochs` | 2 | 10 (+ `--patience 2`) | early stopping decides the real length |
+| `--batch-size` / `--grad-accum` | 4 / 4 | 2 / 8 | effective batch still 16; sequences went ~2,300 → ~3,428 tokens and the batch-4 memory figure was measured at the old length |
+| `--eval-every` | 100 | 250 | at 100, validation cost more tokens than training |
+| train walltime | 12 h | 48 h | ~4.3 h/epoch estimated, up to 10 epochs |
+| eval walltime | 8 h | 12 h | 945 eval nodes, not 495 |
+
+`run_train_adapter.sh` also documents the prerequisite that bites first: a stale `epoch*.pt`
+from the uncapped experiment makes `train.py` refuse to resume, so the job dies at startup
+until it is moved to `checkpoints/legacy-uncapped/`.
+
+### Open questions
+
+- **48 h may exceed the partition limit.** It was chosen deliberately to fit 10 epochs in one
+  job, but Komondor's maximum walltime has not been checked from here; if the scheduler
+  rejects it, drop to 24 h and rely on the resume, which is now safe across restarts.
+- **Batch 2 is a precaution, not a measurement.** A short smoke run would settle both it and
+  the ~4.3 h/epoch estimate the walltime rests on, and would cost minutes.
+- **Validation still runs ~3 times per epoch.** `--eval-every 250` was chosen before
+  end-of-epoch validation existed, which adds roughly one more pass per epoch. If validation
+  turns out to be a material share of the wall-clock, raising it to 500 costs nothing now that
+  every epoch ends with a validation anyway.

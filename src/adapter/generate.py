@@ -1,5 +1,5 @@
 """
-Stage 5 — generate abstracts for the frozen 495-node evaluation set.
+Stage 5 — generate abstracts for a frozen evaluation set.
 
 Produces one CSV per condition, over the same nodes, with the same prompts, in the same order:
 
@@ -27,17 +27,30 @@ Everything else is held fixed on purpose:
     with a pre-filled prefix cache were never verified. One node at a time removes the
     question entirely.
 
+Node sets
+---------
+`--sets capped` (default) generates for the 945 nodes of `eval_nodes_capped.json`, with
+prompts trimmed to the centroid-closest references by `text.capped_example` — the same
+builder training used, so the adapter meets the prompt shape it was trained on.
+
+`--sets legacy` reproduces the older 495-node runs from `eval_nodes.json` with untrimmed
+prompts. The two are not comparable: only 2 nodes overlap, and a checkpoint records which
+sets it was trained on so a mismatched pairing is refused rather than silently measured.
+
 Context overflow
 ----------------
-63 of the 495 eval nodes (12.7%) have prompts too long to leave room for 256 new tokens inside
-Vicuna's 4,096-token context. Following `src/generation/generate_vicuna.py`, those rows are still
-written, with `generated_abstract = "ERROR: prompt too long (...)"`; `src/evaluation/evaluate_results.py`
-already skips them. The 10 prefix positions are charged against the budget in **both** modes,
-even though the baseline has no prefix, so the two CSVs carry identical ERROR rows and the
-comparison runs on the same 432 nodes.
+Under `--sets capped` overflow cannot happen: the freeze selected each node with its prompt
+already trimmed to fit, so a prompt over budget means the prompt path has drifted and the run
+aborts. `--max-new-tokens` above the reserve the sets were frozen under is refused for the
+same reason.
 
-Those 63 are not a random sample — they concentrate at high out-degree, precisely where the
-graph has the most to contribute. See `docs/adapter.md`, Stage 4c.
+Under `--sets legacy` the old behaviour stands: 63 of the 495 nodes (12.7%) overflow, are
+written as `generated_abstract = "ERROR: prompt too long (...)"`, and are skipped by
+`src/evaluation/evaluate_results.py`. The 10 prefix positions are charged against the budget in
+**both** modes, even though the baseline has no prefix, so the two CSVs carry identical ERROR
+rows and the comparison runs on the same 432 nodes. Those 63 are not a random sample — they
+concentrate at high out-degree, precisely where the graph has the most to contribute. See
+`docs/adapter.md`, Stage 4c.
 
 Usage:
     cd src/adapter
@@ -53,21 +66,35 @@ import csv
 import json
 import os
 
+import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import (CHECKPOINT_DIR, EXPERIMENTS_DIR, FROZEN_DIR, JOINT_DIR,
-                    MAX_LENGTH, NUM_PREFIX_TOKENS)
+from config import (CHECKPOINT_DIR, EXPERIMENTS_DIR, FROZEN_DIR,
+                    GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
+                    NUM_PREFIX_TOKENS)
 from graph import load_graph, make_loader
 from model import GraphSAGEEncoder, PrefixAdapter
 from prefix_generation import generate_with_prefix, patch_for_prefix
-from text import Corpus
+from text import Corpus, capped_example
+
+# Mirrors train.py's SETS: which frozen eval nodes, and whether their prompts are capped.
+SETS = {
+    "capped": ("eval_nodes_capped.json", True),
+    "legacy": ("eval_nodes.json", False),
+}
 
 
-def load_adapter(path, device):
+def load_adapter(path, device, sets):
     """Restore the trained encoder and adapter from a `train.py` checkpoint."""
     checkpoint = torch.load(path, map_location=device)
+    # A capped-trained prefix evaluated on legacy prompts (or the reverse) produces fluent
+    # text from a neighbourhood the adapter was never calibrated on — silent, not an error.
+    was = checkpoint.get("sets", "legacy")   # checkpoints predating --sets are all legacy
+    assert was == sets, (
+        f"{path} was trained on the '{was}' node sets but --sets is '{sets}'; "
+        f"the prompts differ, so this pairing would not measure the trained adapter")
     encoder = GraphSAGEEncoder().to(device)
     adapter = PrefixAdapter().to(device)
     encoder.load_state_dict(checkpoint["encoder"])
@@ -107,8 +134,20 @@ def main():
     ap.add_argument("--output", default=None,
                     help="default: experiments/<mode>/generations.csv; pass a run directory "
                          "explicitly so each run keeps its own folder")
+    ap.add_argument("--sets", choices=sorted(SETS), default="capped",
+                    help="which frozen eval nodes to generate for; 'legacy' reproduces the "
+                         "uncapped 495-node runs")
     ap.add_argument("--max-new-tokens", type=int, default=256)
     args = ap.parse_args()
+
+    eval_file, capped = SETS[args.sets]
+    # The capped sets were frozen holding GENERATION_RESERVE tokens back for the abstract.
+    # Asking for more at generation time would need references the freeze already dropped,
+    # so the guarantee that nothing overflows would quietly stop holding.
+    if capped and args.max_new_tokens > GENERATION_RESERVE:
+        raise SystemExit(
+            f"--max-new-tokens {args.max_new_tokens} exceeds the {GENERATION_RESERVE}-token "
+            f"reserve the capped sets were frozen under; use --sets legacy or lower it")
 
     output = args.output or os.path.join(EXPERIMENTS_DIR, args.mode, "generations.csv")
     os.makedirs(os.path.dirname(output), exist_ok=True)
@@ -116,16 +155,27 @@ def main():
     dtype = torch.bfloat16
 
     # --- data -------------------------------------------------------------
-    with open(os.path.join(FROZEN_DIR, "eval_nodes.json")) as f:
+    with open(os.path.join(FROZEN_DIR, eval_file)) as f:
         eval_nodes = json.load(f)
     corpus = Corpus()
     mag_id = pd.read_csv(os.path.join(JOINT_DIR, "nodes.csv"),
                          usecols=["node_id", "mag_id"]).set_index("node_id")["mag_id"]
-    print(f"{len(eval_nodes)} eval nodes, mode={args.mode}")
+    print(f"{len(eval_nodes)} eval nodes, mode={args.mode}, sets={args.sets} ({eval_file})")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     if tokenizer.pad_token is None:                        # Llama ships without one
         tokenizer.pad_token = tokenizer.eos_token
+
+    # Both conditions must build byte-identical prompts — that is the whole comparison — so
+    # the embeddings are loaded in baseline mode too, where no graph is otherwise needed.
+    # Memory-mapped: only the sampled rows are ever touched.
+    if capped:
+        embeddings = np.load(os.path.join(JOINT_DIR, "node_embeddings.npy"), mmap_mode="r")
+        def example(node_id):
+            prompt, target, _ = capped_example(tokenizer, corpus, embeddings, node_id)
+            return prompt, target
+    else:
+        example = corpus.example
 
     # --- models -----------------------------------------------------------
     print(f"Loading {args.model} in {dtype} …")
@@ -135,7 +185,7 @@ def main():
 
     encoder = adapter = data = None
     if args.mode == "adapter":
-        encoder, adapter = load_adapter(args.checkpoint, device)
+        encoder, adapter = load_adapter(args.checkpoint, device, args.sets)
         data = load_graph()                                # stays on CPU; sampling runs there
         patch_for_prefix(llm, NUM_PREFIX_TOKENS)
 
@@ -164,12 +214,19 @@ def main():
         if node_id in done:
             continue
 
-        prompt, original = corpus.example(node_id)
+        prompt, original = example(node_id)
         input_ids = torch.tensor([tokenizer(prompt).input_ids], device=device)
         n_tokens = input_ids.size(1)
 
         print(f"[{i}/{len(eval_nodes)}] node_id={node_id}  refs={corpus.out_degree(node_id)}  "
               f"prompt_tokens={n_tokens}", flush=True)
+
+        # Capping makes overflow structurally impossible. If it happens anyway the prompt
+        # path has drifted from the freeze, and every row already written is suspect — so
+        # this stops the run rather than writing another plausible-looking ERROR row.
+        assert not (capped and n_tokens > budget), (
+            f"node {node_id}: capped prompt is {n_tokens} tokens, over the {budget} budget; "
+            f"the prompt path no longer matches the frozen sets")
 
         if n_tokens > budget:
             overflowed += 1

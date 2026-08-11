@@ -66,31 +66,9 @@ from config import (CAPPED_EVAL_PER_DEGREE, CAPPED_MAX_OUT_DEGREE,
                     CAPPED_MIN_OUT_DEGREE, CAPPED_TRAIN_PER_DEGREE,
                     CAPPED_VALID_PER_DEGREE, FROZEN_DIR, GENERATION_RESERVE,
                     JOINT_DIR, MAX_LENGTH, NUM_PREFIX_TOKENS, PROMPT_MAX_REFS)
-from neighbour_cap import fit_refs
-from text import Corpus, build_prompt, encode
+from text import Corpus, capped_example, encode
 
 DEGREES = range(CAPPED_MIN_OUT_DEGREE, CAPPED_MAX_OUT_DEGREE + 1)
-
-
-def example(tokenizer, corpus, embeddings, node_id):
-    """-> (prompt, target, kept_refs) for one node, trimmed to fit the context.
-
-    The budget leaves room for the prefix and for the abstract: the node's own abstract
-    when it is longer than GENERATION_RESERVE, so the training sequence is complete, and
-    never less than GENERATION_RESERVE, so generation has somewhere to write.
-    """
-    target = corpus.abstract[node_id]
-    target_ids = tokenizer(target, add_special_tokens=False).input_ids
-    reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
-    budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
-
-    def measure(kept):
-        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
-        return len(tokenizer(prompt).input_ids)
-
-    refs = fit_refs(corpus.refs.get(node_id, []), embeddings, measure, budget)
-    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
-            target, refs)
 
 
 def collect(tokenizer, corpus, embeddings, candidates, wanted, rng):
@@ -100,7 +78,7 @@ def collect(tokenizer, corpus, embeddings, candidates, wanted, rng):
     kept, lengths, refs, seen = [], [], [], 0
     for node_id in pool:
         seen += 1
-        prompt, target, node_refs = example(tokenizer, corpus, embeddings, node_id)
+        prompt, target, node_refs = capped_example(tokenizer, corpus, embeddings, node_id)
         if not node_refs:
             continue        # not even one reference fits — the graph cannot be shown at all
         input_ids, _ = encode(tokenizer, prompt, target)

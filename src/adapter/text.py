@@ -26,6 +26,13 @@ valid  — VALID_PER_DEGREE nodes at each out-degree 5-15, matching how the eval
 The 495-node evaluation set in `eval_nodes.json` is **not** touched; its overflow rate is
 reported so Stage 5 knows what it is dealing with.
 
+Capped prompts
+--------------
+`capped_example` is the Stage 1b path: instead of dropping a node whose reference list
+overflows, it trims the list to the references closest to its centroid (neighbour_cap.py)
+until the prompt fits. It is the *only* place a capped prompt is built — the freeze,
+training and generation all call it, so all three see the same references.
+
 Usage:
     python adapter/text.py          # freeze the subsets (needs the Vicuna tokenizer)
 """
@@ -38,9 +45,10 @@ import random
 import pandas as pd
 from transformers import AutoTokenizer
 
-from config import (FROZEN_DIR, JOINT_DIR, MAX_LENGTH, MAX_OUT_DEGREE,
-                    MIN_OUT_DEGREE, NUM_PREFIX_TOKENS, TRAIN_SUBSET,
-                    VALID_PER_DEGREE)
+from config import (FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
+                    MAX_OUT_DEGREE, MIN_OUT_DEGREE, NUM_PREFIX_TOKENS,
+                    TRAIN_SUBSET, VALID_PER_DEGREE)
+from neighbour_cap import fit_refs
 
 SYSTEM = (
     "A chat between a curious user and an artificial intelligence assistant. "
@@ -96,6 +104,33 @@ class Corpus:
 
     def out_degree(self, node_id):
         return len(self.refs.get(node_id, []))
+
+
+def capped_example(tokenizer, corpus, embeddings, node_id):
+    """-> (prompt, target, kept_refs) for one node, trimmed to fit the context.
+
+    The single capped-prompt path: prepare_data_capped.py freezes node sets with it,
+    train.py builds training prompts with it, and generate.py builds eval prompts with
+    it. They must agree exactly — a node was selected on the assumption that these
+    references are the ones shown, and the failure mode of a mismatched budget is silent
+    (a fluent abstract written from the wrong sources, not an error).
+
+    The budget leaves room for the prefix and for the abstract: the node's own abstract
+    when it is longer than GENERATION_RESERVE, so the training sequence is complete, and
+    never less than GENERATION_RESERVE, so generation has somewhere to write.
+    """
+    target = corpus.abstract[node_id]
+    target_ids = tokenizer(target, add_special_tokens=False).input_ids
+    reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
+    budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
+
+    def measure(kept):
+        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
+        return len(tokenizer(prompt).input_ids)
+
+    refs = fit_refs(corpus.refs.get(node_id, []), embeddings, measure, budget)
+    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
+            target, refs)
 
 
 def collect(tokenizer, corpus, candidates, wanted, rng):

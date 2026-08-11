@@ -32,11 +32,11 @@ EVAL_PER_DEGREE = 45
 # --- Stage 1b: the capped-prompt node sets -----------------------------------
 # Eligibility is widened to out-degree 5-100; the prompt is capped at 15 references
 # by centroid distance (neighbour_cap.py), so degree no longer has to fit the context.
-# Quotas are ceilings, not guarantees: above out-degree ~39 the graph simply has fewer
+# Quotas are ceilings, not guarantees: above out-degree ~34 the graph simply has fewer
 # nodes than that, and those degrees contribute everything they have.
 CAPPED_MIN_OUT_DEGREE = 5
 CAPPED_MAX_OUT_DEGREE = 100
-CAPPED_TRAIN_PER_DEGREE = 100
+CAPPED_TRAIN_PER_DEGREE = 200
 CAPPED_VALID_PER_DEGREE = 10
 CAPPED_EVAL_PER_DEGREE = 10
 

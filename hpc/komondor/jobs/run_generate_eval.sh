@@ -5,12 +5,12 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=6000M
-#SBATCH --time=08:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.out
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Stage 5 — generates both evaluation CSVs over the frozen 495-node eval set:
+# Stage 5 — generates both evaluation CSVs over the frozen 945-node capped eval set:
 #
 #   experiments/<date>_vicuna-baseline/generations.csv   frozen Vicuna-7B, no prefix
 #   experiments/<date>_adapter/generations.csv           GraphSAGE + prefix adapter, same frozen Vicuna
@@ -27,18 +27,26 @@
 #   - a checkpoint in checkpoints/ (produced by run_train_adapter.sh)
 #   - lmsys/vicuna-7b-v1.5 already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
-# Walltime is 8 h against an estimated ~1.5 h per condition (432 scorable nodes x 256 greedy
-# tokens at batch size 1, twice). That estimate has never been checked on a real A100, so 8 h
-# absorbs a ~2.5x miss. Lower it once one condition has actually been timed — the cost is queue
-# time, and the resume below covers a timeout anyway.
+# Walltime is 12 h against an estimated ~2.9 h per condition (945 nodes x 256 greedy tokens at
+# batch size 1, twice — 1.9x the old 495-node set, and none of them lost to overflow). That
+# estimate has never been checked on a real A100. Lower it once one condition has actually been
+# timed — the cost is queue time, and the resume below covers a timeout anyway.
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SIF=$BASE_DIR/adapter-gpu.sif
 
 mkdir -p $BASE_DIR/logs
 
-# Newest checkpoint, same `sort -V` idiom as run_train_adapter.sh (so epoch10 beats epoch2).
-LATEST=$(ls -1 "$BASE_DIR"/checkpoints/epoch*.pt 2>/dev/null | sort -V | tail -1)
+# best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
+# early stopping the *last* epoch is by definition worse than the best one, so picking the
+# highest-numbered file would score a model the run had already decided to abandon.
+# Fall back to the newest epoch file (same `sort -V` idiom, so epoch10 beats epoch2) for runs
+# that predate best.pt.
+LATEST="$BASE_DIR/checkpoints/best.pt"
+if [ ! -f "$LATEST" ]; then
+    LATEST=$(ls -1 "$BASE_DIR"/checkpoints/epoch*.pt 2>/dev/null | sort -V | tail -1)
+    echo "no best.pt — falling back to the newest epoch checkpoint"
+fi
 if [ -z "$LATEST" ]; then
     echo "no checkpoint in $BASE_DIR/checkpoints — run run_train_adapter.sh first" >&2
     exit 1
