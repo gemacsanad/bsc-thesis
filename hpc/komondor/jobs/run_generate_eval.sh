@@ -13,7 +13,7 @@
 # Stage 5 — generates both evaluation CSVs over the frozen 945-node capped eval set:
 #
 #   experiments/<date>_vicuna-baseline/generations.csv   frozen Vicuna-7B, no prefix
-#   experiments/<date>_adapter/generations.csv           GraphSAGE + prefix adapter, same frozen Vicuna
+#   experiments/<date>_$ARM/generations.csv              GraphSAGE + prefix adapter, same frozen Vicuna
 #
 # Both conditions run back to back in ONE job, on the same node and the same GPU, so nothing but
 # the prefix differs between the two files. Greedy decoding, bf16, batch size 1 — see
@@ -37,25 +37,34 @@ SIF=$BASE_DIR/adapter-gpu.sif
 
 mkdir -p $BASE_DIR/logs
 
+# Which run to score: point CKPT_DIR at the depth's training output, and name RUN_TAG's
+# suffix to match. Nothing here selects an architecture — generate.py reads the encoder depth
+# back out of the checkpoint — so a wrong directory scores another run's weights, but can
+# never build the wrong encoder for them.
+CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+ARM=adapter-gnn2                        # experiments/<date>-<job>_$ARM/
+
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
 # early stopping the *last* epoch is by definition worse than the best one, so picking the
 # highest-numbered file would score a model the run had already decided to abandon.
 # Fall back to the newest epoch file (same `sort -V` idiom, so epoch10 beats epoch2) for runs
 # that predate best.pt.
-LATEST="$BASE_DIR/checkpoints/best.pt"
+LATEST="$CKPT_DIR/best.pt"
 if [ ! -f "$LATEST" ]; then
-    LATEST=$(ls -1 "$BASE_DIR"/checkpoints/epoch*.pt 2>/dev/null | sort -V | tail -1)
+    LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
     echo "no best.pt — falling back to the newest epoch checkpoint"
 fi
 if [ -z "$LATEST" ]; then
-    echo "no checkpoint in $BASE_DIR/checkpoints — run run_train_adapter.sh first" >&2
+    echo "no checkpoint in $CKPT_DIR — run run_train_adapter.sh first" >&2
     exit 1
 fi
-echo "evaluating checkpoint $LATEST"
-export SINGULARITYENV_CKPT="/app/checkpoints/$(basename "$LATEST")"
+echo "evaluating checkpoint $LATEST as $ARM"
+export SINGULARITYENV_CKPT="/app${CKPT_DIR#$BASE_DIR}/$(basename "$LATEST")"
 
-# Each condition gets its own experiment directory, named for the day and the job.
+# Each condition gets its own experiment directory, named for the day, the job and the arm,
+# so several depths evaluated on one day stay tellable apart in experiments/.
 export SINGULARITYENV_RUN_TAG="$(date +%F)-${SLURM_JOB_ID:-manual}"
+export SINGULARITYENV_ARM="$ARM"
 
 module load singularity
 
@@ -77,7 +86,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     python generate.py --mode baseline \
         --output "/app/experiments/${RUN_TAG}_vicuna-baseline/generations.csv"
 
-    echo "=== adapter: GraphSAGE + prefix adapter + frozen Vicuna-7B ==="
+    echo "=== adapter: GraphSAGE + prefix adapter + frozen Vicuna-7B ($ARM) ==="
     python generate.py --mode adapter --checkpoint "$CKPT" \
-        --output "/app/experiments/${RUN_TAG}_adapter/generations.csv"
+        --output "/app/experiments/${RUN_TAG}_${ARM}/generations.csv"
 '

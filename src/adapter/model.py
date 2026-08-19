@@ -5,9 +5,12 @@ Encodes a target node's reference neighbourhood into a single vector, and turns
 that vector into the key/value prefixes injected into every layer of a frozen
 Vicuna-7B.
 
-Two SAGEConv layers (1024 -> 1024 -> 1024, mean aggregation) over the batches
+`GNN_LAYERS` SAGEConv layers (all 1024 wide, mean aggregation) over the batches
 produced by graph.py, so the encoder sees the node's references at layer 1 and
-the references of those references at layer 2.
+the references of those references at layer 2. The default is 2; `--gnn-layers`
+on train.py and graph.py runs deeper encoders, and the loader's hop count follows
+it — a layer reading from an unsampled hop would aggregate incomplete
+neighbourhoods and produce a plausible result rather than an error.
 
 Seed masking
 ------------
@@ -39,7 +42,8 @@ begins as prefix tuning with the graph disconnected. Setting gate to zero at eva
 time is therefore the "no graph" ablation on the very same weights.
 
 Usage:
-    python adapter/model.py     # smoke-test a forward pass on one batch
+    python adapter/model.py                  # smoke-test a forward pass on one batch
+    python adapter/model.py --gnn-layers 3   # same checks on a deeper encoder
 """
 
 import torch
@@ -47,27 +51,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
-from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, HEAD_DIM, HIDDEN_CHANNELS,
-                    IN_CHANNELS, NUM_HEADS, NUM_LAYERS, NUM_PREFIX_TOKENS,
-                    OUT_CHANNELS, TRUNK_DIM)
+from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GNN_LAYERS, HEAD_DIM,
+                    HIDDEN_CHANNELS, IN_CHANNELS, NUM_HEADS, NUM_LAYERS,
+                    NUM_PREFIX_TOKENS, OUT_CHANNELS, TRUNK_DIM)
 
 
 class GraphSAGEEncoder(nn.Module):
+    """`num_layers` SAGEConv layers, all 1024 wide. Layer i aggregates hop i, so the loader
+    must sample at least `num_layers` hops — config.num_neighbors() derives that."""
+
     def __init__(self, in_channels=IN_CHANNELS, hidden_channels=HIDDEN_CHANNELS,
-                 out_channels=OUT_CHANNELS, dropout=DROPOUT):
+                 out_channels=OUT_CHANNELS, dropout=DROPOUT, num_layers=GNN_LAYERS):
         super().__init__()
-        self.conv1 = SAGEConv(in_channels, hidden_channels, aggr="mean")
-        self.conv2 = SAGEConv(hidden_channels, out_channels, aggr="mean")
+        assert num_layers >= 1, "the encoder needs at least one conv layer"
+        widths = [in_channels] + [hidden_channels] * (num_layers - 1) + [out_channels]
+        self.convs = nn.ModuleList(
+            SAGEConv(widths[i], widths[i + 1], aggr="mean") for i in range(num_layers)
+        )
         self.dropout = dropout
         # unit norm, like the voyage features it replaces
         self.mask = nn.Parameter(torch.randn(in_channels) / in_channels ** 0.5)
 
     def forward(self, x, edge_index, batch_size):
         """Returns (batch_size, out_channels) — one embedding per seed node."""
-        x = torch.cat([self.mask.expand(batch_size, -1), x[batch_size:]])
-        h = F.relu(self.conv1(x, edge_index))
-        h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.conv2(h, edge_index)          # no activation on the output layer
+        h = torch.cat([self.mask.expand(batch_size, -1), x[batch_size:]])
+        for conv in self.convs[:-1]:
+            h = F.relu(conv(h, edge_index))
+            h = F.dropout(h, p=self.dropout, training=self.training)
+        h = self.convs[-1](h, edge_index)      # no activation on the output layer
         return h[:batch_size]
 
 
@@ -96,7 +107,7 @@ class PrefixAdapter(nn.Module):
         )
         # one matrix for all 2 * num_layers heads, split apart by the reshape below
         self.codes = nn.Linear(trunk_dim, num_layers * 2 * code_dim)
-        # shared by every (layer, role) — this is what keeps the model off 2.68B params
+        # shared by every (layer, role) 
         self.decoder = nn.Linear(code_dim, num_prefix_tokens * num_heads * head_dim)
 
         # node-independent prefix: plain prefix tuning, and what gate=0 falls back to
@@ -118,21 +129,27 @@ class PrefixAdapter(nn.Module):
 
 
 if __name__ == "__main__":
+    import argparse
     import json
     import os
 
     from config import FROZEN_DIR
     from graph import load_graph, make_loader
 
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--gnn-layers", type=int, default=GNN_LAYERS)
+    args = ap.parse_args()
+
     data = load_graph()
     with open(os.path.join(FROZEN_DIR, "splits_eligible.json")) as f:
         seeds = json.load(f)["train"]
 
-    model = GraphSAGEEncoder()
+    model = GraphSAGEEncoder(num_layers=args.gnn_layers)
     print(model)
     print(f"\ntrainable parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    batch = next(iter(make_loader(data, seeds, batch_size=8, shuffle=False)))
+    batch = next(iter(make_loader(data, seeds, batch_size=8, shuffle=False,
+                                  gnn_layers=args.gnn_layers)))
     model.eval()
     with torch.no_grad():
         out = model(batch.x, batch.edge_index, batch.batch_size)

@@ -1,0 +1,1 @@
+first train with 5-100 neighbours with static centroid filter trained on 8000 nodes.

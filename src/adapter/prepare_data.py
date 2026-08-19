@@ -1,5 +1,4 @@
 """
-Stage 1 — data prep for the graph-conditioned adapter.
 
 Defines which nodes of the joint dataset are usable for adapter training and which
 are held out for evaluation, and writes both to disk so every later stage reads
@@ -11,24 +10,6 @@ core == True  and  5 <= out_degree <= 15, where out_degree counts outgoing edges
 in data/processed/joint/edges.csv (src cites dst, so out-edges are the paper's own
 references — the temporally honest signal). Intersected with splits.json, which
 only covers the 169,343 core nodes.
-
-Evaluation nodes
-----------------
-495 nodes drawn from the eligible test nodes, 45 at each out-degree from 5 to 15,
-so quality can be read against neighbour count without the degree bins differing
-in size. Sampling is seeded and the frozen list is committed, so the set never
-moves between runs.
-
-The earlier 200-node set in data/processed/ogbn_subset/nodes_subset.csv is not reused:
-it was stratified over ogbn-arxiv out-degree, which counts only citations between
-arXiv CS papers. the joint dataset adds Semantic Scholar bibliographies, under which
-those 200 nodes span out-degree 1-65 and half of them overflow the context window.
-
-Caveat carried by this set: an S2 bibliography exists for only some core nodes, and
-coverage rises with out-degree (39% at degree 5, 65% at degree 15). Nodes without one
-show only their arXiv-CS-internal references, so a low out-degree can mean either a
-short bibliography or an unseen one. The eval set is not filtered on coverage; the
-per-degree breakdown is printed at freeze time so the confound stays visible.
 
 Outputs
 -------

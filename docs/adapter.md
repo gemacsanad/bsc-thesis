@@ -1656,3 +1656,241 @@ until it is moved to `checkpoints/legacy-uncapped/`.
   end-of-epoch validation existed, which adds roughly one more pass per epoch. If validation
   turns out to be a material share of the wall-clock, raising it to 500 costs nothing now that
   every epoch ends with a validation anyway.
+
+---
+
+## Stage 6a — encoder depth as a run parameter (`--gnn-layers`)
+
+**Date:** 2026-08-18
+
+### Goal
+
+Run the 3-layer and 4-layer GraphSAGE encoders against the existing 2-layer result, without
+either run depending on which version of the source happened to be on Komondor when the
+scheduler started it.
+
+### Why the depth could not just be edited between submissions
+
+The obvious plan — upload a 3-layer `model.py`, `sbatch`, edit it to 4 layers, `sbatch` again —
+does not work. `sbatch` copies the *batch script* into the job spool at submit time, so that
+file is safe to edit afterwards; the Python under `/app` is not, because it is read when the
+job actually starts, after however long it waits in the queue. A job submitted first can
+therefore run the architecture intended for the second. Both runs would also write `epoch*.pt`
+and `best.pt` into the same `checkpoints/`, and the job script's auto-resume takes the newest
+file it finds there.
+
+So the depth travels as an argument. `run_train_adapter.sh` now carries `--gnn-layers` and a
+`CKPT_DIR` written literally, edited together per experiment — safe, because editing that file
+cannot reach a job already queued.
+
+### Decisions
+
+**One number sets both the encoder depth and the sampling depth.** `NUM_NEIGHBORS = [-1, -1]`
+is gone; `config.num_neighbors(gnn_layers)` returns `[-1] * gnn_layers` and `make_loader` takes
+the layer count. This is the failure the change exists to prevent: a third `SAGEConv` layer
+reading from a 2-hop sample aggregates hop-2 nodes whose own neighbourhoods were never sampled.
+It does not raise — it returns a plausible vector and a plausible loss curve, the same class of
+silent failure as the `cache_position` bug in Stage 4.
+
+**The depth is recorded in every checkpoint and asserted**, exactly as `sets` already is.
+`train.py` refuses a `--resume` whose recorded depth differs, and `generate.py` reads the depth
+*out of* the checkpoint rather than taking it on the command line — there is no way to pair a
+3-layer checkpoint with a 4-layer encoder. Checkpoints predating this default to 2, so the
+existing runs still load.
+
+**Widths stay at 1024 throughout** and dropout stays between every pair of layers, so depth is
+the only thing that varies against the 2-layer baseline.
+
+**The 2-layer run keeps `checkpoints/`**; deeper runs get `checkpoints/gnn3/`, `gnn4/`. The
+existing results and their W&B history stay where they are.
+
+### The cost of deeper hops, measured
+
+Sampled locally on 500 of the 7,750 capped train seeds, same graph construction as `graph.py`:
+
+| hops | mean nodes | median | p90 | p99 | max |
+|---|---|---|---|---|---|
+| 2 | 199 | 168 | 380 | 696 | 1,087 |
+| 3 | 876 | 708 | 1,770 | 3,590 | 4,629 |
+| 4 | 2,645 | 2,186 | 5,597 | 10,451 | 13,836 |
+
+At `--batch-size 2` a micro-batch samples 397 nodes / 734 edges at 2 hops, 1,712 / 4,842 at 3,
+and 5,204 / 17,992 at 4. The worst 4-hop batch is ~21 MB of fp32 features against 13.5 GB of
+frozen Vicuna, and sampling 500 seeds took 0.1 s on a laptop CPU. **Neither depth is a memory
+or throughput problem** — the run stays LLM-bound, as it was at 2 hops.
+
+The 2-hop mean of 199 is far above the 50.6 recorded in Stage 2. That figure was measured on
+the legacy out-degree 5–15 nodes; the capped sets go to out-degree 100.
+
+| encoder | params |
+|---|---|
+| 2 layers | 4,197,376 |
+| 3 layers | 6,295,552 |
+| 4 layers | 8,393,728 |
+
+The 12,108,096-parameter adapter is unchanged, so trainable totals are 16.3M / 18.4M / 20.5M.
+
+### Settings consolidated into `config.py`
+
+Done at the same time, because the depth sweep made the sprawl obvious: the job script was
+restating `--epochs 10 --patience 2 --batch-size 2 --grad-accum 8 --log-every 10
+--eval-every 250 --wandb-project dytag-adapter`, and `"lmsys/vicuna-7b-v1.5"` was written out
+as a literal in five separate files.
+
+All of it now lives in `config.py`: `EPOCHS`, `PATIENCE`, `BATCH_SIZE`, `GRAD_ACCUM`,
+`LOG_EVERY`, `EVAL_EVERY`, `SEED`, `WANDB_PROJECT`, `DEFAULT_SETS`, `MAX_NEW_TOKENS`, and
+`BASE_MODEL` (imported by `train.py`, `generate.py`, `text.py`, `prepare_data_capped.py` and
+`verify_capped_prompts.py`). Their argparse flags are gone — a constant with a flag shadowing
+it is two places to change, which is the problem being fixed.
+
+This reverses the housekeeping decision recorded earlier in this document ("values already
+exposed on the command line stay as argparse defaults in the scripts that own them"). That
+held while the pipeline was one script; with two sbatch scripts restating the schedule it
+stopped holding.
+
+**Five flags survive on `train.py`**, and the test each one passes is *has to differ between
+two submissions of the same experiment*:
+
+| flag | why it cannot be a constant |
+|---|---|
+| `--gnn-layers` | the sweep variable — see below |
+| `--sets` | the other arm (capped vs legacy) |
+| `--out-dir` | one directory per depth |
+| `--resume` | computed by the job script from the filesystem |
+| `--wandb` / `--wandb-run` | opt-in, and the name carries `$SLURM_JOB_ID` |
+
+`--gnn-layers` is the one that matters, and it is the reason `GNN_LAYERS` in `config.py` is a
+*default* rather than the only value. Editing that constant between two submissions has the
+race this whole section exists to avoid: `sbatch` snapshots the job script, but `config.py` is
+read when the job starts, so a still-queued 3-layer job would come up as 4 layers. The
+checkpoint would record `gnn_layers: 4` and be internally honest — but `CKPT_DIR` and the W&B
+run name would both say `gnn3`, and the result would be mislabelled rather than wrong.
+
+Since `vars(args)` no longer carries the hyperparameters, `train.py` names them explicitly in
+the W&B config. A run whose config omits its own batch size is not comparable to anything,
+which is the entire point of logging to W&B.
+
+### Inputs / outputs
+
+| | |
+|---|---|
+| In | unchanged — the same frozen capped node sets |
+| Out | `checkpoints/` (2 layers), `checkpoints/gnn3/`, `checkpoints/gnn4/`; each checkpoint records its own `gnn_layers` |
+| Run | edit `--gnn-layers` and `CKPT_DIR` in `run_train_adapter.sh`, `sbatch`, repeat; then `CKPT_DIR` and `ARM` in `run_generate_eval.sh`. Everything else is `config.py` |
+
+### Verification
+
+`python model.py --gnn-layers {2,3,4}` — every existing assertion passes at all three depths,
+including the one that matters most, that randomising the seed rows leaves the output
+bit-identical (the target's abstract cannot leak through a deeper encoder either). Parameter
+counts came out as tabulated above.
+
+`python graph.py --gnn-layers 3` — the seed-row and edge-direction assertions still hold.
+
+Checkpoint round-trip, tested directly at all three depths: the depth survives `torch.save` →
+`load_adapter`, weights come back bit-identical, a checkpoint with no `gnn_layers` key loads as
+2 layers, and a deliberate 3-vs-4 mismatch aborts on the new assertion rather than on a
+`state_dict` key error.
+
+The job scripts' path logic was exercised under `bash` for each depth: `sort -V` picks the
+newest checkpoint from the right directory, and the container-side path is `/app/checkpoints`
+or `/app/checkpoints/gnn3` as appropriate.
+
+After the `config.py` consolidation every check above was re-run unchanged, and all ten
+modules in `src/adapter/` import cleanly — the cheapest way to catch a constant that was
+referenced but never moved.
+
+### Open questions and limitations
+
+- **Nothing has been trained at depth 3 or 4.** Everything above is shape, memory and plumbing;
+  whether a deeper encoder actually lowers validation loss or lifts `valid/delta` is the
+  experiment.
+- **Depth interacts with the seed-collision effect** from the Stage 3a addendum. Collision rates
+  there were measured at 2 hops; a 4-hop neighbourhood is ~13x larger, so a seed is far more
+  likely to appear inside another seed's neighbourhood and be replaced by the mask. This has not
+  been re-measured and could quietly grow the input loss that section describes as sub-1%.
+- **Over-smoothing is untested.** Four rounds of mean aggregation over a citation graph is where
+  node representations classically start to converge; the encoder output norms in the smoke test
+  (0.71–0.73 at both depth 3 and 4, against 0.79–0.81 at depth 2) are the only signal so far and
+  come from random weights.
+- **The eval job still re-runs the frozen-Vicuna baseline for every arm**, ~3 GPU-hours for a
+  file that is byte-identical across depths (greedy decoding, identical prompts, no prefix).
+  Left as it is because the two conditions running on one node and one GPU is a deliberate part
+  of the comparison, but for the depth sweep specifically it is avoidable waste.
+
+---
+
+## Stage 6b — the prompt rewrite (2026-08-19)
+
+### Goal
+
+Raise `llm_accuracy`, which is the only metric the graph currently moves (baseline 2.81 →
+adapter 3.29 over the 945 capped eval nodes) and the one sitting furthest from its ceiling.
+The trigger was the qualitative comparison in `experiments/sentiment_analysis/report.md`: on 57
+sampled nodes, gpt-5.4-mini judged the adapter against the baseline with the gold abstract as
+reference, and the failure modes it names turned out to be specified by the prompt itself.
+
+### Change
+
+`INSTRUCTION` in `text.py`, previously carried over verbatim from
+`scripts/generate_test_csv.py`:
+
+> You are a scientific writing assistant. Based on the source publications listed below, write a
+> concise abstract for a **new application paper** that **builds on and combines these works**.
+> Output ONLY the abstract text, without any heading or explanation.
+
+Three defects, each matching a measured failure:
+
+1. **"a new … paper"** specifies invention, but the target is the existing paper's own abstract.
+   The report's summary — "a fluent abstract of a plausible-but-nonexistent paper on the right
+   topic" — describes the task as written.
+2. **"application paper"** fixes the genre. Surveys fail as a class (98612, 126535, 134751,
+   105246) because the prompt does not permit a survey abstract to be written.
+3. **"builds on and combines these works"** asks for a synthesis of the sources — the
+   neighbourhood centroid. Measured consequence: accuracy rises monotonically with how close a
+   paper sits to its own bibliography's centroid (2.56 in the most atypical quintile → 3.82 in
+   the most typical, Spearman 0.31 over 945 nodes).
+
+Also **"concise"**, against a gold mean of 174 words and generations averaging 123 (baseline) /
+142 (adapter), with 238 of 945 adapter outputs ending mid-sentence.
+
+The replacement frames the task as reconstruction, leaves the genre open, asks for the paper's
+departure from its sources rather than their combination, and names a length target. The
+surrounding frame moved with it: `Source publications:` → `Cited publications:`, and the
+trailing cue `Generated abstract:` → `Abstract:`, which stops the prompt from signalling
+"produce something new" at the point of generation.
+
+### Cost and scope
+
++74 tokens (~250 → ~510 characters) against a mean capped prompt of ~3,428 tokens and a mean
+reference of ~200. `fit_refs` re-trims to whatever budget the prompt leaves, so no prompt can
+overflow; the effect is that a node already sitting near the budget may show one reference
+fewer. `build_prompt` is called only from within `text.py` (`Corpus.example` and
+`capped_example`), so training, generation and the freeze all move together, as Stage 1e
+requires.
+
+**Runs before and after this change are not prompt-comparable**, and that includes the archived
+Vicuna and GPT baselines. The adapter checkpoints were trained under the old wording, so
+generating with the new one is a train/test mismatch — both arms need regenerating, and the
+adapter needs retraining, before the numbers mean anything.
+
+### Verification
+
+Not yet run. `verify_capped_prompts.py` is the gate: it re-derives every frozen node's prompt
+through `capped_example`, asserts at least one reference survives, and prints the largest prompt
+and the headroom left. It has to pass before any GPU time is spent.
+
+### Open questions and limitations
+
+- **The length target and the reserve interact.** 180 words is ~245 tokens; the reserve was
+  raised from 256 to 320 in the same batch of changes to give it slack, at the cost of a
+  slightly smaller prompt budget.
+- **"what it concludes" invites fabricated results.** The report records invented figures
+  ("66%", "54.2%") under the old prompt. The clause is kept because gold abstracts end with
+  claims and because the judge's accuracy rubric explicitly forgives "creative but plausible
+  predictions", but it is the clause most worth ablating.
+- **The true reference count is still hidden.** Under the cap a paper citing 96 works and one
+  citing 6 produce visually identical prompts, which removes the strongest available survey
+  signal. Adding it needs a `build_prompt` signature change and is deliberately left out of this
+  change so its effect can be attributed separately.
+- **Untested.** Every claim here is about what the prompt specifies, not about what it produces.

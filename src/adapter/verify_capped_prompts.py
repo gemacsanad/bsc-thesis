@@ -33,7 +33,7 @@ import os
 import numpy as np
 from transformers import AutoTokenizer
 
-from config import (FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
+from config import (BASE_MODEL, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
                     NUM_PREFIX_TOKENS)
 from text import Corpus, capped_example, encode
 
@@ -72,7 +72,7 @@ def check(name, nodes, tokenizer, corpus, view, mapped, budget):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="lmsys/vicuna-7b-v1.5")
+    ap.add_argument("--model", default=BASE_MODEL)
     ap.add_argument("--sample", type=int, default=100,
                     help="nodes drawn per set; 0 checks every frozen node (slow)")
     ap.add_argument("--seed", type=int, default=0)

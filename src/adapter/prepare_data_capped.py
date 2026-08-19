@@ -62,7 +62,7 @@ import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer
 
-from config import (CAPPED_EVAL_PER_DEGREE, CAPPED_MAX_OUT_DEGREE,
+from config import (BASE_MODEL, CAPPED_EVAL_PER_DEGREE, CAPPED_MAX_OUT_DEGREE,
                     CAPPED_MIN_OUT_DEGREE, CAPPED_TRAIN_PER_DEGREE,
                     CAPPED_VALID_PER_DEGREE, FROZEN_DIR, GENERATION_RESERVE,
                     JOINT_DIR, MAX_LENGTH, NUM_PREFIX_TOKENS, PROMPT_MAX_REFS)
@@ -140,7 +140,7 @@ def main():
     ap.add_argument("--edges", default=os.path.join(JOINT_DIR, "edges.csv"))
     ap.add_argument("--splits", default=os.path.join(JOINT_DIR, "splits.json"))
     ap.add_argument("--embeddings", default=os.path.join(JOINT_DIR, "node_embeddings.npy"))
-    ap.add_argument("--model", default="lmsys/vicuna-7b-v1.5", help="tokenizer to measure with")
+    ap.add_argument("--model", default=BASE_MODEL, help="tokenizer to measure with")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out-dir", default=FROZEN_DIR)
     args = ap.parse_args()

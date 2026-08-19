@@ -31,7 +31,7 @@ from rouge_score import rouge_scorer as rs_lib
 from bert_score import score as bs_fn
 from openai import OpenAI, RateLimitError
 
-load_dotenv()
+load_dotenv(".env_local")
 
 # ---------------------------------------------------------------------------
 # Args
@@ -39,8 +39,8 @@ load_dotenv()
 parser = argparse.ArgumentParser()
 parser.add_argument("--input",  default="generations.csv")
 parser.add_argument("--output", default="scored_scores_only.csv")
-parser.add_argument("--nodes",  default="data/processed/ogbn_subset/nodes_subset.csv",
-                    help="Path to nodes_subset.csv for num_of_neighbors join")
+parser.add_argument("--edges",  default="data/processed/joint/edges.csv",
+                    help="Path to joint edges.csv used to compute num_of_neighbors (out-degree)")
 parser.add_argument("--model",  default="gpt-5.4-mini", help="OpenAI model for LLM judge")
 parser.add_argument("--bertscore_batch_size", type=int, default=32,
                     help="Batch size for BERTScore; lower if you hit memory issues")
@@ -204,10 +204,15 @@ for idx, row in df.iterrows():
     rows.append(out)
 
 # ---------------------------------------------------------------------------
-# Add neighbor count
+# Add neighbor count — out-degree computed from the joint edges.csv (src cites
+# dst, so out-edges are the paper's own references). nodes_subset.csv only
+# covers the old 200-node test set, so joining against it leaves most rows
+# empty for the current eval sets.
 # ---------------------------------------------------------------------------
-nodes = pd.read_csv(args.nodes, usecols=["node_id", "num_of_neighbors"])
-df = pd.DataFrame(rows).merge(nodes, on="node_id", how="left")
+edges = pd.read_csv(args.edges, usecols=["src_node_id"])
+out_degree = edges.groupby("src_node_id").size()
+df = pd.DataFrame(rows)
+df["num_of_neighbors"] = df["node_id"].map(out_degree).fillna(0).astype(int)
 print(f"num_of_neighbors added for {df['num_of_neighbors'].notna().sum()}/{len(df)} rows.")
 
 # ---------------------------------------------------------------------------

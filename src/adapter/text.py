@@ -6,8 +6,15 @@ train and validation node lists so every run reads the same sets.
 
 Prompt
 ------
-Vicuna-v1.1 chat format, carried over verbatim from `scripts/generate_test_csv.py` so
-the results stay comparable with the earlier Vicuna and GPT baselines in `experiments/_archive/`.
+Vicuna-v1.1 chat format. The instruction was carried over verbatim from
+`scripts/generate_test_csv.py` until 2026-08-19 and rewritten then, so runs on either side of
+that date are not prompt-comparable — including the archived Vicuna and GPT baselines in
+`experiments/_archive/`. The old wording asked for "a concise abstract for a new application
+paper that builds on and combines these works", which specified invention where the target is
+reconstruction, fixed the genre as an application paper (surveys and empirical studies cannot
+be written under it), and asked for a synthesis of the sources rather than the one paper that
+cites them. Those three are the failure modes measured in
+`experiments/sentiment_analysis/report.md`.
 
 The target paper's **own title is not in the prompt** — the model sees only the titles and
 abstracts of the papers it cites, and has to infer the topic from the neighbourhood alone.
@@ -45,7 +52,7 @@ import random
 import pandas as pd
 from transformers import AutoTokenizer
 
-from config import (FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
+from config import (BASE_MODEL, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
                     MAX_OUT_DEGREE, MIN_OUT_DEGREE, NUM_PREFIX_TOKENS,
                     TRAIN_SUBSET, VALID_PER_DEGREE)
 from neighbour_cap import fit_refs
@@ -57,18 +64,39 @@ SYSTEM = (
 
 INSTRUCTION = (
     "You are a scientific writing assistant. "
-    "Based on the source publications listed below, write a concise abstract "
-    "for a new application paper that builds on and combines these works. "
+    "The publications listed below are cited by one paper, whose own abstract is missing. "
+    "Reconstruct that missing abstract: the problem the paper addresses, how it builds on "
+    "and departs from the work it cites, what it proposes, and what it concludes. "
+    "Infer from the references what kind of paper it is — a new method, an application, "
+    "an empirical study, or a survey — rather than assuming. "
+    "Write 150-180 words. "
     "Output ONLY the abstract text, without any heading or explanation."
 )
 
 
-def build_prompt(neighbours):
-    """`neighbours` is a list of (title, abstract) for the papers the target cites."""
+def build_prompt(neighbours, total_refs=None):
+    """`neighbours` is a list of (title, abstract) for the papers the target cites.
+
+    `total_refs` is the node's true out-degree, which under the cap is larger than
+    `len(neighbours)`. It is stated in the prompt because the cap otherwise makes a paper
+    citing 96 works indistinguishable from one citing 6, and bibliography size is the
+    clearest signal of the paper's kind that the graph can give without touching its text.
+    Defaults to everything being shown.
+    """
+    shown = len(neighbours)
+    total = shown if total_refs is None else total_refs
     sources = "\n\n".join(f"- Title: {t}\n  Abstract: {a}" for t, a in neighbours)
+    if not neighbours:
+        block = "No cited publications are available for this paper."
+    elif shown == total:
+        block = f"This paper cites {total} works, all listed below:\n{sources}"
+    else:
+        kept = ("the most representative one is" if shown == 1
+                else f"the {shown} most representative are")
+        block = f"This paper cites {total} works; {kept} listed below:\n{sources}"
     user = (f"{INSTRUCTION}\n\n"
-            f"Source publications:\n{sources or '(no neighbouring sources available)'}\n\n"
-            f"Generated abstract:")
+            f"{block}\n\n"
+            f"Abstract:")
     return f"{SYSTEM} USER: {user} ASSISTANT:"
 
 
@@ -124,12 +152,15 @@ def capped_example(tokenizer, corpus, embeddings, node_id):
     reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
     budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
 
+    all_refs = corpus.refs.get(node_id, [])
+    total = len(all_refs)
+
     def measure(kept):
-        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
+        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept], total)
         return len(tokenizer(prompt).input_ids)
 
-    refs = fit_refs(corpus.refs.get(node_id, []), embeddings, measure, budget)
-    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
+    refs = fit_refs(all_refs, embeddings, measure, budget)
+    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs], total),
             target, refs)
 
 
@@ -151,7 +182,7 @@ def collect(tokenizer, corpus, candidates, wanted, rng):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="lmsys/vicuna-7b-v1.5", help="tokenizer to measure with")
+    ap.add_argument("--model", default=BASE_MODEL, help="tokenizer to measure with")
     ap.add_argument("--nodes", default=os.path.join(JOINT_DIR, "nodes.csv"))
     ap.add_argument("--edges", default=os.path.join(JOINT_DIR, "edges.csv"))
     ap.add_argument("--seed", type=int, default=42)

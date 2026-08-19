@@ -2,7 +2,7 @@
 Stage 2 — graph tensors and dataloaders for GraphSAGE training.
 
 Builds the PyG `Data` object the GNN runs on, and `NeighborLoader`s that feed it
-complete 2-hop neighbourhoods.
+complete neighbourhoods.
 
 Graph
 -----
@@ -12,7 +12,7 @@ data/processed/joint/edges.csv with the 20 self-loops dropped.
 
 The graph is **directed, references only**. edges.csv stores (citing, cited); PyG
 aggregates along in-edges, so edge_index is stored reversed as (cited, citing) and
-messages flow from a paper's references into the paper. A node therefore learns
+messages flow from a paper's references into the paper. A node therefore learnss
 only from work it cites — never from papers citing it, which are published later
 and would not exist at generation time.
 
@@ -21,9 +21,11 @@ out-degree filter in prepare_data.py rather than cutting across it.
 
 Sampling
 --------
-`num_neighbors=[-1, -1]` — every 1-hop and every 2-hop neighbour, nothing dropped.
-Neighbourhoods are small (1-hop ~9 nodes, 2-hop ~51, max ~385 in total), so no cap
-is needed. Seed nodes occupy rows 0..batch_size-1 of each batch.
+`num_neighbors=[-1] * gnn_layers` — every neighbour at every hop, nothing dropped.
+The depth follows the encoder's layer count: a conv layer reading from an unsampled
+hop would aggregate incomplete neighbourhoods without erroring. Neighbourhoods stay
+small enough not to need a cap (capped train seeds: mean 199 nodes at 2 hops, 876 at
+3, 2,645 at 4). Seed nodes occupy rows 0..batch_size-1 of each batch.
 
 `Data` stays on CPU; sampling runs there and only the sampled subgraph moves to GPU.
 
@@ -41,7 +43,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import coalesce, remove_self_loops
 
-from config import FROZEN_DIR, JOINT_DIR, NUM_NEIGHBORS
+from config import FROZEN_DIR, GNN_LAYERS, JOINT_DIR, num_neighbors
 
 
 def load_graph(embeddings=None, edges=None):
@@ -62,11 +64,12 @@ def load_graph(embeddings=None, edges=None):
     return Data(x=x, edge_index=edge_index, num_nodes=x.size(0))
 
 
-def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0):
-    """NeighborLoader over `seed_nodes`, returning their full 2-hop neighbourhoods."""
+def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0,
+                gnn_layers=GNN_LAYERS):
+    """NeighborLoader over `seed_nodes`, returning their full `gnn_layers`-hop neighbourhoods."""
     return NeighborLoader(
         data,
-        num_neighbors=NUM_NEIGHBORS,
+        num_neighbors=num_neighbors(gnn_layers),
         input_nodes=torch.as_tensor(seed_nodes, dtype=torch.long),
         batch_size=batch_size,
         shuffle=shuffle,
@@ -80,6 +83,8 @@ def main():
     ap.add_argument("--embeddings",
                     default=os.path.join(JOINT_DIR, "node_embeddings.npy"))
     ap.add_argument("--batch-size", type=int, default=4)
+    ap.add_argument("--gnn-layers", type=int, default=GNN_LAYERS,
+                    help="encoder depth; sets the number of sampled hops")
     args = ap.parse_args()
 
     print("Building graph …")
@@ -105,7 +110,8 @@ def main():
                         ("eval", eval_nodes)]:
         print(f"  {name:<6} {len(seeds):>7,} seed nodes")
 
-    loader = make_loader(data, splits["train"], args.batch_size, shuffle=False)
+    loader = make_loader(data, splits["train"], args.batch_size, shuffle=False,
+                         gnn_layers=args.gnn_layers)
     batch = next(iter(loader))
     # Stage 3 substitutes a [MASK] vector at x[:batch_size], which is only correct
     # if the seed nodes really are the first rows of the batch.

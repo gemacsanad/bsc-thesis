@@ -14,11 +14,14 @@ Everything else is held fixed on purpose:
   * **Prompts** come from `text.build_prompt` via `text.Corpus`, the same code path training
     used. The target paper's own title is not in the prompt; the model sees only the titles
     and abstracts of the papers it cites, and infers the topic from the neighbourhood.
-  * **Greedy decoding** (`do_sample=False`). Sampling noise would sit on top of the effect
-    being measured, and reruns would not reproduce. The older
-    `experiments/_archive/vicuna-7b-8bit` baseline
-    sampled (temperature 0.35); it is therefore not a drop-in comparison for these two, which
-    is why the frozen-LLM condition is regenerated here rather than reused.
+  * **Greedy decoding** (`do_sample=False`) with `REPETITION_PENALTY`, from one `decoding`
+    dict shared by both branches so they cannot drift apart. The penalty is deterministic, so
+    reruns still reproduce; it is applied to both conditions, so the repair cannot be mistaken
+    for an adapter effect — but the degeneration it repairs is the adapter's (84 of its 945
+    outputs repeat a whole sentence, against 0 for the frozen LLM). Sampling noise would sit
+    on top of the effect being measured. The older `experiments/_archive/vicuna-7b-8bit`
+    baseline sampled (temperature 0.35); it is therefore not a drop-in comparison for these
+    two, which is why the frozen-LLM condition is regenerated here rather than reused.
   * **bfloat16, not 8-bit.** `src/generation/generate_vicuna.py` loaded the baseline in 8-bit, but
     the adapter was trained against a bf16 model and its prefix is calibrated to those
     numerics. Both conditions therefore run bf16, so quantisation error cannot be mistaken
@@ -71,9 +74,9 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import (CHECKPOINT_DIR, EXPERIMENTS_DIR, FROZEN_DIR,
-                    GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
-                    NUM_PREFIX_TOKENS)
+from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
+                    FROZEN_DIR, GENERATION_RESERVE, GNN_LAYERS, JOINT_DIR,
+                    MAX_LENGTH, MAX_NEW_TOKENS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
 from graph import load_graph, make_loader
 from model import GraphSAGEEncoder, PrefixAdapter
 from prefix_generation import generate_with_prefix, patch_for_prefix
@@ -87,7 +90,12 @@ SETS = {
 
 
 def load_adapter(path, device, sets):
-    """Restore the trained encoder and adapter from a `train.py` checkpoint."""
+    """Restore the trained encoder and adapter from a `train.py` checkpoint.
+
+    Also returns the encoder depth, which is read off the checkpoint rather than passed in:
+    the same number has to build the encoder and set the loader's hop count, and there is no
+    reason to let the command line disagree with the weights being loaded.
+    """
     checkpoint = torch.load(path, map_location=device)
     # A capped-trained prefix evaluated on legacy prompts (or the reverse) produces fluent
     # text from a neighbourhood the adapter was never calibrated on — silent, not an error.
@@ -95,18 +103,20 @@ def load_adapter(path, device, sets):
     assert was == sets, (
         f"{path} was trained on the '{was}' node sets but --sets is '{sets}'; "
         f"the prompts differ, so this pairing would not measure the trained adapter")
-    encoder = GraphSAGEEncoder().to(device)
+    gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
+    encoder = GraphSAGEEncoder(num_layers=gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
     encoder.load_state_dict(checkpoint["encoder"])
     adapter.load_state_dict(checkpoint["adapter"])
     encoder.eval()
     adapter.eval()
-    print(f"loaded {path} (epoch {checkpoint['epoch']}, step {checkpoint['step']})")
-    return encoder, adapter
+    print(f"loaded {path} (epoch {checkpoint['epoch']}, step {checkpoint['step']}, "
+          f"{gnn_layers}-layer encoder)")
+    return encoder, adapter, gnn_layers
 
 
 @torch.no_grad()
-def iter_prefixes(node_ids, encoder, adapter, data, device):
+def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers):
     """Yield `(node_id, prefix)` for each node, in the order given. `prefix` is None in
     baseline mode.
 
@@ -119,7 +129,8 @@ def iter_prefixes(node_ids, encoder, adapter, data, device):
             yield node_id, None
         return
 
-    for batch in make_loader(data, node_ids, batch_size=1, shuffle=False):
+    for batch in make_loader(data, node_ids, batch_size=1, shuffle=False,
+                             gnn_layers=gnn_layers):
         batch = batch.to(device)
         graph_vector = encoder(batch.x, batch.edge_index, batch.batch_size)
         yield int(batch.n_id[0]), adapter(graph_vector)
@@ -130,14 +141,14 @@ def main():
     ap.add_argument("--mode", choices=["baseline", "adapter"], required=True)
     ap.add_argument("--checkpoint", default=os.path.join(CHECKPOINT_DIR, "epoch2.pt"),
                     help="train.py checkpoint; --mode adapter only")
-    ap.add_argument("--model", default="lmsys/vicuna-7b-v1.5")
+    ap.add_argument("--model", default=BASE_MODEL)
     ap.add_argument("--output", default=None,
                     help="default: experiments/<mode>/generations.csv; pass a run directory "
                          "explicitly so each run keeps its own folder")
-    ap.add_argument("--sets", choices=sorted(SETS), default="capped",
+    ap.add_argument("--sets", choices=sorted(SETS), default=DEFAULT_SETS,
                     help="which frozen eval nodes to generate for; 'legacy' reproduces the "
                          "uncapped 495-node runs")
-    ap.add_argument("--max-new-tokens", type=int, default=256)
+    ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     args = ap.parse_args()
 
     eval_file, capped = SETS[args.sets]
@@ -184,8 +195,9 @@ def main():
     llm.eval()
 
     encoder = adapter = data = None
+    gnn_layers = GNN_LAYERS
     if args.mode == "adapter":
-        encoder, adapter = load_adapter(args.checkpoint, device, args.sets)
+        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets)
         data = load_graph()                                # stays on CPU; sampling runs there
         patch_for_prefix(llm, NUM_PREFIX_TOKENS)
 
@@ -209,8 +221,14 @@ def main():
     budget = MAX_LENGTH - NUM_PREFIX_TOKENS - args.max_new_tokens
     overflowed = 0
 
+    # One dict for both branches: the conditions must not drift apart in how they decode, and
+    # `generate_with_prefix` forwards **kwargs straight to `generate()`, so they cannot.
+    decoding = dict(max_new_tokens=args.max_new_tokens, do_sample=False,
+                    repetition_penalty=REPETITION_PENALTY,
+                    pad_token_id=tokenizer.pad_token_id)
+
     for i, (node_id, prefix) in enumerate(iter_prefixes(eval_nodes, encoder, adapter,
-                                                        data, device), start=1):
+                                                        data, device, gnn_layers), start=1):
         if node_id in done:
             continue
 
@@ -234,14 +252,11 @@ def main():
         else:
             try:
                 if prefix is None:
-                    out = llm.generate(input_ids, max_new_tokens=args.max_new_tokens,
-                                       do_sample=False, pad_token_id=tokenizer.pad_token_id)
+                    out = llm.generate(input_ids, **decoding)
                     new_tokens = out[0, n_tokens:]
                 else:
                     new_tokens = generate_with_prefix(
-                        llm, input_ids, prefix.to(dtype),
-                        max_new_tokens=args.max_new_tokens, do_sample=False,
-                        pad_token_id=tokenizer.pad_token_id)
+                        llm, input_ids, prefix.to(dtype), **decoding)
                 generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
             except torch.cuda.OutOfMemoryError as e:
                 generated = f"ERROR: CUDA out of memory — {e}"

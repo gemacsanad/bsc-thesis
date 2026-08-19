@@ -26,30 +26,47 @@
 #     so a stale epoch*.pt from the uncapped experiment aborts this job at startup. Move it
 #     to checkpoints/legacy-uncapped/ before the first capped run.
 #
-# Walltime is 48 h. Training is capped at 10 epochs but stops early after 2 epochs without a
-# better validation loss, so the run usually ends well before that. The estimate is ~4.3 h per
-# epoch — 7,750 nodes at a ~3,428-token mean, 2.9x the token count of the old 4,000-node set —
-# and it has never been checked on a real A100. The resume below covers a timeout, and the
-# patience counter survives it because train.py stores it in the checkpoint.
+# The hyperparameters are NOT here. Epochs, patience, batch size, gradient accumulation,
+# logging cadence, seed, base model and the W&B project are constants in src/adapter/config.py,
+# so they are changed in one place and this script does not restate them. What is passed below
+# is only what differs between two submissions.
 #
-# batch-size 2 x grad-accum 8 keeps the effective batch at 16 while halving the micro-batch:
-# sequences now average ~3,428 tokens against the ~2,300 the batch-4 memory figure was measured
-# at. If a smoke run shows headroom, 4 x 4 is the faster setting.
+# Walltime is 48 h against config.EPOCHS = 10 and PATIENCE = 2, so the run usually ends well
+# before that. The estimate is ~4.3 h per epoch — 7,750 nodes at a ~3,428-token mean, 2.9x the
+# token count of the old 4,000-node set — and it has never been checked on a real A100. The
+# resume below covers a timeout, and the patience counter survives it because train.py stores
+# it in the checkpoint.
+#
+# Encoder depth: edit --gnn-layers and CKPT_DIR below, submit, then edit them again for the
+# next depth. That is safe, and only because it is *this* file: sbatch copies the batch script
+# into the job spool at submit time, so a queued job keeps the version it was submitted with.
+# The Python under /app has no such protection — it is read when the job starts, after however
+# long the queue takes. That is precisely why the depth is a --gnn-layers argument and not the
+# GNN_LAYERS constant in config.py: editing the constant between two submissions would let a
+# still-queued job pick up the value meant for the next one.
+#
+# The two must be edited together. Each depth needs its own checkpoint directory: the resume
+# below takes the newest epoch file it finds and best.pt is a single fixed name, so two depths
+# sharing one directory would resume from and overwrite each other. train.py refuses a resume
+# whose recorded depth differs from --gnn-layers, so the mistake aborts rather than trains.
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SIF=$BASE_DIR/adapter-gpu.sif
 
-mkdir -p $BASE_DIR/logs
+CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+
+mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
 # Pick up where a timed-out or crashed run left off. train.py restores the encoder, adapter,
 # optimizer and scheduler, and restarts at the next *epoch* — progress within an epoch is lost.
-LATEST=$(ls -1 "$BASE_DIR"/checkpoints/epoch*.pt 2>/dev/null | sort -V | tail -1)
+LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
 if [ -n "$LATEST" ]; then
-    export SINGULARITYENV_RESUME="--resume /app/checkpoints/$(basename "$LATEST")"
+    export SINGULARITYENV_RESUME="--resume /app${CKPT_DIR#$BASE_DIR}/$(basename "$LATEST")"
     echo "resuming from $LATEST"
 else
     echo "no checkpoint found — starting from scratch"
 fi
+export SINGULARITYENV_CKPT_DIR="/app${CKPT_DIR#$BASE_DIR}"
 
 module load singularity
 
@@ -65,14 +82,9 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     python verify_capped_prompts.py || exit 1
 
     python train.py \
-        --epochs 10 \
-        --patience 2 \
-        --batch-size 2 \
-        --grad-accum 8 \
-        --log-every 10 \
-        --eval-every 250 \
+        --gnn-layers 2 \
+        --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-project dytag-adapter \
-        --wandb-run "adapter-$SLURM_JOB_ID" \
+        --wandb-run "adapter-gnn2-$SLURM_JOB_ID" \
         ${RESUME:-}
 '

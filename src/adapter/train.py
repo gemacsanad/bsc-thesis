@@ -35,10 +35,20 @@ The choice is written into every checkpoint, and both `--resume` and `generate.p
 checkpoint trained on the other sets: the prompts differ, so such a pairing would train or
 measure against a neighbourhood the adapter never saw, without erroring.
 
+Encoder depth
+-------------
+`--gnn-layers` (default 2) sets how many SAGEConv layers the encoder has *and* how many hops
+the loader samples — they are one number so they cannot drift apart, and a conv layer fed by
+an unsampled hop aggregates incomplete neighbourhoods without erroring.
+
+The depth is written into every checkpoint and asserted on `--resume`. Give each depth its
+own `--out-dir`: the job script resumes from whatever checkpoint is newest, and two depths
+sharing one directory would overwrite each other's `best.pt`.
+
 Early stopping
 --------------
-`--epochs` is an upper bound, not a target. Validation runs at the end of every epoch and the
-run stops once `--patience` consecutive epochs fail to improve the graph-on validation loss.
+`EPOCHS` is an upper bound, not a target. Validation runs at the end of every epoch and the
+run stops once `PATIENCE` consecutive epochs fail to improve the graph-on validation loss.
 The best epoch is copied to `checkpoints/best.pt`, because when early stopping fires the last
 checkpoint is by definition worse than the best one, and the eval job picks by filename.
 
@@ -46,11 +56,19 @@ Best loss and the patience counter are stored in every checkpoint. A 10-epoch ru
 one job, so it has to survive the resubmit the walltime forces; without this the counter would
 reset on each restart and the run could never stop early.
 
+Where the settings live
+-----------------------
+Epochs, patience, batch size, gradient accumulation, logging cadence, seed, base model and
+the W&B project are constants in `config.py`, not command-line arguments — one place to
+change them, and the sbatch script does not restate them. The flags that remain are the ones
+that have to differ between two submissions: the arm (`--gnn-layers`, `--sets`), where its
+checkpoints go (`--out-dir`), what to continue from (`--resume`), and W&B opt-in.
+
 Usage:
-    python adapter/train.py --epochs 10 --patience 2
-    python adapter/train.py --epochs 10 --patience 2 --wandb    # track metrics online
-    python adapter/train.py --patience 0                        # disable early stopping
+    python adapter/train.py
+    python adapter/train.py --wandb                             # track metrics online
     python adapter/train.py --sets legacy                       # the old 4,000/495 run
+    python adapter/train.py --gnn-layers 3 --out-dir checkpoints/gnn3
 """
 
 import argparse
@@ -64,8 +82,10 @@ from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
 
-from config import (CHECKPOINT_DIR, ENV_FILE, FROZEN_DIR, GRAD_CLIP,
-                    LEARNING_RATE, NUM_PREFIX_TOKENS, WARMUP_STEPS, WEIGHT_DECAY)
+from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE,
+                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
+                    LEARNING_RATE, LOG_EVERY, NUM_PREFIX_TOKENS, PATIENCE, SEED,
+                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader
 from model import GraphSAGEEncoder, PrefixAdapter
 from text import Corpus, capped_example, encode
@@ -206,25 +226,22 @@ def validate(llm, encoder, adapter, loader, tokenizer, example, device, dtype):
 
 
 def main():
+    # Only what varies between two submissions of the same experiment. Everything else —
+    # epochs, patience, batch size, gradient accumulation, logging cadence, seed, model,
+    # W&B project — is a constant in config.py, so the job script does not restate it.
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--model", default="lmsys/vicuna-7b-v1.5")
-    ap.add_argument("--sets", choices=sorted(SETS), default="capped",
+    ap.add_argument("--gnn-layers", type=int, default=GNN_LAYERS,
+                    help="GraphSAGE encoder depth; also sets how many hops the loader "
+                         "samples, so the two can never disagree. A flag rather than a "
+                         "config edit because two depths get submitted minutes apart")
+    ap.add_argument("--sets", choices=sorted(SETS), default=DEFAULT_SETS,
                     help="which frozen node sets to train on; 'legacy' reproduces the "
                          "uncapped 4,000/495 runs")
-    ap.add_argument("--epochs", type=int, default=10, help="upper bound; early stopping "
-                                                           "usually ends the run sooner")
-    ap.add_argument("--patience", type=int, default=2,
-                    help="stop after this many consecutive epochs without a better "
-                         "validation loss; 0 disables early stopping")
-    ap.add_argument("--batch-size", type=int, default=4)
-    ap.add_argument("--grad-accum", type=int, default=4)
-    ap.add_argument("--eval-every", type=int, default=100, help="optimizer steps")
-    ap.add_argument("--log-every", type=int, default=10, help="optimizer steps")
-    ap.add_argument("--out-dir", default=CHECKPOINT_DIR)
+    ap.add_argument("--out-dir", default=CHECKPOINT_DIR,
+                    help="one directory per depth; two depths sharing one would overwrite "
+                         "each other's best.pt")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
-    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
-    ap.add_argument("--wandb-project", default="dytag-adapter")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
     args = ap.parse_args()
 
@@ -235,7 +252,7 @@ def main():
         load_dotenv(ENV_FILE)
         wandb.login(key=os.environ["WANDB_KEY"])
 
-    torch.manual_seed(args.seed)
+    torch.manual_seed(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16
     os.makedirs(args.out_dir, exist_ok=True)
@@ -248,11 +265,13 @@ def main():
           f"{len(sets['train']):,} train nodes, {len(sets['valid']):,} valid nodes")
 
     data = load_graph()                                   # stays on CPU; sampling runs there
-    train_loader = make_loader(data, sets["train"], args.batch_size, shuffle=True)
-    valid_loader = make_loader(data, sets["valid"], args.batch_size, shuffle=False)
+    train_loader = make_loader(data, sets["train"], BATCH_SIZE, shuffle=True,
+                               gnn_layers=args.gnn_layers)
+    valid_loader = make_loader(data, sets["valid"], BATCH_SIZE, shuffle=False,
+                               gnn_layers=args.gnn_layers)
 
     corpus = Corpus()
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
     if tokenizer.pad_token is None:                        # Llama ships without one
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -267,8 +286,8 @@ def main():
         example = corpus.example
 
     # --- models -----------------------------------------------------------
-    print(f"Loading {args.model} in {dtype} …")
-    llm = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype).to(device)
+    print(f"Loading {BASE_MODEL} in {dtype} …")
+    llm = AutoModelForCausalLM.from_pretrained(BASE_MODEL, torch_dtype=dtype).to(device)
     llm.config.use_cache = False
     for p in llm.parameters():
         p.requires_grad_(False)
@@ -276,11 +295,12 @@ def main():
     llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     llm.train()
 
-    encoder = GraphSAGEEncoder().to(device)
+    encoder = GraphSAGEEncoder(num_layers=args.gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
     trainable = list(encoder.parameters()) + list(adapter.parameters())
     n_trainable = sum(p.numel() for p in trainable)
-    print(f"trainable parameters: {n_trainable:,}")
+    print(f"{args.gnn_layers}-layer encoder over {args.gnn_layers} sampled hops; "
+          f"trainable parameters: {n_trainable:,}")
 
     optimizer = AdamW(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -290,10 +310,17 @@ def main():
     run = None
     if args.wandb:
         run = wandb.init(
-            project=args.wandb_project,
+            project=WANDB_PROJECT,
             name=args.wandb_run,
+            # `vars(args)` no longer carries the hyperparameters — they are config.py
+            # constants now — so they are named here. W&B is where the runs are compared,
+            # and a run whose config omits its own batch size is not comparable to anything.
             config={**vars(args), "trainable_parameters": n_trainable,
-                    "effective_batch_size": args.batch_size * args.grad_accum,
+                    "model": BASE_MODEL, "seed": SEED,
+                    "epochs": EPOCHS, "patience": PATIENCE,
+                    "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
+                    "effective_batch_size": BATCH_SIZE * GRAD_ACCUM,
+                    "eval_every": EVAL_EVERY, "log_every": LOG_EVERY,
                     "train_nodes": len(sets["train"]), "valid_nodes": len(sets["valid"]),
                     "learning_rate": LEARNING_RATE, "weight_decay": WEIGHT_DECAY,
                     "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
@@ -315,6 +342,13 @@ def main():
         assert was == args.sets, (
             f"{args.resume} was trained on the '{was}' node sets but --sets is "
             f"'{args.sets}'; the prompts differ, so this would not be a continuation")
+        # A depth mismatch would already fail on the conv keys below, but the message would
+        # name tensors rather than the mistake — and with several depths sharing one
+        # checkpoint tree, picking up the wrong run is the likely way to get here.
+        was_layers = ckpt.get("gnn_layers", 2)   # checkpoints predating --gnn-layers are 2-layer
+        assert was_layers == args.gnn_layers, (
+            f"{args.resume} was trained with {was_layers} GNN layers but --gnn-layers is "
+            f"{args.gnn_layers}; use a separate --out-dir per depth")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -328,9 +362,9 @@ def main():
     # The job script resubmits blindly after a timeout, so it will eventually resubmit a run
     # that has nothing left to do. Say so and exit, rather than entering an empty epoch loop
     # and failing on the summary that follows it.
-    if start_epoch >= args.epochs or (args.patience and bad_epochs >= args.patience):
-        why = ("early stopping already fired" if args.patience and bad_epochs >= args.patience
-               else f"--epochs is {args.epochs}")
+    if start_epoch >= EPOCHS or (PATIENCE and bad_epochs >= PATIENCE):
+        why = ("early stopping already fired" if PATIENCE and bad_epochs >= PATIENCE
+               else f"--epochs is {EPOCHS}")
         print(f"nothing to do: checkpoint is at epoch {start_epoch} and {why}")
         if run is not None:
             run.finish()
@@ -341,20 +375,20 @@ def main():
     adapter.train()
     running, running_n, tokens, clock = 0.0, 0, 0, time.time()
 
-    for epoch in range(start_epoch, args.epochs):
+    for epoch in range(start_epoch, EPOCHS):
         for i, batch in enumerate(train_loader):
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
 
             loss, prefix = step_loss(llm, encoder, adapter, batch.to(device),
                                      input_ids, labels, mask, dtype)
-            (loss / args.grad_accum).backward()
+            (loss / GRAD_ACCUM).backward()
 
             running += loss.item()
             running_n += 1
             tokens += int(mask.sum())
 
-            if (i + 1) % args.grad_accum:
+            if (i + 1) % GRAD_ACCUM:
                 continue
 
             grad_norm = torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP)
@@ -363,7 +397,7 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             opt_step += 1
 
-            if opt_step % args.log_every == 0:
+            if opt_step % LOG_EVERY == 0:
                 elapsed = time.time() - clock
                 print(f"epoch {epoch} step {opt_step:>5}  loss {running / running_n:.4f}  "
                       f"lr {scheduler.get_last_lr()[0]:.2e}  {tokens / elapsed:,.0f} tok/s",
@@ -385,7 +419,7 @@ def main():
                     }, step=opt_step)
                 running, running_n, tokens, clock = 0.0, 0, 0, time.time()
 
-            if opt_step % args.eval_every == 0:
+            if opt_step % EVAL_EVERY == 0:
                 losses = validate(llm, encoder, adapter, valid_loader, tokenizer,
                                   example, device, dtype)
                 print(f"  valid @ step {opt_step}: graph {losses['graph']:.4f}  "
@@ -409,7 +443,7 @@ def main():
 
         print(f"epoch {epoch + 1} valid: graph {losses['graph']:.4f}  "
               f"gate=0 {losses['gate=0']:.4f}  delta {losses['gate=0'] - losses['graph']:+.4f}"
-              f"  {'best' if improved else f'no improvement {bad_epochs}/{args.patience}'}",
+              f"  {'best' if improved else f'no improvement {bad_epochs}/{PATIENCE}'}",
               flush=True)
         if run is not None:
             run.log({"valid/graph": losses["graph"], "valid/gate0": losses["gate=0"],
@@ -420,6 +454,7 @@ def main():
         torch.save({"encoder": encoder.state_dict(), "adapter": adapter.state_dict(),
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "epoch": epoch + 1, "step": opt_step, "sets": args.sets,
+                    "gnn_layers": args.gnn_layers,
                     "valid_loss": losses["graph"], "best_loss": best_loss,
                     "bad_epochs": bad_epochs}, path)
         print(f"saved {path}")
@@ -431,9 +466,9 @@ def main():
             shutil.copyfile(path, best_path)
             print(f"saved {best_path} (epoch {epoch + 1}, valid {best_loss:.4f})")
 
-        if args.patience and bad_epochs >= args.patience:
+        if PATIENCE and bad_epochs >= PATIENCE:
             print(f"\nearly stop: {bad_epochs} epochs without improvement on the validation "
-                  f"loss (best {best_loss:.4f}); {args.epochs - epoch - 1} epoch(s) skipped")
+                  f"loss (best {best_loss:.4f}); {EPOCHS - epoch - 1} epoch(s) skipped")
             break
 
         clock = time.time()
