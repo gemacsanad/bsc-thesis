@@ -1,0 +1,1 @@
+prompt v4 with repetition penalty set to 1

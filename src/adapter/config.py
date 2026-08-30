@@ -51,7 +51,7 @@ IN_CHANNELS = 1024          # voyage-4-large embedding dim
 HIDDEN_CHANNELS = 1024
 OUT_CHANNELS = 1024
 DROPOUT = 0.2
-GNN_LAYERS = 3              # default depth; --gnn-layers overrides it per run
+GNN_LAYERS = 2              # default depth; --gnn-layers overrides it per run
 
 
 def num_neighbors(gnn_layers=GNN_LAYERS):
@@ -81,7 +81,7 @@ SEED = 42
 DEFAULT_SETS = "capped"     # which frozen node sets; --sets legacy reproduces the old runs
 
 # The run schedule, previously literals in hpc/komondor/jobs/run_train_adapter.sh.
-EPOCHS = 10                 # upper bound; early stopping usually ends the run sooner
+EPOCHS = 3                 # upper bound; early stopping usually ends the run sooner
 PATIENCE = 2                # epochs without a better validation loss before stopping
 BATCH_SIZE = 2              # micro-batch; 2 x 8 keeps the effective batch at 16 while
 GRAD_ACCUM = 8              # holding memory at the capped sets' ~3,428-token mean
@@ -90,8 +90,18 @@ EVAL_EVERY = 250            # optimizer steps; at 100, validation cost more toke
 
 WANDB_PROJECT = "dytag-adapter"
 
+# --- Stage 4b: LoRA on the frozen LLM ----------------------------------------
+# Off unless train.py is given --lora. Only q_proj and v_proj, on all 32 layers: 64 modules
+# x 2 x (4096 x 16) = 8.4M parameters, against the 5.7M of the encoder and adapter together.
+# The prefix reaches the model as extra keys and values, so the query and value projections
+# are what decide how much of it is read — see lora.py for why the targets stop there.
+LORA_R = 16
+LORA_ALPHA = 32             # 2 x rank; peft scales the adapter by alpha / r
+LORA_DROPOUT = 0.05
+LORA_TARGETS = ["q_proj", "v_proj"]
+
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen
                                       # under would need references the freeze dropped
 
-REPETITION_PENALTY = 1.15
+REPETITION_PENALTY = 1.00

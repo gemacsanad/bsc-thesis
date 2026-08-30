@@ -4,11 +4,12 @@ Samples 3 nodes from each neighbour-count bin (5-10, 10-15, ..., 95-100) and
 writes node_id, original_abstract, baseline_abstract, adapter_abstract.
 """
 
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-EXPERIMENTS = Path(__file__).resolve().parent.parent
+EXPERIMENTS = Path(__file__).resolve().parents[2]
 BASELINE = EXPERIMENTS / "2026-08-15-14207605_vicuna-baseline" / "generations.csv"
 ADAPTER = EXPERIMENTS / "2026-08-15-14207605_adapter" / "generations.csv"
 EVALUATED = EXPERIMENTS / "2026-08-15-14207605_adapter" / "evaluated_result.csv"
@@ -19,7 +20,15 @@ PER_BIN = 3
 SEED = 42
 
 
+def _refuse_to_clobber(output):
+    """Re-running a builder over a CSV the judge has written into destroys paid-for work."""
+    if output.exists() and "comparison" in pd.read_csv(output, nrows=0).columns:
+        if "--force" not in sys.argv:
+            sys.exit(f"{output.name} already holds judge output; pass --force to overwrite.")
+
+
 def main():
+    _refuse_to_clobber(OUTPUT)
     baseline = pd.read_csv(BASELINE)
     adapter = pd.read_csv(ADAPTER)
     evaluated = pd.read_csv(EVALUATED)

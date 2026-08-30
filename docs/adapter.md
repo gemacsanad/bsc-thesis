@@ -1894,3 +1894,170 @@ and the headroom left. It has to pass before any GPU time is spent.
   signal. Adding it needs a `build_prompt` signature change and is deliberately left out of this
   change so its effect can be attributed separately.
 - **Untested.** Every claim here is about what the prompt specifies, not about what it produces.
+
+## Stage 6c — the prompt rewritten twice more (2026-08-20, 2026-08-21)
+
+### Goal
+
+Stage 6b's rewrite (era 2) was measured and did not work: mean `llm_accuracy` went 3.288 → 3.259.
+Two further rewrites followed, each driven by a blind-judge diagnosis rather than by intuition.
+Era 3 (2026-08-20 run) went 3.259 → 3.214. Era 4 is written but **not yet run**.
+
+The three diagnoses live in `experiments/sentiment_analysis/{01,02,03}_*/report.md`; the eras
+themselves are recorded in `text.py`'s module docstring and in each folder's `prompt.md`.
+
+### What three rewrites established
+
+Each rewrite changed 70–90% of the generated text and moved the mean by less than judge noise
+(3.288 → 3.259 → 3.214). Prompting controls *how* the abstracts are written, not *which paper*
+they are about. Two measurements over all 945 eval nodes explain why:
+
+- Generated-vs-gold bigram overlap is **0.027**; generated-vs-nearest-cited-reference is
+  **0.146**. The output is ~5× closer to a paper the target cites than to the target. Identical
+  in eras 2 and 3.
+- **10.4%** of outputs are near-verbatim copies of a single cited abstract (>0.5 overlap), and
+  those copies are **19–24% of everything scoring ≥6**. A fifth of the top tier is regurgitation,
+  not reconstruction — which qualifies every previous claim about the ceiling.
+
+### Decisions taken for era 4, and their evidence
+
+| decision | evidence |
+|---|---|
+| Drop *"what it proposes"*; describe the paper by mechanism, never by a name | Era 3 banned naming absent methods while still demanding a proposal. The demand won: coining a name went 10.7% → 33.1% → **35.2%**, rising *after* the ban, and costs **−0.43** accuracy. A prohibition cannot close a slot the same instruction opens. |
+| State that the target is **not** among the listed papers | Attacks the 10.4% copy rate; no earlier era ever said this. |
+| Keep the hedging rule | Nodes where nothing is invented average **5.38**. Naming correctly is never rewarded: golds that name their own system score 3.20 vs 3.22 for those that do not — hedging is free. |
+| Keep the voice clause | Took the adapter's third-person rate to **0.0%**. |
+| **No genre clause at all** | Only **5.6%** of golds are surveys; the model already guesses survey 22× against 53 true ones, hitting 3. Its "we propose" default is right ~94% of the time. This **overrides** the round-2 report, which read genre off extreme cells. |
+| Require plain prose | LaTeX markup reached **11.9%** and costs −0.24. |
+
+Cost: the instruction grows 133 → 181 words (~65 tokens), which under the cap is worth about a
+third of one reference.
+
+### The measured graph effect is falling, and that is progress
+
+Era 2's reference-count line made the *no-graph baseline* describe the bibliography instead of
+the paper. Third-person "the authors" in the baseline arm: 15.4% → 58.1% → 40.0%. The measured
+gap tracks it:
+
+| run | baseline | adapter | gap (95% CI) |
+|---|---|---|---|
+| 08-15 (era 1) | 2.815 | 3.288 | +0.473 ± 0.098 |
+| 08-20 (era 2) | 2.829 | 3.259 | +0.431 ± 0.095 |
+| 08-21 (era 3) | 2.871 | 3.214 | **+0.343** ± 0.094 |
+
+The gap shrank because the control was being repaired, not because the adapter regressed. With
+40% of baseline outputs still carrying the artifact, +0.343 remains an upper bound. **A prompt
+change that lowers the headline gap can be the more honest measurement**, and era 4 is expected
+to lower it again.
+
+### How strong a model would have to be
+
+`experiments/_archive/` has gpt-5.4-mini and Vicuna-7B on the same 200 nodes, same prompt, same
+judge (147 paired): **4.11 vs 2.50** accuracy. But `cat_wrong_methodology` is 70% for Vicuna and
+**95% for GPT** — the specific mechanism a paper contributes is not recoverable from its
+bibliography by any model, while domain (58% → 91%) and task (22% → 53%) are. The 6–7 accuracy
+target is above what this task supports from references alone.
+
+### Verification
+
+- `python -m py_compile src/adapter/text.py` passes.
+- `verify_capped_prompts.py` has **not** been re-run since the instruction grew; it must pass
+  before GPU time is spent, because a longer instruction shrinks the reference budget.
+
+### Open questions and limitations
+
+- **Untested.** Every era-4 claim is about what the prompt specifies. Expected effect on the mean
+  is small — roughly +0.15 from removing the naming marker; the copy clause buys validity, not
+  score.
+- **Retrain needed.** The 08-21 checkpoints were trained under era 3, so both arms need
+  regenerating and the adapter retraining before era-4 numbers mean anything.
+- **Tune on the baseline arm, and score with the accuracy rubric.** A pairwise preference judge
+  preferred the era-3 run 28–16 while its accuracy fell; the two objectives demonstrably diverge.
+- **Prompting looks exhausted for the mean.** A generation-only sweep (~150 nodes per variant, no
+  retrain) is the cheap way to confirm era 4 before committing to it; the remaining headroom is
+  in the model and the conditioning signal, not the wording.
+
+---
+
+## Stage 6d — LoRA on the frozen LLM (2026-08-24)
+
+### Goal
+
+Three prompt rewrites moved mean accuracy by 0.074 in total (3.288 / 3.259 / 3.214 / 3.143
+across eras 1-4), so the instruction is not the lever that reaches the 6-7 target. The
+failure modes that remain are register and style — stock openers (8.9% of outputs, −0.20),
+LaTeX markup (12.0%, −0.25), "we propose" phrasing (78.9%), length calibration, and an
+overlap with the gold abstract of 0.184 against 0.146 with the nearest cited reference.
+None of those are things a prompt can fix in a 7B model, and all of them are learnable from
+7,750 gold abstracts. LoRA is the smallest change that lets the LLM learn them.
+
+### Decisions
+
+**Targets: `q_proj` and `v_proj` only, rank 16.** 64 modules across the 32 layers, 8.4M
+parameters, against the 5.7M of the encoder and prefix adapter together. The prefix reaches
+the model as extra keys and values, so the query and value projections are what decide how
+much of it is read — the smallest change that lets the LLM *use* the prefix rather than
+merely tolerate it. Wider targets (`k_proj`/`o_proj`, or the MLP) are more capacity for the
+LLM to learn the task on its own, which is the same capacity that lets it ignore the graph.
+
+**Injected, not wrapped.** `peft.inject_adapter_in_model` edits the module tree in place and
+leaves the object a `LlamaForCausalLM`. `get_peft_model` would not: a `PeftModel`'s
+`generate()` reassigns `prepare_inputs_for_generation`, which is the exact attribute
+`prefix_generation.patch_for_prefix` monkeypatches, and its `forward` would have to relay
+`past_key_values`, `cache_position` and `use_cache` through `**kwargs` for `PrefixCache` to
+keep working. Injection leaves all of that untouched and needs no merge step at generation
+time whose numerics could drift from training's.
+
+**LoRA parameters are fp32, in training and generation alike.** peft builds them in the base
+dtype, bf16, and AdamW on bf16 parameters loses updates below bf16's precision. peft casts
+activations to the adapter's dtype on the way in, so if the two halves disagreed, generation
+would not be running what training produced.
+
+**Joint from step 0, not staged.** The alternative — train the prefix first, then unfreeze
+LoRA — protects the gate but is harder to describe and costs an extra run. The risk it
+guards against is measurable during training (below), so it is held in reserve.
+
+**A third evaluation arm.** With the LLM tuned, the frozen-Vicuna baseline differs from the
+adapter by two things at once. `--mode gate0` generates from the checkpoint's own weights
+with the gate forced to zero, which differs by only the graph. It is the same ablation
+`validate()` already runs every epoch, carried through to generation.
+
+### Inputs / outputs
+
+Unchanged prompts, node sets and decoding. `train.py --lora` writes the adapter tensors into
+every checkpoint under a `lora` key (`None` without the flag), growing them from ~196 MB to
+~300 MB. `generate.py` restores them automatically when present — there is no flag, because a
+prefix generated against different LLM weights than it was trained on produces fluent text
+rather than an error.
+
+```
+python train.py --lora --wandb                        # LORA=1 in run_train_adapter.sh
+python generate.py --mode gate0 --checkpoint ...      # RUN_GATE0=1 in run_generate_eval.sh
+```
+
+### Verification
+
+`verify_lora_prefix.py`, run before the GPU hours by the training job, on a 4-layer random
+Llama on CPU. Four checks, each against a failure that is otherwise silent:
+
+1. the adapter is on the forward path at all — peft zero-initialises `lora_B`, so a freshly
+   injected adapter is exactly the identity and every later check would pass vacuously
+2. gradients reach the prefix *and* every LoRA tensor through non-reentrant checkpointing
+3. a reloaded checkpoint reproduces the model bit-identically
+4. the generation cache path still agrees with the training path once the module tree is
+   edited
+
+### Open questions and limitations
+
+- **The gate may never open.** 8.4M LoRA parameters against a 64-element gate. If LoRA learns
+  the task faster than the gate learns the graph, the measured GNN effect collapses — the
+  number this project exists to defend. `gate/mean_abs` and `prefix/graph_fraction` are
+  already logged and show it inside one epoch; a flatlining gate against a falling train loss
+  is the signal to stop and switch to the staged schedule.
+- `EPOCHS = 3` was set for a run with 5.7M trainable parameters. With LoRA there is more to
+  fit and it is probably too few, but raising it doubles a 15-hour run.
+- LoRA co-adapts to whatever prompt is in `text.py` when training starts. That fixes the
+  prompt for the lifetime of the checkpoint.
+- Nothing here has run on a GPU yet. The memory estimate — ~13.5 GB weights plus ~34 MB of
+  fp32 adapters and optimizer state, on top of the existing ~1 GB of activations — is
+  arithmetic, not a measurement.

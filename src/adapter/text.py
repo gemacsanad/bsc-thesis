@@ -1,45 +1,4 @@
 """
-Stage 4 — prompts, labels, and the frozen training subsets.
-
-Turns a node into the (prompt, target) pair the LLM is trained on, and freezes the
-train and validation node lists so every run reads the same sets.
-
-Prompt
-------
-Vicuna-v1.1 chat format. The instruction was carried over verbatim from
-`scripts/generate_test_csv.py` until 2026-08-19 and rewritten then, so runs on either side of
-that date are not prompt-comparable — including the archived Vicuna and GPT baselines in
-`experiments/_archive/`. The old wording asked for "a concise abstract for a new application
-paper that builds on and combines these works", which specified invention where the target is
-reconstruction, fixed the genre as an application paper (surveys and empirical studies cannot
-be written under it), and asked for a synthesis of the sources rather than the one paper that
-cites them. Those three are the failure modes measured in
-`experiments/sentiment_analysis/report.md`.
-
-The target paper's **own title is not in the prompt** — the model sees only the titles and
-abstracts of the papers it cites, and has to infer the topic from the neighbourhood alone.
-Loss is computed on the target abstract only; the prompt is masked with -100.
-
-Subsets
--------
-Nodes whose prompt + target + prefix exceeds the 4,096-token context are dropped, so every
-training sequence is complete. Candidates are shuffled and walked until enough survivors are
-collected, which is distributionally the same as sampling from the fitting set but tokenises
-a few thousand nodes instead of all 48,000.
-
-train  — TRAIN_SUBSET nodes from the eligible train split
-valid  — VALID_PER_DEGREE nodes at each out-degree 5-15, matching how the eval set was built
-
-The 495-node evaluation set in `eval_nodes.json` is **not** touched; its overflow rate is
-reported so Stage 5 knows what it is dealing with.
-
-Capped prompts
---------------
-`capped_example` is the Stage 1b path: instead of dropping a node whose reference list
-overflows, it trims the list to the references closest to its centroid (neighbour_cap.py)
-until the prompt fits. It is the *only* place a capped prompt is built — the freeze,
-training and generation all call it, so all three see the same references.
-
 Usage:
     python adapter/text.py          # freeze the subsets (needs the Vicuna tokenizer)
 """
@@ -62,41 +21,21 @@ SYSTEM = (
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
 )
 
+
 INSTRUCTION = (
     "You are a scientific writing assistant. "
-    "The publications listed below are cited by one paper, whose own abstract is missing. "
-    "Reconstruct that missing abstract: the problem the paper addresses, how it builds on "
-    "and departs from the work it cites, what it proposes, and what it concludes. "
-    "Infer from the references what kind of paper it is — a new method, an application, "
-    "an empirical study, or a survey — rather than assuming. "
-    "Write 150-180 words. "
+    "Based on the source publications listed below, write a concise abstract "
+    "for a new application paper that builds on and combines these works. "
     "Output ONLY the abstract text, without any heading or explanation."
 )
 
 
-def build_prompt(neighbours, total_refs=None):
-    """`neighbours` is a list of (title, abstract) for the papers the target cites.
-
-    `total_refs` is the node's true out-degree, which under the cap is larger than
-    `len(neighbours)`. It is stated in the prompt because the cap otherwise makes a paper
-    citing 96 works indistinguishable from one citing 6, and bibliography size is the
-    clearest signal of the paper's kind that the graph can give without touching its text.
-    Defaults to everything being shown.
-    """
-    shown = len(neighbours)
-    total = shown if total_refs is None else total_refs
+def build_prompt(neighbours):
+    """`neighbours` is a list of (title, abstract) for the papers the target cites."""
     sources = "\n\n".join(f"- Title: {t}\n  Abstract: {a}" for t, a in neighbours)
-    if not neighbours:
-        block = "No cited publications are available for this paper."
-    elif shown == total:
-        block = f"This paper cites {total} works, all listed below:\n{sources}"
-    else:
-        kept = ("the most representative one is" if shown == 1
-                else f"the {shown} most representative are")
-        block = f"This paper cites {total} works; {kept} listed below:\n{sources}"
     user = (f"{INSTRUCTION}\n\n"
-            f"{block}\n\n"
-            f"Abstract:")
+            f"Source publications:\n{sources or '(no neighbouring sources available)'}\n\n"
+            f"Generated abstract:")
     return f"{SYSTEM} USER: {user} ASSISTANT:"
 
 
@@ -153,14 +92,13 @@ def capped_example(tokenizer, corpus, embeddings, node_id):
     budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
 
     all_refs = corpus.refs.get(node_id, [])
-    total = len(all_refs)
 
     def measure(kept):
-        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept], total)
+        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
         return len(tokenizer(prompt).input_ids)
 
     refs = fit_refs(all_refs, embeddings, measure, budget)
-    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs], total),
+    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
             target, refs)
 
 

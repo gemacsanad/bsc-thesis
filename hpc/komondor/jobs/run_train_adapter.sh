@@ -54,8 +54,14 @@ BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SIF=$BASE_DIR/adapter-gpu.sif
 
 CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+LORA=1                                  # 1 also trains LoRA on the LLM's q/v projections
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
+
+# LoRA is recorded in every checkpoint and train.py refuses to resume across a change of it,
+# so a LoRA run needs its own CKPT_DIR — the resume below picks up whatever epoch file is
+# newest, which would otherwise be another run's.
+[ "$LORA" = 1 ] && export SINGULARITYENV_LORA="--lora"
 
 # Pick up where a timed-out or crashed run left off. train.py restores the encoder, adapter,
 # optimizer and scheduler, and restarts at the next *epoch* — progress within an epoch is lost.
@@ -81,10 +87,14 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # wrong references yield a fluent abstract, not an error — so it runs before the GPU hours.
     python verify_capped_prompts.py || exit 1
 
+    # Same idea for LoRA: it edits the module tree the prefix is injected into, and every way
+    # that can go wrong yields fluent text rather than an error.
+    [ -n "${LORA:-}" ] && { python verify_lora_prefix.py || exit 1; }
+
     python train.py \
         --gnn-layers 2 \
         --out-dir "$CKPT_DIR" \
         --wandb \
         --wandb-run "adapter-gnn2-$SLURM_JOB_ID" \
-        ${RESUME:-}
+        ${LORA:-} ${RESUME:-}
 '

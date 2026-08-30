@@ -19,6 +19,15 @@
 # the prefix differs between the two files. Greedy decoding, bf16, batch size 1 — see
 # docs/adapter_evaluation.md for why each of those is fixed.
 #
+# RUN_BASELINE=0 skips the control and halves the walltime. Only do that when the decoding
+# settings are unchanged from a run whose baseline already exists — the GNN gap is a difference
+# between the two arms, so a baseline generated under different decoding cannot be reused.
+#
+# RUN_GATE0=1 adds a third arm: the checkpoint's own weights with the gate forced to zero, so
+# the prefix is node-independent. Under LoRA that is the control that isolates the graph — the
+# frozen-Vicuna arm differs from the adapter by two things at once, LoRA and the graph, while
+# gate=0 differs by only the graph. Without LoRA it is redundant with the baseline.
+#
 # Nothing is trained and nothing is written to W&B; no .env is needed.
 #
 # Prerequisites:
@@ -43,6 +52,8 @@ mkdir -p $BASE_DIR/logs
 # never build the wrong encoder for them.
 CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
 ARM=adapter-gnn2                        # experiments/<date>-<job>_$ARM/
+RUN_BASELINE=0                          # 0 to generate the adapter arm only
+RUN_GATE0=0                             # 1 adds the gate=0 arm (see below)
 
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
 # early stopping the *last* epoch is by definition worse than the best one, so picking the
@@ -65,6 +76,8 @@ export SINGULARITYENV_CKPT="/app${CKPT_DIR#$BASE_DIR}/$(basename "$LATEST")"
 # so several depths evaluated on one day stay tellable apart in experiments/.
 export SINGULARITYENV_RUN_TAG="$(date +%F)-${SLURM_JOB_ID:-manual}"
 export SINGULARITYENV_ARM="$ARM"
+export SINGULARITYENV_RUN_BASELINE="$RUN_BASELINE"
+export SINGULARITYENV_RUN_GATE0="$RUN_GATE0"
 
 module load singularity
 
@@ -82,9 +95,19 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # so it runs before the GPU hours, not after.
     python verify_generation.py || exit 1
 
-    echo "=== baseline: frozen Vicuna-7B, no prefix ==="
-    python generate.py --mode baseline \
-        --output "/app/experiments/${RUN_TAG}_vicuna-baseline/generations.csv"
+    if [ "$RUN_BASELINE" = 1 ]; then
+        echo "=== baseline: frozen Vicuna-7B, no prefix ==="
+        python generate.py --mode baseline \
+            --output "/app/experiments/${RUN_TAG}_vicuna-baseline/generations.csv"
+    else
+        echo "=== baseline skipped (RUN_BASELINE=0) ==="
+    fi
+
+    if [ "$RUN_GATE0" = 1 ]; then
+        echo "=== gate=0: the same weights with the graph disconnected ==="
+        python generate.py --mode gate0 --checkpoint "$CKPT" \
+            --output "/app/experiments/${RUN_TAG}_${ARM}-gate0/generations.csv"
+    fi
 
     echo "=== adapter: GraphSAGE + prefix adapter + frozen Vicuna-7B ($ARM) ==="
     python generate.py --mode adapter --checkpoint "$CKPT" \

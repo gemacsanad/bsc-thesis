@@ -1,68 +1,4 @@
 """
-Stage 4 — train the GraphSAGE encoder and prefix adapter against a frozen Vicuna-7B.
-
-The LLM is frozen and never receives a gradient. The only trainable channel is the prefix:
-the graph neighbourhood is encoded, mapped to per-layer key/value prefixes, and injected as
-`past_key_values`. Loss is cross-entropy on the target abstract's tokens.
-
-The injection recipe below was verified in `verify_prefix_injection.ipynb`; each part of it
-fails *silently* if dropped, so none of it is incidental:
-
-  * `PrefixCache` instead of `DynamicCache` — gradient checkpointing recomputes each layer,
-    and a mutating cache appends the body's keys a second time (10 -> 26 -> 42 positions).
-  * `attention_mask` of length `NUM_PREFIX_TOKENS + L`, covering the prefix as well.
-  * explicit `cache_position`, because `use_cache=False` leaves `past_seen_tokens` at 0 and
-    the causal mask is then built as if the prefix were not there.
-  * `use_reentrant=False`, because with a frozen LLM no tensor input to layer 0 requires a
-    gradient and reentrant checkpointing refuses to build a graph.
-
-Positions run `P .. P+L-1` (the default, `position_ids = cache_position`), which is the same
-convention the patched `generate()` produces — train and generate must agree or the prefix is
-read at an offset it was never trained for.
-
-Memory on one A100 40GB, bf16 + checkpointing: ~13.5 GB weights, ~1 GB activations, leaving
-room for batch 4-8. Without checkpointing the activations alone are 14-22 GB. Those figures
-were measured at a ~2,300-token mean; the capped sets average ~3,400, so the headroom is
-smaller than it looks.
-
-Node sets
----------
-`--sets capped` (default) trains on `training_sets_capped.json` — 7,750 train / 806 valid
-nodes at out-degree 5-100 — with prompts trimmed to the centroid-closest references by
-`text.capped_example`. `--sets legacy` reproduces the older uncapped 4,000/495 runs.
-
-The choice is written into every checkpoint, and both `--resume` and `generate.py` refuse a
-checkpoint trained on the other sets: the prompts differ, so such a pairing would train or
-measure against a neighbourhood the adapter never saw, without erroring.
-
-Encoder depth
--------------
-`--gnn-layers` (default 2) sets how many SAGEConv layers the encoder has *and* how many hops
-the loader samples — they are one number so they cannot drift apart, and a conv layer fed by
-an unsampled hop aggregates incomplete neighbourhoods without erroring.
-
-The depth is written into every checkpoint and asserted on `--resume`. Give each depth its
-own `--out-dir`: the job script resumes from whatever checkpoint is newest, and two depths
-sharing one directory would overwrite each other's `best.pt`.
-
-Early stopping
---------------
-`EPOCHS` is an upper bound, not a target. Validation runs at the end of every epoch and the
-run stops once `PATIENCE` consecutive epochs fail to improve the graph-on validation loss.
-The best epoch is copied to `checkpoints/best.pt`, because when early stopping fires the last
-checkpoint is by definition worse than the best one, and the eval job picks by filename.
-
-Best loss and the patience counter are stored in every checkpoint. A 10-epoch run does not fit
-one job, so it has to survive the resubmit the walltime forces; without this the counter would
-reset on each restart and the run could never stop early.
-
-Where the settings live
------------------------
-Epochs, patience, batch size, gradient accumulation, logging cadence, seed, base model and
-the W&B project are constants in `config.py`, not command-line arguments — one place to
-change them, and the sbatch script does not restate them. The flags that remain are the ones
-that have to differ between two submissions: the arm (`--gnn-layers`, `--sets`), where its
-checkpoints go (`--out-dir`), what to continue from (`--resume`), and W&B opt-in.
 
 Usage:
     python adapter/train.py
@@ -84,8 +20,8 @@ from transformers.cache_utils import Cache
 
 from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE,
                     EPOCHS, EVAL_EVERY, FROZEN_DIR, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
-                    LEARNING_RATE, LOG_EVERY, NUM_PREFIX_TOKENS, PATIENCE, SEED,
-                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
+                    LEARNING_RATE, LOG_EVERY, LORA_R, LORA_TARGETS, NUM_PREFIX_TOKENS,
+                    PATIENCE, SEED, WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader
 from model import GraphSAGEEncoder, PrefixAdapter
 from text import Corpus, capped_example, encode
@@ -240,6 +176,9 @@ def main():
     ap.add_argument("--out-dir", default=CHECKPOINT_DIR,
                     help="one directory per depth; two depths sharing one would overwrite "
                          "each other's best.pt")
+    ap.add_argument("--lora", action="store_true",
+                    help="also train LoRA adapters on the LLM's q/v projections (lora.py). "
+                         "Without it the LLM is frozen, as in every run up to now")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
@@ -251,6 +190,10 @@ def main():
         import wandb
         load_dotenv(ENV_FILE)
         wandb.login(key=os.environ["WANDB_KEY"])
+
+    # Imported here, like wandb above, so a run without --lora does not depend on peft.
+    if args.lora:
+        from lora import add_lora, load_lora_state, lora_state_dict
 
     torch.manual_seed(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -291,13 +234,22 @@ def main():
     llm.config.use_cache = False
     for p in llm.parameters():
         p.requires_grad_(False)
+
+    # Before checkpointing is enabled, so the wrappers are placed around the final module
+    # tree rather than around one the injection then edits underneath them.
+    lora_params = []
+    if args.lora:
+        lora_params = add_lora(llm)
+        print(f"LoRA r={LORA_R} on {LORA_TARGETS}: {sum(p.numel() for p in lora_params):,} "
+              f"parameters across {len(lora_params) // 2} modules")
+
     # reentrant checkpointing needs an input that requires grad; with a frozen LLM there is none
     llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     llm.train()
 
     encoder = GraphSAGEEncoder(num_layers=args.gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
-    trainable = list(encoder.parameters()) + list(adapter.parameters())
+    trainable = list(encoder.parameters()) + list(adapter.parameters()) + lora_params
     n_trainable = sum(p.numel() for p in trainable)
     print(f"{args.gnn_layers}-layer encoder over {args.gnn_layers} sampled hops; "
           f"trainable parameters: {n_trainable:,}")
@@ -349,8 +301,17 @@ def main():
         assert was_layers == args.gnn_layers, (
             f"{args.resume} was trained with {was_layers} GNN layers but --gnn-layers is "
             f"{args.gnn_layers}; use a separate --out-dir per depth")
+        # Resuming a LoRA run without --lora would continue a prefix against a different set
+        # of LLM weights than it was trained against — no error, just a wrong continuation.
+        was_lora = ckpt.get("lora") is not None
+        assert was_lora == args.lora, (
+            f"{args.resume} was trained {'with' if was_lora else 'without'} LoRA but --lora "
+            f"is {'set' if args.lora else 'not set'}; the LLM's weights differ between the "
+            f"two, so the prefix would continue against a model it never saw")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
+        if args.lora:
+            load_lora_state(llm, ckpt["lora"])
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch, opt_step = ckpt["epoch"], ckpt["step"]
@@ -452,6 +413,7 @@ def main():
 
         path = os.path.join(args.out_dir, f"epoch{epoch + 1}.pt")
         torch.save({"encoder": encoder.state_dict(), "adapter": adapter.state_dict(),
+                    "lora": lora_state_dict(llm) if args.lora else None,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "epoch": epoch + 1, "step": opt_step, "sets": args.sets,
                     "gnn_layers": args.gnn_layers,

@@ -68,6 +68,7 @@ import argparse
 import csv
 import json
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -89,12 +90,32 @@ SETS = {
 }
 
 
-def load_adapter(path, device, sets):
+def remap_encoder(state):
+    """`conv1`/`conv2` -> `convs.0`/`convs.1` for checkpoints written before the encoder
+    became a ModuleList (4105279, 2026-08-19, the commit that added --gnn-layers).
+
+    Only the attribute name moved: at two layers both definitions build the same pair of
+    1024-wide `SAGEConv(aggr="mean")` layers, with relu and dropout between them and no
+    activation on the output. `state` is returned unchanged unless an old-style key is
+    actually present, so checkpoints from every run since 08-19 do not go through this.
+    """
+    if not any(re.match(r"conv\d+\.", key) for key in state):
+        return state
+    print("checkpoint predates the ModuleList encoder — remapping convN. -> convs.N-1.")
+    return {re.sub(r"^conv(\d+)\.", lambda m: f"convs.{int(m.group(1)) - 1}.", key): value
+            for key, value in state.items()}
+
+
+def load_adapter(path, device, sets, llm):
     """Restore the trained encoder and adapter from a `train.py` checkpoint.
 
     Also returns the encoder depth, which is read off the checkpoint rather than passed in:
     the same number has to build the encoder and set the loader's hop count, and there is no
     reason to let the command line disagree with the weights being loaded.
+
+    If the checkpoint carries LoRA, it is injected into `llm` here. That is not optional and
+    there is no flag for it: the prefix was trained against those LLM weights, so generating
+    without them measures a prefix on a model it never saw — fluent text, no error.
     """
     checkpoint = torch.load(path, map_location=device)
     # A capped-trained prefix evaluated on legacy prompts (or the reverse) produces fluent
@@ -106,12 +127,20 @@ def load_adapter(path, device, sets):
     gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
     encoder = GraphSAGEEncoder(num_layers=gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
-    encoder.load_state_dict(checkpoint["encoder"])
+    encoder.load_state_dict(remap_encoder(checkpoint["encoder"]))
     adapter.load_state_dict(checkpoint["adapter"])
     encoder.eval()
     adapter.eval()
+
+    lora = checkpoint.get("lora")     # None for every checkpoint trained without --lora
+    if lora is not None:
+        from lora import add_lora, load_lora_state
+        add_lora(llm)
+        load_lora_state(llm, lora)
+
     print(f"loaded {path} (epoch {checkpoint['epoch']}, step {checkpoint['step']}, "
-          f"{gnn_layers}-layer encoder)")
+          f"{gnn_layers}-layer encoder, "
+          f"{'LoRA restored' if lora is not None else 'frozen LLM'})")
     return encoder, adapter, gnn_layers
 
 
@@ -138,7 +167,7 @@ def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["baseline", "adapter"], required=True)
+    ap.add_argument("--mode", choices=["baseline", "adapter", "gate0"], required=True)
     ap.add_argument("--checkpoint", default=os.path.join(CHECKPOINT_DIR, "epoch2.pt"),
                     help="train.py checkpoint; --mode adapter only")
     ap.add_argument("--model", default=BASE_MODEL)
@@ -196,10 +225,21 @@ def main():
 
     encoder = adapter = data = None
     gnn_layers = GNN_LAYERS
-    if args.mode == "adapter":
-        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets)
+    if args.mode != "baseline":
+        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets, llm)
+        # `gate0` is the ablation validate() runs every epoch, carried through to generation:
+        # the same weights, the same LoRA, with the graph disconnected from the prefix. Under
+        # LoRA it is the honest control, since the frozen-Vicuna arm differs by two things.
+        if args.mode == "gate0":
+            with torch.no_grad():
+                adapter.gate.zero_()
+            print("gate forced to zero — the prefix is node-independent from here on")
         data = load_graph()                                # stays on CPU; sampling runs there
         patch_for_prefix(llm, NUM_PREFIX_TOKENS)
+
+    # After any LoRA injection: peft builds its modules in train mode, and lora_dropout would
+    # otherwise be live at generation time, making greedy decoding non-deterministic.
+    llm.eval()
 
     # --- resume -----------------------------------------------------------
     done = set()
