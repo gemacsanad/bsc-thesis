@@ -8,6 +8,8 @@ rather than a rewrite of what came before.
 | [`adapter.md`](adapter.md) | Stages 1–4 of the current model: eligible nodes and the frozen eval set, the graph tensors and loaders, the GraphSAGE encoder, the prefix adapter, prefix injection into a frozen Vicuna, training, W&B telemetry, the container and the training job. |
 | [`adapter_evaluation.md`](adapter_evaluation.md) | Stage 5: generating the two evaluation CSVs, and what is held fixed between the adapter and baseline conditions. |
 | [`hpc_migration.md`](hpc_migration.md) | Moving the Komondor project onto this layout in place, keeping the Vicuna cache, the trained adapter and the S2 download. |
+| [`model_swap_qwen.md`](model_swap_qwen.md) | Stage 7, **the plan**: swapping the frozen Vicuna-7B for Qwen3-14B, what must not change, and why. |
+| [`qwen_migration.md`](qwen_migration.md) | Stage 7, **the record**: what was actually built at each step, with the measurements. |
 | [`weekly/week_4.md`](weekly/week_4.md) | The reference-filtering pipeline — LLM relevance labels, Voyage embeddings, and the two cosine scores. Old generation. |
 | `../src/data/s2/README.md` | The Semantic Scholar bulk download and the joint dataset build. |
 
