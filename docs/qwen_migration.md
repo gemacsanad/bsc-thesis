@@ -140,3 +140,84 @@ plan's central architectural claim into every build log.
   is CPU work still owed before step 5 writes the ChatML wrapper.
 - The local env proves Python-level compatibility only; the `+pt22cu121` extensions are Linux
   CUDA builds, verified by the Komondor `%test` rather than locally.
+
+---
+
+## Step 2 — freezing the reference lists
+
+**Done 2026-09-03.** The plan calls this *"the step that makes 'the data is the same' true
+rather than assumed."*
+
+### What was actually wrong
+
+`text.capped_example` decided a node's bibliography at call time: keep the 15 references closest
+to the centroid, then drop the farthest one at a time until the **tokenizer's** count fits the
+budget. So the bibliography is a function of the tokenizer. Qwen3's BPE is more efficient on
+English than Vicuna's SentencePiece — more references would survive the same 4,096-token budget,
+and the two arms would silently read different evidence.
+
+**Nothing new is decided here, and that is worth being clear about.** The frozen node sets were
+selected in August by running this same computation, so these lists were already implicit in
+every run since. They were simply never written down: reproducibility came from *recomputation*
+— same tokenizer, same code, same reserve ⇒ same answer. That held fine until now. Swapping the
+LLM is precisely what breaks the assumption.
+
+Checked before building anything: no reference lists were stored anywhere. Both 08-15
+`generations.csv` files are 945 × `[node_id, mag_id, original_abstract, generated_abstract]`,
+and `generate.py:215` discards the list on the spot (`prompt, target, _ = capped_example(...)`).
+`data/frozen/` held only node-id lists. The only persisted bibliographies in the repo were
+`prompt_sensitivity_gpt/0*/test_set.csv` — 48 nodes, 0.5% of the 9,501.
+
+### Decisions
+
+| decision | reasoning |
+|---|---|
+| `capped_example(..., frozen=True)` **raises** on a missing node | the plan's "load it when it exists" wording admits a silent fallback. A node quietly recomputed under Qwen's tokenizer would be shown a different bibliography and would still produce a fluent abstract — no error, nothing downstream can tell |
+| `frozen=False` kept as the producer path | pinned explicitly in `prepare_data_capped.py`, which walks candidates not yet in any frozen set and is what decides membership. It is not re-run |
+| tokenizer pinned **in the script**, not read from `config.BASE_MODEL` | `BASE_MODEL` becomes Qwen at step 4; re-running the freeze afterwards must still reproduce the same file |
+| new `freeze_prompt_refs.py` rather than a mode on `text.py`'s `main()` | that `main()` builds the *legacy* non-capped training sets; the two jobs share nothing |
+| reserve **320**, not 256 | see `model_swap_qwen.md` §1 — the measurement that settled it is the era-1 gate below |
+
+### How to run
+
+```bash
+cd src/adapter
+python freeze_prompt_refs.py            # ~20 min on a laptop CPU
+```
+
+Writes `data/frozen/prompt_refs_capped.json` (`node_id → [ref_node_id, ...]`, `edges.csv`
+order), then runs its own checks. Versioned deliberately, like the node lists: a result cannot
+be reproduced without it.
+
+### Results
+
+9,501 nodes — 945 eval + 7,750 train + 806 valid. File is 1,040,720 bytes.
+
+| check | result |
+|---|---|
+| coverage | keys are exactly the three frozen sets; every node keeps ≥1 reference; `edges.csv` order preserved |
+| **era-1 gate** | **48/48** prompts *and* reference lists match the stored build, string-for-string |
+| regression | 450 nodes (150/set) byte-identical between `frozen=True` and `frozen=False` |
+| `verify_capped_prompts.py` | 900 sampled nodes ok; largest prompt 3,766 tokens = the budget exactly |
+| determinism | two full runs produced md5 `6044dbffd30bb8c5131f1f8e8ca9554c` both times |
+
+References shown across all 9,501: **mean 12.87, median 14, min 5, max 15**. Consistent with the
+13.25 mean the `prompt_sensitivity_gpt` README reports for its 48-node stratified sample.
+
+The era-1 gate is the load-bearing number. It is the direct confirmation that reserve 320 was
+right: the same check is 45/48 at 256.
+
+### Known limitations
+
+- **The hard gate covers 48 of 9,501 nodes — 0.5%.** The other 9,453 have no stored prompt to
+  diff against. The only guarantee for them is that they came from this code path, this
+  tokenizer and this reserve. Do not claim a verification that was not done.
+- **`verify_capped_prompts.py`'s check 1 is now vacuous.** It compares `np.load(...)` against
+  `np.load(..., mmap_mode="r")` — train.py's embedding source versus generate.py's — asserting
+  they build identical prompts. On the frozen path `embeddings` is never consulted, so the
+  assertion passes without testing anything. The divergence it guarded against is now impossible
+  by construction, so this is not a correctness problem, but a test that silently stops testing
+  is exactly the failure class this project keeps hitting. Fix it in step 7's rewrite of that
+  script.
+- `tokenizer` and `embeddings` remain in `capped_example`'s signature though unused when frozen,
+  so the two paths stay interchangeable and no caller had to change.

@@ -16,6 +16,25 @@ from config import (BASE_MODEL, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_L
                     TRAIN_SUBSET, VALID_PER_DEGREE)
 from neighbour_cap import fit_refs
 
+# Which references a prompt shows was decided once, under the Vicuna tokenizer, and written
+# here. It used to be recomputed per call, which made the bibliography a function of the
+# *tokenizer*: Qwen3's BPE is more efficient on English than Vicuna's SentencePiece, so more
+# references would survive the same budget and the two models would silently read different
+# evidence. See docs/model_swap_qwen.md §5 step 2.
+FROZEN_REFS = os.path.join(FROZEN_DIR, "prompt_refs_capped.json")
+
+_frozen_refs = None
+
+
+def frozen_refs():
+    """-> {node_id: [ref_node_id, ...]}, the bibliography every model reads. Cached."""
+    global _frozen_refs
+    if _frozen_refs is None:
+        with open(FROZEN_REFS) as f:
+            _frozen_refs = {int(k): v for k, v in json.load(f).items()}
+    return _frozen_refs
+
+
 SYSTEM = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."
@@ -73,7 +92,7 @@ class Corpus:
         return len(self.refs.get(node_id, []))
 
 
-def capped_example(tokenizer, corpus, embeddings, node_id):
+def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     """-> (prompt, target, kept_refs) for one node, trimmed to fit the context.
 
     The single capped-prompt path: prepare_data_capped.py freezes node sets with it,
@@ -82,22 +101,34 @@ def capped_example(tokenizer, corpus, embeddings, node_id):
     references are the ones shown, and the failure mode of a mismatched budget is silent
     (a fluent abstract written from the wrong sources, not an error).
 
-    The budget leaves room for the prefix and for the abstract: the node's own abstract
-    when it is longer than GENERATION_RESERVE, so the training sequence is complete, and
-    never less than GENERATION_RESERVE, so generation has somewhere to write.
+    `frozen=True` reads the reference list from FROZEN_REFS and raises KeyError if the node
+    is not in it. It deliberately does not fall back to recomputing: a node recomputed under
+    a different tokenizer would be shown a different bibliography and would still produce a
+    fluent abstract. `tokenizer` and `embeddings` go unused on this path, and stay in the
+    signature because every caller has both and the two paths must remain interchangeable.
+
+    `frozen=False` is the original computation, and is how FROZEN_REFS itself is built
+    (freeze_prompt_refs.py). The budget leaves room for the prefix and for the abstract: the
+    node's own abstract when it is longer than GENERATION_RESERVE, so the training sequence
+    is complete, and never less than GENERATION_RESERVE, so generation has somewhere to write.
     """
     target = corpus.abstract[node_id]
-    target_ids = tokenizer(target, add_special_tokens=False).input_ids
-    reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
-    budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
 
-    all_refs = corpus.refs.get(node_id, [])
+    if frozen:
+        refs = frozen_refs()[node_id]
+    else:
+        target_ids = tokenizer(target, add_special_tokens=False).input_ids
+        reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
+        budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
 
-    def measure(kept):
-        prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
-        return len(tokenizer(prompt).input_ids)
+        all_refs = corpus.refs.get(node_id, [])
 
-    refs = fit_refs(all_refs, embeddings, measure, budget)
+        def measure(kept):
+            prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
+            return len(tokenizer(prompt).input_ids)
+
+        refs = fit_refs(all_refs, embeddings, measure, budget)
+
     return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
             target, refs)
 

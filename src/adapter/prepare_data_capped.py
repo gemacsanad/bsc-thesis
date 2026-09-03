@@ -78,7 +78,10 @@ def collect(tokenizer, corpus, embeddings, candidates, wanted, rng):
     kept, lengths, refs, seen = [], [], [], 0
     for node_id in pool:
         seen += 1
-        prompt, target, node_refs = capped_example(tokenizer, corpus, embeddings, node_id)
+        # frozen=False: this walks candidates that are not yet in any frozen set, and it is
+        # what decides membership in the first place. It is not re-run — model_swap_qwen.md §6.
+        prompt, target, node_refs = capped_example(tokenizer, corpus, embeddings, node_id,
+                                                   frozen=False)
         if not node_refs:
             continue        # not even one reference fits — the graph cannot be shown at all
         input_ids, _ = encode(tokenizer, prompt, target)
