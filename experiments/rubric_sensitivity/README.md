@@ -1,207 +1,176 @@
-# Does the judge rubric decide how large the graph effect looks?
+# Does the judge's rubric decide how big the graph effect looks?
 
-Every accuracy number in this project comes from one judge prompt, in
-`src/evaluation/evaluate_results.py`. This folder holds the same two generation arms — the
-no-graph baseline and the GraphSAGE-prefix adapter — scored under four rubrics, to see how
-much of the measured graph effect is a property of the instrument.
+Every accuracy score in this project comes from one judge prompt, in
+`src/evaluation/evaluate_results.py`. Nobody had ever asked what that choice was worth. This
+folder takes the **same two sets of generated abstracts** — the no-graph baseline and the
+GraphSAGE-prefix adapter — and scores them **four times under four different judge prompts**.
 
-The generations never change, and neither does the judge model. Only the rubric does.
+The generations never change. The judge model never changes. Only the rubric changes. So any
+difference in the measured graph effect is a property of the ruler, not the model.
 
-## The honest framing, first
+## What we did
 
-The stated goal was to maximise the gap between baseline and adapter. Tuning a measurement
-until it produces a wanted result is how instruments stop being instruments, so the design
-here is built to make that failure visible rather than to avoid the question:
+- **Two arms**, both from the 2026-08-15 era-1 run: frozen Vicuna-7B with no prefix, and the
+  same model with the graph prefix. Same prompt, same nodes, differing only in the prefix.
+- **150 papers**, picked by out-degree only — never by score, so no arm's result influenced
+  which papers it was measured on.
+- **Judge**: `gpt-5.4-mini` at temperature 0, exactly the project's own evaluator.
+- **Two guards against fooling ourselves**, run under every rubric:
+  - a **negative control** — two adapter runs that differ only in a repetition-penalty setting.
+    Nothing about the graph separates them. A rubric that widens the real comparison *and* this
+    one isn't detecting the graph, it's just spreading everything apart.
+  - **all four results reported**, including the ones that make the effect look smaller.
+- 1,800 judge calls. R1 cost nothing — see the note at the bottom.
 
-- **R1 is the current rubric, verbatim**, scored by the project's own judge. It is the
-  reference the other three are read against, not a competitor. On these 300 nodes it gives
-  +0.433, against +0.473 over the full 945 — the subset is slightly less favourable to the
-  adapter, which is worth knowing before any variant is called an improvement.
-- **Every rubric is scored on a negative-control pair** — two adapter runs that differ only in
-  repetition penalty. Nothing about the graph separates them. A rubric that widens the
-  baseline-vs-adapter gap *and* this one is not detecting the prefix, it is spreading every
-  comparison it touches.
-- **Every rubric is scored on identical text twice**, giving its own test-retest noise. A gap
-  smaller than a rubric's noise floor is not a measurement.
-- **All four results get reported**, including the ones that shrink the gap.
+### Why these four rubrics
 
-A rubric earns the headline only if the graph gap grows while the other two hold still. There
-is one defensible reason to change the rubric at all, and it is not gap size: R1 spends a third
-of its accuracy definition on methodology, which `docs/adapter.md` records as unrecoverable
-from a bibliography — 70% wrong for Vicuna, **95% wrong for gpt-5.4-mini**. Scoring a dimension
-no arm can achieve adds variance that cannot discriminate. Removing it makes the instrument
-measure what the task can deliver. That argument stands whether or not the gap widens, and it
-is the argument the write-up should rest on.
+First we measured what the graph actually changes, with no API calls (`analyse_arms.py`, all
+945 papers). Three findings drove the design:
 
-## What the graph actually changes
-
-From `analyse_arms.py`, over all 945 era-1 nodes, no API calls. This is what the rubrics were
-written from.
-
-**The adapter is more precise, not more complete.**
-
-| | baseline | adapter |
-|---|---|---|
-| gold-term recall | 0.0876 | 0.0855 |
-| gold-term precision | 0.0963 | **0.1183** |
-| distinct terms used | 55.6 | 48.5 |
-| bigram overlap with gold | 0.0596 | **0.0790** |
-
-It says *less* and gets *more* of it right: 13% fewer distinct terms, 23% higher precision,
-33% more bigram overlap with the gold, and slightly **lower** recall. Any rubric that rewards
-completeness or coverage will therefore miss the adapter's actual advantage — which is one
-concrete reason R1 may be understating it.
-
-**The advantage is not extra neighbourhood information.** The centroid cap shows at most 15
-references while the GNN reads the whole neighbourhood, so if the prefix were an information
-channel the gap should grow with how many references the cap hid. It does not:
-Spearman(gap, hidden references) = **−0.05, p=0.11**, and the largest gap of any bin (+0.71)
-is at *zero* hidden references, where the GNN saw nothing the prompt did not. The prefix works
-as a focusing signal on text the model already has, not as a second source of facts.
-
-**The advantage lives in the upper tail.**
-
-| | ≤2 | ≥5 | mean |
-|---|---|---|---|
-| baseline | 46.7% | 5.8% | 2.815 |
-| adapter | 34.9% | **13.7%** | 3.288 |
-
-Under R1 both arms are pinned near the floor — half the baseline's outputs score 1 or 2 — and
-a compressed scale cannot express a difference. The adapter's win is that it produces 6s, 7s
-and 8s (102 of 945) where the baseline produces almost none (31).
-
-**The baseline's dominant failure is writing one cited paper instead of the citing paper.**
-Share of outputs where a single cited reference accounts for more than 30% of the generated
-bigrams: baseline **73.2%**, adapter **58.7%**. (The *mean* overlap runs the other way and is
-confounded by generation length, so the share is the readable figure — this one is suggestive,
-not settled.) The qualitative pattern is unambiguous, e.g. node 5182, out-degree 53:
-
-- **gold** — AraBERT, a pre-trained language model for Arabic
-- **baseline** (scored 2) — "a new application of pre-trained word representations… train
-  high-quality word vector representations by using a combination of known tricks" — this is
-  one cited paper, word2vec/fastText, written out as if it were the target
-- **adapter** (scored 8) — "a new pre-trained language model for Arabic, called AraBERT"
-
-Same at node 41817 (baseline writes Bitcoin-NG; gold and adapter are a blockchain security
-survey) and node 68995 (baseline writes one GCN attack paper; gold and adapter are a survey of
-graph adversarial attack and defence). The graph tells the model the *scope and topic the
-bibliography converges on*. That is exactly the "problem and task" axis, and it is why the
-proposal to stop scoring methodology is well founded rather than convenient.
-
-## Why the judge is gpt-5.4-mini and not the cheaper model
-
-`gpt-5.6-luna` scored R1 over the same 300 nodes before the judge was settled. Same rubric,
-same generations, only the judge different — `judge_comparison/luna_R1_*.csv`:
-
-| judge | baseline | adapter | gap | SD of paired diff | Cohen's *d* |
-|---|---|---|---|---|---|
-| gpt-5.4-mini | 2.850 | 3.283 | **+0.433** | 1.702 | **0.255** |
-| gpt-5.6-luna | 2.103 | 2.383 | +0.280 | 1.667 | 0.168 |
-
-The SD column is what decides it. A harsher judge that compressed the whole scale would shrink
-the gap and the spread together and leave the effect size alone; luna's spread is
-indistinguishable from mini's (pooled 1.33 vs 1.35) while its gap is a third smaller. It is
-genuinely less able to separate the two arms — about 1.5x less per unit of variance — not
-merely stricter. The two agree on which papers are good (per-node Spearman **+0.77**), so this
-is sensitivity, not disagreement.
-
-Cost, the reason luna was tried, does not hold up either: at `reasoning_effort=low` it emits
-235 completion tokens per judge call (172 output + 63 reasoning) against mini's 169, so it
-needs a substantially lower per-token price merely to break even.
-
-**Choosing a judge because it shows a bigger difference is the same instrument-selection
-problem as choosing a rubric that way**, so it is worth being precise about which argument is
-doing the work. The one that does not depend on the outcome is reproducibility: the 5.6 models
-reject `temperature=0.0` and run only at temperature 1, giving a measured per-item SD of
-**0.44**, against roughly a point of disagreement in 1 node out of 6 for mini at
-`temperature=0`. That argument would hold even if luna had shown the larger gap. The
-sensitivity argument is supporting evidence, and it is only clean here because the spreads
-matched — had they not, a larger gap would have proved nothing.
+1. **The adapter is more precise, not more complete.** It uses 13% fewer distinct terms but
+   gets 23% more of them right. Any rubric rewarding coverage will miss its advantage.
+2. **Both arms are pinned near the floor.** Under the current rubric 76% of baseline outputs
+   score ≤3. A squashed scale cannot show a difference that exists.
+3. **The baseline's commonest failure is writing about the wrong paper** — describing one of
+   the cited works instead of the paper citing them. E.g. paper 5182: the real abstract
+   introduces AraBERT; the baseline confidently describes word2vec, one of its references. The
+   adapter gets AraBERT. The current rubric has no language for this failure, so a fluent
+   description of the wrong paper can still score mid-range.
 
 ## The four rubrics
 
-Only the `accuracy` definition changes; `coherence` and `language` are held identical
-throughout, so the comparison has one variable.
+Only the **accuracy** definition changes. Coherence and language are held word-for-word
+identical throughout, so the comparison has exactly one variable.
 
-| | what it does | why |
+| | what it scores | what it focuses on |
 |---|---|---|
-| **R1** control | current rubric, verbatim | the reference point the other three are read against; without it nothing else is interpretable |
-| **R2** problem & task | scores research problem and specific task only, methods explicitly excluded | methodology is unrecoverable and pins both arms to the floor |
-| **R3** decomposed | separate domain / problem / task / scope scores plus an overall | says *which* dimension carries the effect; `scope` is where the survey-vs-method failures live |
-| **R4** target vs source | R2 plus: describing a cited work rather than the citing paper caps accuracy at 3 | names the baseline's dominant failure, which R1 has no language for |
+| **R1** *control* | the current rubric, verbatim: objective, problem domain **and methodology** | the reference point — not a candidate |
+| **R2** *problem & task* | the research problem and the specific task **only**; methods, models, datasets and numbers explicitly excluded | "did it work out what this paper is trying to do?" |
+| **R3** *decomposed* | R2, split into separate **domain / problem / task / scope** scores plus an overall | diagnostic: *which* dimension carries the effect |
+| **R4** *target vs source* | R2 plus one override: if it reads as an account of a single cited work rather than the citing paper, accuracy is capped at 3 | names the baseline's commonest failure outright |
 
-**R4 is the one to distrust.** It encodes the specific failure the baseline was observed
-making, so it is the most likely to widen the gap and the least likely to be measuring
-something real. That is precisely what the negative control and the noise floor are for. If R4
-widens the graph gap and leaves both controls flat, it is a sharper instrument; if it widens
-all three, it is a thumb on the scale.
+The reason to change the rubric at all — decided before any scores came in, and independent of
+whether the gap grew — is that **methodology is not recoverable from a reference list**.
+`docs/adapter.md` records methodology as wrong 70% of the time for Vicuna and 95% for
+gpt-5.4-mini. R1 spends a third of its accuracy definition on a dimension no model can achieve.
+That is noise that cannot discriminate. R2 removes it.
 
-## Design
+## Results
 
-- **Pair**: era 1, `2026-08-15-14207605_{vicuna-baseline,adapter}` — same generation job, same
-  prompt, same nodes, differing only in the prefix. The 2026-08-25 3-layer run is era 4 and its
-  baseline was never judged; pairing those two would have put the four prompt rewrites inside
-  the measured graph effect.
-- **Nodes**: 300, stratified by out-degree over the 945 capped eval nodes (mean out-degree 51.4
-  against the full set's 51.8). Selected on out-degree alone, never on a score.
-- **Controls**: 150-node subset — the adapter re-scored under each rubric, and the two era-4
-  adapter runs that differ only in repetition penalty.
-- **Judge**: `gpt-5.4-mini` at `temperature=0.0` — the project's own evaluator, unchanged, with
-  the same JSON response format, retry policy and user-message layout as
-  `src/evaluation/evaluate_results.py`. Only the system prompt differs between cells, so
-  results here sit beside every figure in `docs/adapter.md`.
+Graph gap = adapter − baseline. Control gap = the two runs that should *not* differ.
 
-  `gpt-5.6-luna` was tried first, for cost, and rejected. The measurement is in
-  `judge_comparison/` and is summarised below; it is a result in its own right, not a false
-  start.
+| rubric | baseline | adapter | **graph gap** | effect size | control gap | control significant? |
+|---|---|---|---|---|---|---|
+| R1 | 2.83 | 3.21 | +0.387 | 0.29 | 0.140 | no (p=0.18) |
+| **R2** | 3.17 | 4.01 | **+0.833** | 0.45 | 0.360 | **yes (p=0.01)** |
+| R3 | 2.98 | 3.45 | +0.473 | 0.32 | 0.227 | borderline (p=0.05) |
+| R4 | 2.50 | 3.24 | +0.740 | 0.50 | 0.087 | no (p=0.64) |
 
-## Layout and running it
+Share of outputs scoring 5 or better — how much of the scale each rubric actually uses:
+
+| | baseline | adapter |
+|---|---|---|
+| R1 | 6.7% | 12.0% |
+| **R2** | 13.3% | **31.3%** |
+| R3 | 6.0% | 21.3% |
+| R4 | 2.7% | 16.0% |
+
+**R3 — where the effect lives:**
+
+| | baseline | adapter | gap | relative |
+|---|---|---|---|---|
+| domain | 7.83 | 8.19 | +0.37 | +4.7% |
+| problem | 4.65 | 5.05 | +0.40 | +8.6% |
+| task | 3.85 | 4.34 | +0.49 | +12.6% |
+| **scope** | 2.64 | 3.16 | **+0.52** | **+19.7%** |
+
+## What this means
+
+**1. The rubric decides roughly half the measured effect.** The same models, the same outputs,
+scored +0.387 or +0.833 depending only on how the judge was asked. That is the main result, and
+it applies to every accuracy figure in the project.
+
+**2. R2 doubles the gap, and the reason is the honest one.** Dropping methodology lifts both
+arms, but the adapter more than twice as much (+0.79 vs +0.35), and adapter outputs scoring ≥5
+go from 12% to 31%. This is finding 2 above confirmed: the advantage was real and the old scale
+was too compressed to show it.
+
+  **But R2 also spreads apart runs that should be identical** — it is the only rubric whose
+  negative control became significant. R2 is a *more sensitive* instrument and a *less specific*
+  one. The case for it is that it measures the right thing, not that it discriminates better.
+
+**3. R4 looks best on the numbers and should still be rejected.** Biggest effect size, and the
+only rubric whose control gap shrank. But its whole gain comes from pushing the baseline down
+(−0.33) while leaving the adapter untouched (+0.03) — and the penalty does **not** land on the
+papers where the baseline actually copied a cited work. It is flat across them
+(correlation −0.09, not significant). So R4 isn't detecting the failure it names; it is simply
+harsher on the baseline. Since R4 was written *from* the baseline's observed failure, that is
+the thumb-on-the-scale outcome the design was built to catch. Worth noting the negative control
+alone did *not* catch it — the extra check did.
+
+**4. R3 confirms the original hypothesis: task and problem are recoverable, specifics are not.**
+Scores fall steadily as the question gets more specific — domain 7.8, problem 4.7, task 3.9,
+scope 2.6. Both arms identify the field; neither pins down the contribution. And the adapter's
+advantage grows the harder the question gets: +4.7% on domain rising to +19.7% on scope. The
+graph tells the model *what kind of paper this is and how broad its claim is* — a survey, not a
+single method — which is exactly the failure in finding 3.
+
+## Which rubric to use going forward
+
+**R2.** Score the research problem and the specific task; do not score methodology.
+
+The argument is that methodology is unrecoverable from a bibliography, so scoring it adds noise
+that cannot separate any two models. That argument was made before the results and holds
+regardless of them. The fact that it doubles the measured graph effect is a consequence, not
+the reason — and it should be presented in that order, with the inflated negative control
+disclosed alongside.
+
+**Keep R3 as the explanatory figure** — it shows *why* the graph helps, which no single number
+can. **Report R4 as checked and rejected**; a variant that was tested and thrown out is a
+stronger methodological story than one that was adopted.
+
+Adopting R2 means every accuracy number in `docs/adapter.md` would have to be rescored to match.
+Nothing already published becomes wrong — it becomes an R1 number, and R1 and R2 cannot be
+mixed in one table.
+
+## Caveats
+
+- **No noise floor was measured.** The same-text-scored-twice cell was dropped to save cost, so
+  nothing here bounds the judge's own wobble. The negative control is a weaker substitute: it is
+  a *real* effect, not noise — the repetition penalty genuinely scores worse, consistently, in
+  all four rubrics — so it measures how much a rubric amplifies an irrelevant difference, not
+  how much it invents one.
+- **150 papers is thin, and it bites where it matters.** In R3, only domain and scope are
+  statistically significant; **problem (p=0.06) and task (p=0.05) are not**. Read the R3 ranking
+  as a pattern, not as four established facts.
+- **R1's scores are cached** from the original evaluation run rather than re-judged, so R1-vs-
+  others carries a small between-run difference the other comparisons don't.
+- **The judge always sees the real abstract**, so it can reward looking similar to the gold
+  rather than being right about the paper. All four rubrics inherit this; none fixes it.
+- **One judge, one pair of runs, one prompt era.** A different generator could rank these
+  rubrics differently.
+- We also tried `gpt-5.6-luna` as a cheaper judge and rejected it: it separated the two arms
+  about 1.5x less well, and cannot run at temperature 0, so it isn't reproducible. Measurement
+  kept in `judge_comparison/`.
+
+## Files
 
 ```
-rubric_sensitivity/
-├── rubrics.py        the four judge prompts
-├── runs.py           which generation runs are compared, and why those
-├── analyse_arms.py   the no-API analysis above  -> arm_analysis.csv
-├── build_subset.py   the frozen 300/150 node sets -> subsets.json
-├── score.py          one rubric x one arm -> 0N_RN/<arm>.csv
-├── report.py         graph gap vs noise floor vs control gap, and the R3 components
-└── 0N_RN/            baseline.csv, adapter.csv, adapter_retest.csv, neg_a.csv, neg_b.csv
+rubrics.py        the four judge prompts
+runs.py           which generation runs are compared, and why those
+analyse_arms.py   what the graph changes, no API calls  -> arm_analysis.csv
+build_subset.py   the frozen 150-paper set              -> subsets.json
+score.py          one rubric x one arm                  -> 0N_RN/<arm>.csv
+report.py         the results tables above
 ```
 
 ```bash
 conda activate DyTAG
-python experiments/rubric_sensitivity/analyse_arms.py
-python experiments/rubric_sensitivity/build_subset.py
-python experiments/rubric_sensitivity/score.py --all     # 4,200 judge calls, gpt-5.4-mini
+python experiments/rubric_sensitivity/score.py --all     # 1,800 judge calls
 python experiments/rubric_sensitivity/report.py
 ```
 
-`score.py` is resumable and can be run cell by cell with `--rubric R2 --arm baseline`.
-
-## Open questions and limitations
-
-- **Not yet run.** Everything above the Design section is measured; the rubric comparison
-  itself is 4,200 judge calls that have not been spent. No claim about R2/R3/R4 exists yet.
-- **A wider gap under a new rubric does not make earlier numbers wrong.** Every figure in
-  `docs/adapter.md` is an R1 figure produced by `gpt-5.4-mini`. Adopting a variant means
-  rescoring the whole series — and because the judge changed here too, that rescoring has to
-  fix *both* the rubric and the judge at once, or the prompt-era story, the rubric change and
-  the judge change end up confounded together.
-- **`temperature=0` is not exact determinism.** Rescoring 6 nodes under R1 against their
-  stored `llm_accuracy` reproduced 5 exactly and moved 1 by a point. The judge is highly
-  reproducible, not perfectly — which is why the retest control still has to be run rather
-  than assumed to be zero, and why a single rubric's gap should not be read to three decimals.
-- **The judge comparison is one rubric on one pair.** `judge_comparison/` shows luna
-  separating these two arms less well under R1. It does not establish that luna is a worse
-  judge in general, and a rubric that changes what is being judged could change that ordering.
-- **R4's cap at 3 is a hard threshold on a judgement call.** "Reads as an account of a single
-  earlier work" is not crisply decidable, and the judge is being asked to apply it
-  categorically. Expect its noise floor to be the worst of the four; that is a reason to read
-  the noise column before the gap column.
-- **The single-source-capture measurement is not settled.** The share above 0.30 and the mean
-  overlap disagree in direction, and both are confounded by generation length. The qualitative
-  examples are stronger evidence than either number, which is a reason to treat this as the
-  motivation for R4 rather than as a result.
-- **The judge scores both arms with the gold abstract in front of it**, so it can reward
-  surface similarity to the gold rather than correctness about the paper. All four rubrics
-  inherit this; none of them addresses it.
+R1 costs nothing: it is the project's current rubric word-for-word, scored by the same judge at
+the same temperature, so the runs' stored scores already *are* its scores. `score.py` copies
+them rather than buying them again. `score.py` is resumable and runs cell by cell with
+`--rubric R2 --arm baseline`.

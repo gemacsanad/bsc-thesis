@@ -2,17 +2,18 @@
 
 For each rubric, three numbers matter and only the first is the headline:
 
-    graph gap    adapter - baseline on the 300 main nodes. What the rubric was written to
-                 change.
-    noise floor  adapter - adapter_retest on the 150 control nodes. The same text scored
-                 twice under the same rubric, so this is the judge's own wobble. A graph gap
-                 is only readable to the extent it exceeds this.
+    graph gap    adapter - baseline on the 150 nodes. What the rubric was written to change.
     control gap  neg_a - neg_b on the same 150. Two era-4 adapter runs differing only in
                  repetition penalty. Nothing about the graph separates them, so a rubric that
                  widens this one is spreading every comparison, not detecting the prefix.
+    noise floor  adapter - adapter_retest, the same text scored twice under the same rubric.
+                 Blank unless that cell was scored: it is off by default, because the judge
+                 runs at temperature 0 and reproduces itself closely. The control gap is then
+                 the only floor on offer, and it is a weaker one — it bounds noise *plus*
+                 whatever the repetition penalty really changed, so it cannot say which.
 
-A rubric earns the headline only if the graph gap grows *and* the other two stay put. Ranking
-on the graph gap alone would be choosing the instrument by the answer it gives.
+A rubric earns the headline only if the graph gap grows *and* the others stay put. Ranking on
+the graph gap alone would be choosing the instrument by the answer it gives.
 
 Usage:
     conda activate DyTAG
@@ -54,23 +55,24 @@ def paired(a, b):
 
 def main():
     print(f"{'rubric':8s} {'baseline':>9s} {'adapter':>8s} {'graph gap':>20s} "
-          f"{'noise floor':>12s} {'control gap':>12s}")
+          f"{'control gap':>12s} {'noise floor':>12s}")
     for rubric in RUBRICS:
         base, adapt = load(rubric, "baseline"), load(rubric, "adapter")
         gap = paired(adapt, base)
-        noise = paired(load(rubric, "adapter"), load(rubric, "adapter_retest"))
         control = paired(load(rubric, "neg_a"), load(rubric, "neg_b"))
+        noise = paired(load(rubric, "adapter"), load(rubric, "adapter_retest"))
         if gap is None:
             print(f"{rubric:8s} not scored yet")
             continue
         print(f"{rubric:8s} {base.mean():9.3f} {adapt.mean():8.3f} "
               f"{gap[0]:+8.3f} (n={gap[1]}, p={gap[2]:.1e}) "
-              f"{(abs(noise[0]) if noise else float('nan')):12.3f} "
-              f"{(abs(control[0]) if control else float('nan')):12.3f}")
+              f"{(abs(control[0]) if control else float('nan')):12.3f} "
+              f"{(f'{abs(noise[0]):.3f}' if noise else '—'):>12s}")
 
-    print("\nA rubric is only interesting if its graph gap grew while the noise floor and the "
-          "control gap did not.\nR1 is the rubric every existing number in the project was "
-          "produced with; it is the reference, not a candidate.")
+    print("\nA rubric is only interesting if its graph gap grew while the control gap did not."
+          "\nR1 is the rubric every existing number in the project was produced with — the "
+          "reference, not a candidate,\nand it is read straight from the arms' stored scores "
+          "rather than re-judged.")
 
     components = {c: (load("R3", "adapter", c), load("R3", "baseline", c))
                   for c in R3_COMPONENTS}

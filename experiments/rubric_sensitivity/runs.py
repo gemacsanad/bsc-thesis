@@ -27,7 +27,7 @@ RUNS = {
 # The comparison, and the two guards against reading a rubric's own spread as a graph effect.
 MAIN = ("baseline", "adapter")
 NEGATIVE_CONTROL = ("neg_a", "neg_b")
-RETEST = "adapter"        # scored twice under every rubric, to get each rubric's noise floor
+RETEST = "adapter"        # off by default; score it twice under one rubric for a noise floor
 
 
 def generations(key):

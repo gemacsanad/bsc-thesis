@@ -1,39 +1,37 @@
 """Score one arm's generations under one rubric.
 
 Reads the arm's existing `evaluated_result.csv` for its `original_abstract` and
-`generated_abstract` — the generations are fixed, only the judge changes — and writes
+`generated_abstract` — the generations are fixed, only the judge prompt changes — and writes
 `0N_RN/<arm>.csv` with the rubric's scores.
 
-Held identical to `src/evaluation/evaluate_results.py`: `response_format=json_object`, the
-user message layout (`ORIGINAL ABSTRACT: … GENERATED ABSTRACT: …`), and the retry policy.
-Only the system prompt differs, which is the variable under study.
+Held identical to `src/evaluation/evaluate_results.py`: the judge model (`gpt-5.4-mini`),
+`temperature=0.0`, `response_format=json_object`, the user message layout
+(`ORIGINAL ABSTRACT: … GENERATED ABSTRACT: …`), and the retry policy. Only the system prompt
+differs, which is the variable under study — so every number here sits beside the figures in
+`docs/adapter.md`.
 
-The judge, however, is **not** the main evaluator's. It is `gpt-5.6-luna`, chosen for cost.
-Two consequences, both real:
-
-  * `temperature` cannot be sent — the 5.6 models accept only the default of 1 and reject
-    `temperature=0.0` with a 400. The judge is therefore **not deterministic**: measured
-    per-item SD of the accuracy score is 0.44 against gpt-5.4-mini's 0.00, so a rerun does
-    not reproduce a previous run row for row. Over 300 nodes that noise averages to a
-    standard error of about 0.026 on the mean, which is far below any gap under study, but
-    it does mean no number here is exactly reproducible and per-node claims are noisier than
-    the project's other CSVs. The noise is worst at the top of the range, which is where the
-    adapter's advantage sits, so the adapter arm is the noisier of the two.
-  * The levels are not the main evaluator's levels. Nothing scored here can be compared with
-    a figure in `docs/adapter.md`; only the cells in this folder compare with each other.
-
-`--model gpt-5.4-mini --temperature 0` reverts both properties if a run needs to be tied back
-to the project's existing numbers.
+**R1 is never sent to the API.** R1 is the project's current rubric verbatim, scored by the
+project's own judge at the same temperature, so the arms' stored `llm_accuracy`,
+`llm_coherence` and `llm_language` already are its scores — for all 945 nodes, paid for when
+the runs were evaluated. `--rubric R1` copies those out instead of buying them again. (No
+`reason` column: the main evaluator consumes it and does not persist it.)
 
 ROUGE and BERTScore are not recomputed: they do not depend on the judge, and the arms already
 carry them.
 
 Usage:
     conda activate DyTAG
-    python experiments/rubric_sensitivity/score.py --rubric R1 --arm baseline
+    python experiments/rubric_sensitivity/score.py --rubric R2 --arm baseline
     python experiments/rubric_sensitivity/score.py --all          # every cell, in order
 
 Resumable: a rerun appends only the node_ids missing from the output CSV.
+
+`--all` covers the four arms under R2/R3/R4 plus the free R1 copy. It does **not** include
+`adapter_retest`, the same-text-twice cell that measures a rubric's own noise floor: at
+`temperature=0` the judge reproduces itself closely enough that the cell was judged not worth
+its calls. It is still reachable as `--rubric R4 --arm adapter_retest` if a rubric's gap comes
+back small enough that the floor matters — R4 is the one to spend it on, since its cap at 3 is
+a categorical judgement call and the likeliest of the four to wobble.
 """
 
 import argparse
@@ -57,14 +55,21 @@ from runs import MAIN, NEGATIVE_CONTROL, RETEST, generations                # no
 
 load_dotenv(ROOT / ".env_local")
 
-# Which arms each rubric is scored over, and on which subset. `adapter_retest` re-scores the
-# adapter a second time under an unchanged rubric: identical text, so whatever gap appears
-# between it and `adapter` is the judge's own noise, and no measured effect smaller than that
-# means anything.
-CELLS = [(a, "main") for a in MAIN] + \
-        [("adapter_retest", "control")] + \
-        [(a, "control") for a in NEGATIVE_CONTROL]
+# Every arm is scored on the same 150 nodes: the two that answer the question, and the two
+# that guard it. `adapter_retest` re-scores the adapter a second time under an unchanged
+# rubric — identical text, so any gap between it and `adapter` is the judge's own noise. It is
+# off by default (see the module docstring) but stays addressable by name.
+CELLS = list(MAIN) + list(NEGATIVE_CONTROL)
+OPTIONAL_CELLS = ["adapter_retest"]
 SOURCE = {"adapter_retest": RETEST}
+
+# R1 is the project's own rubric and judge, so its scores are already in the arms' CSVs.
+STORED = {"accuracy": "llm_accuracy", "coherence": "llm_coherence", "language": "llm_language"}
+
+
+def nodes():
+    with open(HERE / "subsets.json") as f:
+        return json.load(f)["nodes"]
 
 
 def clean(result):
@@ -85,10 +90,6 @@ def clean(result):
 
 def call_judge(client, args, system, original, generated, retries=6):
     user = f"ORIGINAL ABSTRACT:\n{original}\n\nGENERATED ABSTRACT:\n{generated}"
-    # Reasoning models take reasoning_effort and reject temperature; the older ones the
-    # reverse. Sending the wrong one is a 400, not a silently different judge.
-    tuning = ({"reasoning_effort": args.reasoning_effort} if args.temperature is None
-              else {"temperature": args.temperature})
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
@@ -96,7 +97,7 @@ def call_judge(client, args, system, original, generated, retries=6):
                 messages=[{"role": "system", "content": system},
                           {"role": "user", "content": user}],
                 response_format={"type": "json_object"},
-                **tuning,
+                temperature=args.temperature,
             )
             return json.loads(resp.choices[0].message.content)
         except RateLimitError:
@@ -109,10 +110,23 @@ def call_judge(client, args, system, original, generated, retries=6):
             for k in ("accuracy", "coherence", "language", "reason")}
 
 
-def run_cell(client, args, rubric, arm, subset_key):
-    with open(HERE / "subsets.json") as f:
-        nodes = json.load(f)[subset_key]
+def copy_stored(arm):
+    """Write the R1 cell from the arm's already-paid-for scores. No API call."""
+    if arm == "adapter_retest":
+        # Copying the same stored column twice would report a noise floor of exactly zero by
+        # construction. An R1 retest has to be bought from the API like any other.
+        sys.exit("R1 comes from stored scores, so it cannot be retested by copying; "
+                 "score a retest under R2/R3/R4, or re-run the main evaluator")
+    source = pd.read_csv(generations(SOURCE.get(arm, arm))).set_index("node_id")
+    out_dir = HERE / ARMS["R1"]
+    out_dir.mkdir(exist_ok=True)
+    frame = source.loc[nodes(), list(STORED.values())]
+    frame.columns = list(STORED)
+    frame.to_csv(out_dir / f"{arm}.csv", quoting=csv.QUOTE_ALL)
+    print(f"R1 / {arm}: {len(frame)} nodes copied from stored scores (no API call)")
 
+
+def run_cell(client, args, rubric, arm):
     source = pd.read_csv(generations(SOURCE.get(arm, arm))).set_index("node_id")
     out_dir = HERE / ARMS[rubric]
     out_dir.mkdir(exist_ok=True)
@@ -127,8 +141,8 @@ def run_cell(client, args, rubric, arm, subset_key):
         done = set(pd.read_csv(output)["node_id"].tolist())
         write_header = False
 
-    todo = [n for n in nodes if n not in done]
-    print(f"{rubric} / {arm} ({subset_key}, {len(nodes)} nodes): {len(todo)} to score")
+    todo = [n for n in nodes() if n not in done]
+    print(f"{rubric} / {arm}: {len(todo)} to score")
     if not todo:
         return
 
@@ -167,39 +181,31 @@ def run_cell(client, args, rubric, arm, subset_key):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rubric", choices=list(RUBRICS))
-    ap.add_argument("--arm")
+    ap.add_argument("--arm", choices=CELLS + OPTIONAL_CELLS)
     ap.add_argument("--all", action="store_true", help="every rubric x every cell")
     ap.add_argument("--model", default="gpt-5.4-mini",
                     help="judge model; the project's own evaluator, kept so results here sit "
                          "beside every figure in docs/adapter.md")
-    ap.add_argument("--reasoning-effort", default="low",
-                    choices=["none", "low", "medium", "high"],
-                    help="reasoning models only (--model gpt-5.6-*); ignored otherwise")
-    ap.add_argument("--temperature", type=lambda s: None if s == "" else float(s), default=0.0,
-                    help="non-reasoning models only; the 5.6 models reject it, so pass "
-                         "--temperature '' with those")
+    ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
-    if args.model.startswith("gpt-5.6"):
-        if args.temperature is not None:
-            sys.exit(f"{args.model} accepts only the default temperature — pass "
-                     f"--temperature '' to use --reasoning-effort instead")
-    elif args.temperature is None:
-        sys.exit(f"{args.model} needs a --temperature; 0 is what the main evaluator uses")
 
     if not (HERE / "subsets.json").exists():
         sys.exit("subsets.json missing — run build_subset.py first")
 
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
     if args.all:
-        cells = [(r, a, s) for r in RUBRICS for a, s in CELLS]
+        cells = [(r, a) for r in RUBRICS for a in CELLS]
     elif args.rubric and args.arm:
-        subset = dict((a, s) for a, s in CELLS)[args.arm]
-        cells = [(args.rubric, args.arm, subset)]
+        cells = [(args.rubric, args.arm)]
     else:
         sys.exit("pass --all, or both --rubric and --arm")
 
-    for rubric, arm, subset in cells:
-        run_cell(client, args, rubric, arm, subset)
+    client = None
+    for rubric, arm in cells:
+        if rubric == "R1":
+            copy_stored(arm)
+            continue
+        client = client or OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        run_cell(client, args, rubric, arm)
 
 
 if __name__ == "__main__":
