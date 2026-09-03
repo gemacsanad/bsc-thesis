@@ -221,3 +221,104 @@ right: the same check is 45/48 at 256.
   script.
 - `tokenizer` and `embeddings` remain in `capped_example`'s signature though unused when frozen,
   so the two paths stay interchangeable and no caller had to change.
+
+---
+
+## Step 3 — prefix injection under transformers 4.51.3
+
+**Done 2026-09-03.** The plan's highest-risk item, and the instruction to *re-derive the patch,
+not port it* was the right call: the bug still exists, but it is **a different bug**.
+
+### What the plan expected, and what is actually true
+
+The plan's hypothesis was that modern transformers had fixed the problem — that
+`_get_initial_cache_position` derives the offset from `past_key_values.get_seq_length()` and is
+already correct, so `patch_for_prefix` should be **deleted**. Measured with a tiny random Qwen3
+on CPU, that is half right and half wrong:
+
+- **The forward pass was never broken.** Calling the model directly with a pre-filled cache
+  agrees with the un-prefixed run to **2.7e-07** max logit error, whether `cache_position` is
+  passed explicitly or omitted entirely. This is why `train.py` needs no patch at all.
+- **`generate()` is still wrong** — 19 of 20 tokens differ unprefixed. The negative control
+  holds, so the patch stays.
+
+### The actual 4.51.3 failure
+
+Read off `generation/utils.py`:
+
+```python
+cache_position = arange(len(input_ids))         # [0 .. L-1]
+past_length    = past_key_values.get_seq_length()
+cache_position = cache_position[past_length:]   # [P .. L-1]
+```
+
+It assumes the cache holds a **prefix of `input_ids`** — the ordinary prefill-then-decode case.
+Our cache holds no `input_ids` at all: it holds P graph positions, and all L body tokens are
+unprocessed. The damage lands in `_cache_dependant_input_preparation`, which with a
+`cache_position` of length L−P against `input_ids` of length L takes its default branch,
+`input_ids[:, cache_position]` — **silently dropping the first P body tokens**. The model then
+writes a fluent continuation of a truncated prompt.
+
+4.39.3 was the opposite: `arange(cur_len)` with *no* slice, so the P positions were simply
+uncounted and every mask row shifted by P. Porting the old `+P` correction into 4.51.3 would
+have been wrong in both halves — the offset is already partly accounted for, and the truncation
+it cannot see would have remained. The old patch hooked `prepare_inputs_for_generation`; the new
+one replaces `_get_initial_cache_position`, which is the function that actually decides.
+
+### The fix
+
+```python
+cache_position = arange(L) + P
+```
+
+Every body token is new; they simply start at position P. This repairs the input slicing for
+free: with `cache_position[-1] == P+L-1 >= L`, `_cache_dependant_input_preparation` takes its
+Exception 3 branch, `input_ids[:, -len(cache_position):]`, which is all L tokens. On later steps
+`_update_model_kwargs_for_generation` carries the last position forward and adds one, so decode
+needs no further help.
+
+The patch also **asserts** that the cache width equals the `num_prefix_tokens` it was installed
+for. That is a live risk here, not a hypothetical: `NUM_PREFIX_TOKENS` moves from 10 to 32 at
+step 4. A consequence is that a patched model raises on a plain `generate()` — deliberate, and
+safe because `generate.py` patches only when `--mode != baseline` and each mode is its own
+process, so the control arm always runs unpatched.
+
+### Cache API changes
+
+Smaller than the plan feared. In 4.51.3 `DynamicCache` still holds `key_cache` / `value_cache`
+lists — it is **not** yet composed of per-layer objects (that lands in a later release), and it
+still iterates as `(key, value)` tuples, so `real_prefix()`'s stacking into the adapter's
+`(1, layers, 2, kv_heads, tokens, head_dim)` layout is unchanged. Only one rename was needed:
+`get_max_length()` → `get_max_cache_shape()` in `PrefixCache`. Qwen3's modeling calls exactly
+two cache methods, `get_seq_length` (line 538) and `get_max_cache_shape` (line 654).
+
+### Results — `python verify_generation.py`, exit 0
+
+```
+prefix layout (1, 4, 2, 2, 10, 16) — 2:1 GQA exercised
+unpatched: 19/20 tokens differ from the reference (as expected)
+patched:   20/20 tokens match the reference exactly
+width guard: a prefix that disagrees with NUM_PREFIX_TOKENS raises
+forward pass: max logit error 2.7e-07 against the plain run
+PrefixCache:  max logit error 2.7e-07, read-only across repeated passes
+```
+
+Two gaps in the old script were closed while it was open:
+
+- **GQA is now exercised.** The config is `num_attention_heads=4, num_key_value_heads=2`. Every
+  earlier version used `kv == q`, so the cache layout could have been wrong in exactly the
+  dimension Qwen3 introduces and the script would still have passed (`model_swap_qwen.md` §7).
+- **`PrefixCache` is now covered.** Everything else in the file exercises `DynamicCache`;
+  training uses `PrefixCache`, a different class with a different contract. Its defining
+  property — storing nothing, so gradient checkpointing can run a layer twice — is asserted by
+  running the same instance twice and requiring identical logits.
+
+### Known limitations
+
+- Verified on a 4-layer random Qwen3 on CPU, which is the method's design: the weights are
+  irrelevant because the test compares two runs of the *same* model. It exercises the real
+  `forward`, mask construction, RoPE and cache code, but not 40 layers, bf16, or CUDA.
+- `2:1` GQA is exercised, not Qwen3-14B's `5:1`. The layout is head-count-agnostic, but the
+  ratio itself is untested.
+- The version assertion is now `4.51.3`. Since 4.39.3 and 4.51.3 fail differently, an upgrade
+  must re-derive rather than assume — the negative control is what says which world you are in.

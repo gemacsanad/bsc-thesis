@@ -2,30 +2,55 @@
 Stage 5 — injecting a trained prefix into `generate()`.
 
 Training built the KV cache by hand and called the model directly (`train.py`). Generation
-cannot: `generate()` owns the cache and the position bookkeeping, and in transformers 4.39.3
-it gets both wrong for a pre-filled cache — **silently**, producing fluent text rather than
-an exception.
+cannot: `generate()` owns the cache and the position bookkeeping, and it gets them wrong for a
+pre-filled cache — **silently**, producing fluent text rather than an exception.
 
-Two things have to be repaired.
+The bug is version-specific, and it changed between transformers 4.39.3 and 4.51.3. This file
+documents the 4.51.3 one. The 4.39.3 analysis is kept below because the difference is the whole
+reason this had to be re-derived rather than ported.
 
-`cache_position`
-----------------
-Every search method in `generation/utils.py` opens with
-`model_kwargs["cache_position"] = torch.arange(cur_len)`, where `cur_len` is the length of
-`input_ids` alone — the P prefix positions already sitting in the cache are not counted. That
-value reaches `LlamaForCausalLM.prepare_inputs_for_generation`, which passes it straight
-through (`cache_position = cache_position[-input_length:]`), and `cache_position` is what
-sizes the causal mask. Every row shifts by P, so each token attends mostly to prefix positions
-instead of to the tokens before it. Passing `cache_position=` to `generate()` does not help —
-it is overwritten before the loop starts.
+`cache_position` in 4.51.3
+--------------------------
+`_get_initial_cache_position` (generation/utils.py) builds the position vector like this:
 
-`prepare_inputs_for_generation` is the last thing to touch `cache_position` before the forward
-pass, so the correction goes there. It is `+P` on **every** step, not only the first:
-`_update_model_kwargs_for_generation` increments the dict `generate` holds, which never sees
-what this override returns, so the value arriving here is always short by exactly P.
+    cache_position = arange(len(input_ids))         # [0 .. L-1]
+    past_length    = past_key_values.get_seq_length()
+    cache_position = cache_position[past_length:]   # [P .. L-1]   ← the mistake, for us
 
-Correcting it on entry rather than on exit also fixes `past_length`, which the stock method
-derives from `cache_position[0]` and uses to decide how much of `input_ids` is unprocessed.
+It assumes the cache holds a **prefix of `input_ids`** — the ordinary prefill-then-decode case,
+where the first `past_length` tokens have already been processed and only the remainder is new.
+Our cache holds no `input_ids` at all: it holds P graph positions, and every one of the L body
+tokens is unprocessed.
+
+The damage lands one step later, in `_cache_dependant_input_preparation`. With a `cache_position`
+of length L-P against `input_ids` of length L, it takes the default branch,
+`input_ids = input_ids[:, cache_position]`, and **the first P body tokens are dropped**. The
+model then generates a fluent continuation of a truncated prompt.
+
+The fix is to stop the slice and offset instead — every body token is new, they simply start at
+position P:
+
+    cache_position = arange(L) + P
+
+That also repairs the input slicing for free. With `cache_position[-1] == P+L-1 >= L`,
+`_cache_dependant_input_preparation` takes its Exception 3 branch,
+`input_ids[:, -len(cache_position):]`, which is all L tokens. On every later step
+`_update_model_kwargs_for_generation` carries the last position forward and adds one, so the
+decode steps stay correct without further help.
+
+How 4.39.3 differed, and why porting would have been wrong
+----------------------------------------------------------
+There, `cache_position` was `arange(cur_len)` with no slice at all, so the P prefix positions
+were simply uncounted: every row of the causal mask shifted by P, and the correction was to add
+P inside `prepare_inputs_for_generation` on every step. Applied to 4.51.3 that would be wrong in
+both halves — the offset is already partly accounted for, and the truncation it cannot see would
+remain. Hence the override goes on `_get_initial_cache_position`, which is the function that
+actually makes the decision, and `prepare_inputs_for_generation` is left alone.
+
+Note that the **forward pass was never broken** in 4.51.3. Calling the model directly with a
+pre-filled cache agrees with the un-prefixed run to ~3e-7 max logit error whether
+`cache_position` is passed explicitly or omitted, which is why `train.py` needs no patch. Only
+`generate()`'s bookkeeping is at fault.
 
 The cache object
 ----------------
@@ -58,23 +83,32 @@ def prefix_to_cache(prefix):
 
 
 def patch_for_prefix(llm, num_prefix_tokens):
-    """Shift `cache_position` by `num_prefix_tokens` on every generation step.
+    """Make `generate()` treat all of `input_ids` as new, starting at position P.
 
-    Call once, before any `generate()` with a prefix. The catch-all must be named `**kwargs`:
-    `_validate_model_kwargs` inspects this signature by name and only forwards forward()'s
-    arguments when it finds `kwargs` or `model_kwargs` there.
+    Call once, before any `generate()` with a prefix. It replaces `_get_initial_cache_position`
+    outright rather than correcting its result, because the value that function returns has
+    already lost the information needed to reconstruct the right one — its length is L-P, and
+    which P entries were dropped is not recoverable from it.
+
+    The patched model is **only** valid for prefixed generation: the assertion below fires on a
+    plain `generate()`, where the cache is empty. That is deliberate. `generate.py` applies the
+    patch only when `--mode` is not `baseline`, and each mode is its own process, so the control
+    arm always runs an unpatched model.
+
+    The assertion also catches the prefix width drifting from `NUM_PREFIX_TOKENS` — which is a
+    live risk, since that constant moves from 10 to 32 for Qwen3's grouped-query attention.
     """
-    original = llm.prepare_inputs_for_generation
+    def get_initial_cache_position(input_ids, model_kwargs):
+        cache = model_kwargs.get("past_key_values")
+        past = cache.get_seq_length() if cache is not None else 0
+        assert past == num_prefix_tokens, (
+            f"cache holds {past} positions but the patch was installed for "
+            f"{num_prefix_tokens}; the prefix and NUM_PREFIX_TOKENS disagree")
+        model_kwargs["cache_position"] = (
+            torch.arange(input_ids.shape[1], device=input_ids.device) + past)
+        return model_kwargs
 
-    def prepare(input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
-                cache_position=None, **kwargs):
-        if cache_position is not None:
-            cache_position = cache_position + num_prefix_tokens
-        return original(input_ids, past_key_values=past_key_values,
-                        attention_mask=attention_mask, inputs_embeds=inputs_embeds,
-                        cache_position=cache_position, **kwargs)
-
-    llm.prepare_inputs_for_generation = prepare
+    llm._get_initial_cache_position = get_initial_cache_position
 
 
 @torch.no_grad()

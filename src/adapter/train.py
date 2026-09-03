@@ -71,7 +71,9 @@ class PrefixCache(Cache):
     def get_seq_length(self, layer_idx=0):
         return self.length
 
-    def get_max_length(self):
+    def get_max_cache_shape(self):
+        # `get_max_length` in transformers 4.39.3; renamed in the modern Cache API. None means
+        # unbounded, which is what a cache that never stores anything is.
         return None
 
     def get_usable_length(self, new_seq_length, layer_idx=0):
