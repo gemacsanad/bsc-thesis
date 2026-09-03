@@ -322,3 +322,86 @@ Two gaps in the old script were closed while it was open:
   ratio itself is untested.
 - The version assertion is now `4.51.3`. Since 4.39.3 and 4.51.3 fail differently, an upgrade
   must re-derive rather than assume — the negative control is what says which world you are in.
+
+---
+
+## Step 4 — `config.py` and `model.py`
+
+**Done 2026-09-03.** The constants move to Qwen3-14B's geometry. `python model.py` is the gate.
+
+### The rename is the change
+
+`NUM_HEADS` was a name that lied. It has always been the **key/value** head count in the cache
+layout, and only equalled the query-head count because Llama-2 has no GQA. Qwen3-14B serves 40
+query heads from 8 KV heads, so the two now differ by 5x, and a constant whose name lies is
+exactly how a silent bug gets planted here. Renaming it to `NUM_KV_HEADS` *is* the GQA change —
+one constant, one import and two uses in `model.py`, and nothing else in the tree referenced it.
+The `PrefixAdapter` parameter and attribute were renamed with it.
+
+### `NUM_PREFIX_TOKENS: 10 → 32`
+
+Holding T at 10 would not have held the method fixed. The prefix is a KV tensor, so GQA narrows
+the graph's channel into the LLM by 3.2x as a side effect — and a fallen gap could then not be
+attributed to the LLM rather than to the narrower prefix. T = 32 holds the prefix **volume**
+constant, which is the quantity that has to be constant. Confirmed by measurement, not
+arithmetic — `python model.py` reports `2,621,440` values per node, identical to Vicuna's.
+
+What it cannot restore is **addressability**: 8 KV heads serve 40 query heads, so the prefix can
+no longer say different things to different heads inside a group. There is no workaround for a
+GQA model. Recorded as a limitation, not fixed.
+
+### Everything else
+
+| constant | from | to | why |
+|---|---|---|---|
+| `BASE_MODEL` | `lmsys/vicuna-7b-v1.5` | `Qwen/Qwen3-14B` | the variable under test |
+| `NUM_LAYERS` | 32 | 40 | |
+| `HEAD_DIM` | 128 | 128 | read off `config.head_dim`, which Qwen3 states explicitly, rather than derived from `hidden_size // num_attention_heads` — those agree here by coincidence |
+| `BATCH_SIZE` × `GRAD_ACCUM` | 2 × 8 | **1 × 16** | effective batch stays 16, the invariant; halved because the weights go 13.5 GB → 29.6 GB on a 40 GB A100 |
+| `MAX_LENGTH` | 4096 | **4096** | deliberately *not* raised to Qwen's 40,960 — see below |
+| `GENERATION_RESERVE` | 320 | 320 | unchanged; §1 |
+
+`MAX_LENGTH` staying at Vicuna's context is the one that looks like an oversight and is not. The
+centroid cap is what gives the GNN information the prompt does not have — the GNN reads every
+reference, the prompt shows ~13. If every reference fit the prompt, the graph's unique signal
+would collapse to 2-hop structure alone. That reasoning now sits in the constant's comment so it
+survives contact with the next reader.
+
+### Results — `python model.py`, all existing assertions pass
+
+```
+trainable parameters: 4,197,376          (encoder, unchanged — it does not depend on the LLM)
+adapter parameters:  12,494,672
+prefix: (8, 40, 2, 8, 32, 128), 2,621,440 values per node
+seed features do not affect the output (mask works)
+gate=0: prefix is node-independent and equals base (prefix-tuning fallback)
+gate=1: the graph embedding moves the prefix
+gradients reach every parameter of both modules
+```
+
+The adapter grew 12,108,096 → 12,494,672 (+3.2%), from the wider `codes` matrix that 40 layers
+needs, partly offset by a narrower `decoder` (8 KV heads instead of 32). `base` is 2,621,440 in
+both. Trainable total: **16.7M**.
+
+**Prompt budget, measured.** With T = 32 the budget tightens to 4096 − 32 − 320 = **3,744**, but
+Qwen's BPE is more efficient than Vicuna's SentencePiece on the same frozen bibliographies:
+`verify_capped_prompts.py` over 900 sampled nodes gives a largest prompt of **3,496 tokens, 248
+under budget**. The 22 extra prefix tokens are paid for several times over. This answers ahead of
+time what `model_swap_qwen.md` §7 defers to step 7 — though on a sample, not all 9,501 nodes.
+
+The stale `config.py` LoRA comment was corrected while there: 80 modules over 40 layers,
+**10.5M** parameters, and under GQA the two targets are *different sizes* — `q_proj` is
+5120 × 5120 but `v_proj` only 5120 × 1024. Measured off a real `Qwen3ForCausalLM`, not derived.
+
+### Known limitations
+
+- **`BASE_MODEL` has a blast radius outside `src/adapter/`.** Two experiment scripts read it:
+  `experiments/prompt_sensitivity_gpt/build_test_set.py` uses it to *measure prompt lengths* when
+  rebuilding the era test sets, so re-running it now would build prompts under the Qwen tokenizer
+  and no longer reproduce the stored `test_set.csv`; `experiments/rubric_sensitivity/analyse_arms.py`
+  loads it but only passes it to `capped_example`, which ignores it on the frozen path, so that
+  one is harmless. Neither was touched — `model_swap_qwen.md` §8 excludes `experiments/` — but
+  `build_test_set.py` is a live trap and should get the same pinned-tokenizer treatment
+  `freeze_prompt_refs.py` has.
+- The prompt-budget headroom is a 900-node sample, not the full 9,501.
+- Parameter counts and prefix volume are verified; nothing here has been run on a GPU.

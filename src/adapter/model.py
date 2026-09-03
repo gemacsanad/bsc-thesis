@@ -3,7 +3,7 @@ Stage 3 — GraphSAGE encoder and prefix adapter.
 
 Encodes a target node's reference neighbourhood into a single vector, and turns
 that vector into the key/value prefixes injected into every layer of a frozen
-Vicuna-7B.
+Qwen3-14B.
 
 `GNN_LAYERS` SAGEConv layers (all 1024 wide, mean aggregation) over the batches
 produced by graph.py, so the encoder sees the node's references at layer 1 and
@@ -26,14 +26,21 @@ graph.py asserts.
 
 Prefix adapter
 --------------
-Prefix tuning, so the graph enters at all 32 layers rather than only at the input.
-That means 32 layers x 2 roles x 10 tokens x 4096 = 2.6M numbers per node, and a
-plain linear map from the 1024-d encoder output would cost 2.68B parameters.
+Prefix tuning, so the graph enters at all 40 layers rather than only at the input.
+That means 40 layers x 2 roles x 32 tokens x (8 kv heads x 128) = 2.6M numbers per
+node, and a plain linear map from the 1024-d encoder output would cost 2.68B
+parameters.
+
+Both figures are unchanged from the Vicuna-7B configuration (32 layers x 2 x 10
+tokens x 4096), and that is deliberate rather than coincidental: Qwen3 serves 40
+query heads from only 8 KV heads, which would have narrowed the prefix 3.2x at the
+old 10 tokens. T was raised to 32 to hold the graph pathway's capacity fixed, since
+that is the quantity that has to be constant for the two runs to be comparable.
 
 The cost lives in the output, not the input, so the output is factorised: a shared
 trunk compresses the graph vector, one small code is emitted per (layer, role), and
-a single decoder shared by all 64 of them expands each code to that layer's prefix.
-Each layer sees the graph through a 96-d projection, but 64 x 96 = 6144 code
+a single decoder shared by all 80 of them expands each code to that layer's prefix.
+Each layer sees the graph through a 96-d projection, but 80 x 96 = 7680 code
 dimensions across all layers, so collectively they can still read all 1024.
 
 The graph supplies an offset, not the whole prefix. `base` is a node-independent
@@ -52,7 +59,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
 from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GNN_LAYERS, HEAD_DIM,
-                    HIDDEN_CHANNELS, IN_CHANNELS, NUM_HEADS, NUM_LAYERS,
+                    HIDDEN_CHANNELS, IN_CHANNELS, NUM_KV_HEADS, NUM_LAYERS,
                     NUM_PREFIX_TOKENS, OUT_CHANNELS, TRUNK_DIM)
 
 
@@ -83,19 +90,23 @@ class GraphSAGEEncoder(nn.Module):
 
 
 class PrefixAdapter(nn.Module):
-    """Graph embedding -> per-layer key/value prefixes for a frozen Vicuna-7B.
+    """Graph embedding -> per-layer key/value prefixes for a frozen Qwen3-14B.
 
-    Returns (batch, num_layers, 2, num_heads, num_prefix_tokens, head_dim), where
+    Returns (batch, num_layers, 2, num_kv_heads, num_prefix_tokens, head_dim), where
     index 0 of dim 2 is keys and index 1 is values. Stage 4 turns that into the
     `past_key_values` the model expects; nothing here imports transformers.
+
+    The head count is the **key/value** one, not the query one — the prefix is a KV
+    tensor. Under GQA the two differ (Qwen3-14B: 40 query heads, 8 KV heads), and
+    using the query count here would produce a cache the model silently misreads.
     """
 
     def __init__(self, in_channels=OUT_CHANNELS, trunk_dim=TRUNK_DIM, code_dim=CODE_DIM,
-                 num_layers=NUM_LAYERS, num_heads=NUM_HEADS, head_dim=HEAD_DIM,
+                 num_layers=NUM_LAYERS, num_kv_heads=NUM_KV_HEADS, head_dim=HEAD_DIM,
                  num_prefix_tokens=NUM_PREFIX_TOKENS):
         super().__init__()
         self.num_layers = num_layers
-        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.num_prefix_tokens = num_prefix_tokens
         self.code_dim = code_dim
@@ -108,11 +119,11 @@ class PrefixAdapter(nn.Module):
         # one matrix for all 2 * num_layers heads, split apart by the reshape below
         self.codes = nn.Linear(trunk_dim, num_layers * 2 * code_dim)
         # shared by every (layer, role) 
-        self.decoder = nn.Linear(code_dim, num_prefix_tokens * num_heads * head_dim)
+        self.decoder = nn.Linear(code_dim, num_prefix_tokens * num_kv_heads * head_dim)
 
         # node-independent prefix: plain prefix tuning, and what gate=0 falls back to
         self.base = nn.Parameter(
-            torch.randn(num_layers, 2, num_heads, num_prefix_tokens, head_dim) * BASE_INIT_STD
+            torch.randn(num_layers, 2, num_kv_heads, num_prefix_tokens, head_dim) * BASE_INIT_STD
         )
         self.gate = nn.Parameter(torch.zeros(num_layers, 2))
 
@@ -120,9 +131,11 @@ class PrefixAdapter(nn.Module):
         b = g.size(0)
         z = self.trunk(g)
         c = self.codes(z).view(b, self.num_layers, 2, self.code_dim)
-        # (tokens, heads, head_dim) matches how Llama reshapes a 4096-d projection
+        # (tokens, kv_heads, head_dim) matches how the model reshapes a k/v projection.
+        # For Qwen3-14B that projection is 8 x 128 = 1024 wide, not hidden_size (5120) —
+        # under GQA the k/v projections are narrower than q.
         delta = self.decoder(c).view(
-            b, self.num_layers, 2, self.num_prefix_tokens, self.num_heads, self.head_dim
+            b, self.num_layers, 2, self.num_prefix_tokens, self.num_kv_heads, self.head_dim
         )
         delta = delta.transpose(3, 4)          # -> (heads, tokens), the cache layout
         return self.base + self.gate.view(1, self.num_layers, 2, 1, 1, 1) * delta
@@ -176,7 +189,7 @@ if __name__ == "__main__":
     adapter.eval()
     with torch.no_grad():
         prefix = adapter(out)
-    assert prefix.shape == (batch.batch_size, NUM_LAYERS, 2, NUM_HEADS,
+    assert prefix.shape == (batch.batch_size, NUM_LAYERS, 2, NUM_KV_HEADS,
                             NUM_PREFIX_TOKENS, HEAD_DIM)
     print(f"prefix: {tuple(prefix.shape)}, {prefix[0].numel():,} values per node")
 
