@@ -35,7 +35,36 @@ from transformers import AutoTokenizer
 
 from config import (BASE_MODEL, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
                     NUM_PREFIX_TOKENS)
-from text import Corpus, capped_example, encode
+from text import INSTRUCTION, SYSTEM, Corpus, build_prompt, capped_example, encode, user_message
+
+# The finished chat wrapper, frozen. `build_prompt` asks the tokenizer for this via
+# `apply_chat_template`, which is the right way to derive it and the wrong thing to trust
+# blindly: a tokenizer_config update would move every prompt in both arms without a word.
+# Written out here so the wrapper is reviewable in a diff rather than only at runtime.
+#
+# The `<think>\n\n</think>\n\n` is not a mistake. Qwen3 is a hybrid thinking model, and
+# `enable_thinking=False` does not delete the block — it emits an empty, already-closed one,
+# which is how the model is told to answer directly.
+CHAT_WRAPPER = ("<|im_start|>system\n{system}<|im_end|>\n"
+                "<|im_start|>user\n{user}<|im_end|>\n"
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+def check_chat_wrapper(tokenizer):
+    """The delimiters are a calling convention; the text inside them is the experiment."""
+    neighbours = [("A Title", "An abstract."), ("Another Title", "Another abstract.")]
+    got = build_prompt(tokenizer, neighbours)
+    want = CHAT_WRAPPER.format(system=SYSTEM, user=user_message(neighbours))
+    assert got == want, (
+        "the chat template has moved:\n"
+        f"  got  {got[:120]!r}…\n  want {want[:120]!r}…")
+
+    # The experimental content must survive the wrapper untouched. These two strings are the
+    # variable the four prompt eras measured; the swap is supposed to change nothing about them.
+    assert SYSTEM in got and INSTRUCTION in got, "the prompt text did not survive the wrapper"
+    assert got.endswith("</think>\n\n"), "the assistant turn does not open where we think"
+    print(f"  wrapper  ChatML, thinking disabled, {len(SYSTEM)}+{len(INSTRUCTION)} chars of "
+          f"prompt text intact")
 
 
 def check(name, nodes, tokenizer, corpus, view, mapped, budget):
@@ -94,6 +123,7 @@ def main():
     budget = MAX_LENGTH - NUM_PREFIX_TOKENS - GENERATION_RESERVE
 
     print(f"Checking the capped prompt path against the frozen sets (budget {budget:,}) …")
+    check_chat_wrapper(tokenizer)
     worst = 0
     for name in ("train", "valid", "eval"):
         nodes = sets[name]

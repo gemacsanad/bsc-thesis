@@ -27,10 +27,15 @@ The checks run after writing, and are the point of the exercise:
   3. kept references are a subsequence of the node's edges.csv order;
   4. the era-1 gate — experiments/prompt_sensitivity_gpt/01_era1/test_set.csv stores the
      finished prompt and reference list for 48 nodes, built at this reserve under this
-     tokenizer. All 48 must match, in the lists and string-for-string in the prompts. This is
-     the same method that folder used to validate era 1 and era 2 (0 mismatches both times);
-  5. regression — reading the file back through capped_example(frozen=True) must give
-     byte-identical prompts to the recompute path, which is what protects the existing runs.
+     tokenizer and wrapper. The lists must match, and the prompts rebuilt from the file must
+     match string-for-string. This is the same method that folder used to validate era 1 and
+     era 2 (0 mismatches both times);
+  5. regression — a fresh recompute must return the reference lists the file already holds.
+
+Checks 4 and 5 compare reference lists, and check 4 additionally a full prompt string in the
+*Vicuna* format. Since Stage 7 step 5 the live prompt is ChatML, so this script never builds a
+live prompt at all: the freeze is defined by the Vicuna tokenizer, the Vicuna wrapper and
+reserve 320, and all three are pinned here so the file stays re-derivable after the model swap.
 
 Check 4 covers 48 of 9,501 nodes. The other 9,453 have no stored prompt to diff against; the
 only guarantee for them is that they came from this code path at this reserve. Say so in the
@@ -95,32 +100,51 @@ def check_coverage(refs, sets, corpus):
     print(f"  coverage:   {len(refs):,} nodes, all with >=1 reference, edges.csv order kept")
 
 
-def check_era1(tokenizer, corpus, embeddings):
-    """The hard gate: 48 stored era-1 prompts, matched string-for-string."""
+def check_era1(corpus):
+    """The hard gate: the frozen file, rendered back into 48 stored era-1 prompts.
+
+    Reads the reference lists straight out of the file rather than recomputing them, so this
+    checks the artifact that ships, not the code that made it. The prompt is rebuilt with the
+    **Vicuna** wrapper because that is the format the stored era-1 prompts are in — the freeze
+    is defined by that tokenizer and that wrapper, and neither moves when the model does.
+    Needs no tokenizer at all: the wrapper is a plain string format.
+    """
     df = pd.read_csv(ERA1)
+    stored_refs = text.frozen_refs()
     for _, row in df.iterrows():
         node_id = int(row.node_id)
-        prompt, _, kept = capped_example(tokenizer, corpus, embeddings, node_id)
         # space-separated, the way build_test_set.py wrote it and diagnostics.py reads it
-        stored = [int(r) for r in str(row.ref_node_ids).split()]
-        assert kept == stored, \
-            f"era-1 node {node_id}: reference list differs from the stored build"
+        want_refs = [int(r) for r in str(row.ref_node_ids).split()]
+        got_refs = stored_refs[node_id]
+        assert got_refs == want_refs, \
+            f"era-1 node {node_id}: frozen reference list differs from the stored build"
+        prompt = text.build_prompt_vicuna(
+            [(corpus.title[n], corpus.abstract[n]) for n in got_refs])
         assert prompt == row.prompt, \
-            f"era-1 node {node_id}: prompt differs from the stored build"
+            f"era-1 node {node_id}: rebuilt prompt differs from the stored build"
     print(f"  era-1 gate: {len(df)}/{len(df)} prompts and reference lists match")
 
 
 def check_regression(tokenizer, corpus, embeddings, sets, sample, seed):
-    """The frozen path and the recompute path must agree byte for byte."""
+    """The stored list and a fresh recompute must agree.
+
+    Compares reference lists and targets, not prompt strings. Since Stage 7 step 5 the two
+    branches build deliberately different formats — `frozen=True` uses the live model's chat
+    template, `frozen=False` the Vicuna wrapper the freeze was computed under — so a
+    byte-for-byte prompt comparison would now fail by design. The reference list is what this
+    file records, and it is what has to be stable. check_era1 is what still pins a full
+    prompt string, in the Vicuna format, against the 48 stored era-1 builds.
+    """
     rng = np.random.default_rng(seed)
+    stored = text.frozen_refs()
     for name, nodes in sets.items():
         drawn = rng.choice(nodes, min(sample, len(nodes)), replace=False)
         for node_id in drawn:
             node_id = int(node_id)
-            a = capped_example(tokenizer, corpus, embeddings, node_id, frozen=True)
-            b = capped_example(tokenizer, corpus, embeddings, node_id, frozen=False)
-            assert a == b, f"{name} node {node_id}: frozen and recomputed prompts differ"
-        print(f"  regression: {name:<6} {len(drawn):>4} nodes byte-identical")
+            _, _, refs = capped_example(tokenizer, corpus, embeddings, node_id, frozen=False)
+            assert stored[node_id] == refs, \
+                f"{name} node {node_id}: stored reference list differs from a fresh recompute"
+        print(f"  regression: {name:<6} {len(drawn):>4} nodes match on recompute")
 
 
 def main():
@@ -148,7 +172,7 @@ def main():
 
     print("\nChecking …")
     check_coverage(refs, sets, corpus)
-    check_era1(tokenizer, corpus, embeddings)
+    check_era1(corpus)
     check_regression(tokenizer, corpus, embeddings, sets, args.regression, args.seed)
 
     counts = sorted(len(v) for v in refs.values())

@@ -403,5 +403,114 @@ The stale `config.py` LoRA comment was corrected while there: 80 modules over 40
   one is harmless. Neither was touched — `model_swap_qwen.md` §8 excludes `experiments/` — but
   `build_test_set.py` is a live trap and should get the same pinned-tokenizer treatment
   `freeze_prompt_refs.py` has.
-- The prompt-budget headroom is a 900-node sample, not the full 9,501.
+- The prompt-budget headroom is a 900-node sample, not the full 9,501. *(Closed in step 5:
+  measured over all 9,501.)*
 - Parameter counts and prefix volume are verified; nothing here has been run on a GPU.
+
+---
+
+## Step 5 — the ChatML wrapper
+
+**Done 2026-09-03.** Keep the text, swap the delimiters.
+
+### The split
+
+`build_prompt` was doing two jobs: assembling the instruction and reference block — the
+*experimental content* — and wrapping it in Vicuna's `SYSTEM … USER: … ASSISTANT:` framing — a
+*calling convention*, like the tokenizer. Only the second may move. They are now separate
+functions, which is what `experiments/prompt_sensitivity_gpt/prompts.py` already does:
+
+```python
+user_message(neighbours)            # the experiment. Unchanged, byte for byte.
+build_prompt(tokenizer, neighbours) # apply_chat_template(..., enable_thinking=False)
+build_prompt_vicuna(neighbours)     # the historical format the freeze was computed under
+```
+
+**Verified against the GPT run, not just asserted.** `text.user_message(ns)` is byte-identical
+to `prompts.user_message(1, ns)[1]`, and `text.SYSTEM` to that call's system message — so the
+adapter now splits into exactly the `(system, user)` pair the era-1 GPT prompt-sensitivity run
+used. `SYSTEM` and `INSTRUCTION` are unchanged since commit `ee55816`.
+
+### Why the wrapper had to change at all
+
+The adapter arm is *trained*, so it would learn any format and learn to stop. The baseline arm
+is frozen and untrained. A frozen Qwen3 given non-ChatML input is off-distribution precisely on
+instruction following, and its stop behaviour is unreliable — it emits `<|im_end|>` because it
+was tuned to end an assistant turn. The degradation would land entirely on the control and
+inflate the measured gap: the same artifact class Stage 6c already caught, where era 2's
+reference-count line took the baseline's third-person rate from 15.4% to 58.1%.
+
+### What the real template does
+
+```
+<|im_start|>system\n{SYSTEM}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n
+<|im_start|>assistant\n<think>\n\n</think>\n\n
+```
+
+`enable_thinking=False` does **not** remove the thinking block — it emits an *empty,
+already-closed* one, which is how Qwen3 is told to answer directly. Seeing `<think>` in the
+prompt is correct; seeing reasoning in the output would not be. Frozen in
+`verify_capped_prompts.py` as `CHAT_WRAPPER`, checked on every run before the GPU hours, so a
+`tokenizer_config` update cannot move every prompt in both arms without a word.
+
+Both of the plan's §5 predictions about `encode()` held: Qwen3 has **no BOS** (`bos_token is
+None`, and `add_special_tokens` adds nothing), so the "carries BOS" comment was wrong and is
+corrected; and `pad_token` is set (151643), so the "Llama ships without one" fallback never
+fires. `eos_token_id` is `<|im_end|>` (151645), so the existing target-termination is already
+right for ChatML.
+
+### The bug the regression check caught
+
+Re-running the freeze gates after the split failed on train node 32196. The cause was **not**
+the wrapper: `NUM_PREFIX_TOKENS` moved 10 → 32 in step 4, and the recompute budget is
+`MAX_LENGTH − NUM_PREFIX_TOKENS − reserve`, so 22 fewer tokens dropped a reference.
+
+```
+stored (from the freeze): 14 refs
+recompute at T=10 : 14 refs   matches stored: True
+recompute at T=32 : 13 refs   matches stored: False
+```
+
+So the freeze is defined by **four** things, not three, and all are now pinned: the Vicuna
+tokenizer, the Vicuna wrapper, `GENERATION_RESERVE = 320`, and `FREEZE_PREFIX_TOKENS = 10`.
+This does not make the frozen lists wrong — it makes them *historical*, which is the point. The
+lists were sized for a narrower prefix than the run now uses, which is safe but not free, so it
+was measured rather than assumed (below).
+
+Two gates changed meaning as a result, and the change is deliberate:
+
+- **`check_era1`** now reads reference lists out of the file and rebuilds the prompt with
+  `build_prompt_vicuna`, so it checks *the artifact that ships* rather than the code that made
+  it. Still **48/48**. It needs no tokenizer at all.
+- **`check_regression`** compares reference lists, not prompt strings. The two branches now
+  build deliberately different formats, so a byte-for-byte prompt comparison would fail by
+  design. `check_era1` is what still pins a full string.
+
+### Results
+
+```
+wrapper  ChatML, thinking disabled, 154+247 chars of prompt text intact
+train  7750 nodes ok | valid 806 nodes ok | eval 945 nodes ok
+largest prompt 3,627 tokens, 117 under budget
+era-1 gate: 48/48 prompts and reference lists match
+regression: 450 nodes match on recompute
+prefix injection survives generate()
+```
+
+**The full-set budget check is the important number.** ChatML's delimiters plus the `<think>`
+block cost ~130 tokens more than the Vicuna wrapper, and T = 32 tightens the budget to
+4096 − 32 − 320 = **3,744**. Over **all 9,501 nodes** the largest prompt is **3,627 — 117 under
+budget**, so generation should produce no `ERROR:` rows. Qwen's BPE still pays for both the
+wrapper and the 22 extra prefix tokens. This is no longer a sample: step 4's limitation is
+closed.
+
+### Known limitations
+
+- 117 tokens of headroom is thin. It holds for the frozen bibliographies at reserve 320, and
+  `generate.py` aborts rather than silently truncates if it is ever breached, but there is no
+  slack for a longer instruction or a bigger `T`.
+- `prepare_data_capped.py` is now internally inconsistent: its recompute path is pinned to the
+  historical budget while its own overflow assertion uses the live `NUM_PREFIX_TOKENS`. It is
+  never re-run — `model_swap_qwen.md` §6 forbids it — so this is recorded, not repaired.
+- The chat template is frozen against the tokenizer as downloaded on 2026-09-03. The freeze is
+  the guard, not a guarantee it will never change upstream.

@@ -23,6 +23,19 @@ from neighbour_cap import fit_refs
 # evidence. See docs/model_swap_qwen.md §5 step 2.
 FROZEN_REFS = os.path.join(FROZEN_DIR, "prompt_refs_capped.json")
 
+# The freeze is defined by four things, all of which have to be pinned for it to stay
+# re-derivable: the Vicuna tokenizer (freeze_prompt_refs.FREEZE_TOKENIZER), the Vicuna chat
+# wrapper (build_prompt_vicuna), GENERATION_RESERVE = 320, and this — the prefix width the
+# budget was computed against. NUM_PREFIX_TOKENS moved to 32 for Qwen3's GQA, and recomputing
+# with it drops a reference on some nodes (train node 32196: 14 -> 13). That does not make the
+# frozen lists wrong; it makes them *historical*, which is the point.
+#
+# The lists were therefore sized for a narrower prefix than the run now uses. That is safe but
+# not free, and it was checked rather than assumed: verify_capped_prompts.py over all 9,501
+# nodes gives a largest prompt of 3,627 against a 3,744 budget at T = 32 under Qwen's
+# tokenizer — 117 to spare, because the BPE saves more than the 22 extra prefix tokens cost.
+FREEZE_PREFIX_TOKENS = 10
+
 _frozen_refs = None
 
 
@@ -49,18 +62,58 @@ INSTRUCTION = (
 )
 
 
-def build_prompt(neighbours):
-    """`neighbours` is a list of (title, abstract) for the papers the target cites."""
+def user_message(neighbours):
+    """The experimental content: the instruction and the reference block.
+
+    `neighbours` is a list of (title, abstract) for the papers the target cites. This is the
+    part that must not change between the Vicuna and Qwen runs — only the chat delimiters
+    around it do. Kept separate for exactly that reason, as
+    experiments/prompt_sensitivity_gpt/prompts.py does.
+    """
     sources = "\n\n".join(f"- Title: {t}\n  Abstract: {a}" for t, a in neighbours)
-    user = (f"{INSTRUCTION}\n\n"
+    return (f"{INSTRUCTION}\n\n"
             f"Source publications:\n{sources or '(no neighbouring sources available)'}\n\n"
             f"Generated abstract:")
-    return f"{SYSTEM} USER: {user} ASSISTANT:"
+
+
+def build_prompt(tokenizer, neighbours):
+    """The user message wrapped in the model's own chat template.
+
+    Built through `apply_chat_template` rather than hand-rolled, so the delimiters come from
+    the tokenizer that will read them. verify_capped_prompts.py freezes the resulting string,
+    so a tokenizer update cannot move it silently.
+
+    `enable_thinking=False` is mandatory. Qwen3 is a hybrid thinking model, and a `<think>`
+    block would poison both the training targets and the generations. Note it does not remove
+    the block: the template emits an *empty, already closed* `<think>\n\n</think>\n\n`,
+    which is how Qwen3 is told to answer directly.
+    """
+    return tokenizer.apply_chat_template(
+        [{"role": "system", "content": SYSTEM},
+         {"role": "user", "content": user_message(neighbours)}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def build_prompt_vicuna(neighbours):
+    """The Vicuna wrapper, kept because the frozen reference lists were computed under it.
+
+    Not used by training or generation any more. `capped_example(frozen=False)` builds with
+    this, so freeze_prompt_refs.py can still re-derive data/frozen/prompt_refs_capped.json
+    byte for byte — the freeze is defined by the Vicuna tokenizer *and* the Vicuna format,
+    and a script that cannot reproduce its own output is not much of a freeze.
+    """
+    return f"{SYSTEM} USER: {user_message(neighbours)} ASSISTANT:"
 
 
 def encode(tokenizer, prompt, target):
-    """-> (input_ids, labels). Labels are -100 over the prompt, so only the abstract trains."""
-    prompt_ids = tokenizer(prompt).input_ids                      # carries BOS
+    """-> (input_ids, labels). Labels are -100 over the prompt, so only the abstract trains.
+
+    Qwen3 has no BOS (`bos_token is None`) and its chat template does not prepend one, so
+    `add_special_tokens` adds nothing here — unlike Vicuna, where this call carried BOS.
+    The appended `eos_token_id` is `<|im_end|>` (151645), which is what ends an assistant
+    turn in ChatML, so the target is terminated the way the model expects.
+    """
+    prompt_ids = tokenizer(prompt).input_ids
     target_ids = tokenizer(target, add_special_tokens=False).input_ids + [tokenizer.eos_token_id]
     return prompt_ids + target_ids, [-100] * len(prompt_ids) + target_ids
 
@@ -82,10 +135,14 @@ class Corpus:
         self.abstract = df["abstract"].fillna("")
         self.refs = pd.read_csv(edges).groupby("src_node_id")["dst_node_id"].apply(list)
 
-    def example(self, node_id):
-        """-> (prompt, target_abstract) for one node."""
+    def example(self, tokenizer, node_id):
+        """-> (prompt, target_abstract) for one node, with every reference shown.
+
+        The legacy (uncapped) path. `tokenizer` is needed because the chat wrapper now comes
+        from the model's own template.
+        """
         refs = self.refs.get(node_id, [])
-        return (build_prompt([(self.title[n], self.abstract[n]) for n in refs]),
+        return (build_prompt(tokenizer, [(self.title[n], self.abstract[n]) for n in refs]),
                 self.abstract[node_id])
 
     def out_degree(self, node_id):
@@ -111,6 +168,12 @@ def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     (freeze_prompt_refs.py). The budget leaves room for the prefix and for the abstract: the
     node's own abstract when it is longer than GENERATION_RESERVE, so the training sequence
     is complete, and never less than GENERATION_RESERVE, so generation has somewhere to write.
+
+    The two branches deliberately build **different prompt formats**. `frozen=True` is the
+    live path and uses the current model's chat template; `frozen=False` exists only to
+    re-derive the freeze, which was computed under the Vicuna tokenizer and the Vicuna
+    wrapper, so it pins both. They agree on the reference list, which is the thing the
+    freeze actually records — not on the string.
     """
     target = corpus.abstract[node_id]
 
@@ -119,17 +182,21 @@ def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     else:
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
         reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
-        budget = MAX_LENGTH - NUM_PREFIX_TOKENS - reserve
+        # FREEZE_PREFIX_TOKENS, not NUM_PREFIX_TOKENS: this branch re-derives a historical
+        # artifact and must use the width it was built under. See FREEZE_PREFIX_TOKENS above.
+        budget = MAX_LENGTH - FREEZE_PREFIX_TOKENS - reserve
 
         all_refs = corpus.refs.get(node_id, [])
 
         def measure(kept):
-            prompt = build_prompt([(corpus.title[n], corpus.abstract[n]) for n in kept])
+            prompt = build_prompt_vicuna([(corpus.title[n], corpus.abstract[n]) for n in kept])
             return len(tokenizer(prompt).input_ids)
 
         refs = fit_refs(all_refs, embeddings, measure, budget)
+        return (build_prompt_vicuna([(corpus.title[n], corpus.abstract[n]) for n in refs]),
+                target, refs)
 
-    return (build_prompt([(corpus.title[n], corpus.abstract[n]) for n in refs]),
+    return (build_prompt(tokenizer, [(corpus.title[n], corpus.abstract[n]) for n in refs]),
             target, refs)
 
 
@@ -140,7 +207,7 @@ def collect(tokenizer, corpus, candidates, wanted, rng):
     kept, lengths, seen = [], [], 0
     for node_id in pool:
         seen += 1
-        input_ids, _ = encode(tokenizer, *corpus.example(node_id))
+        input_ids, _ = encode(tokenizer, *corpus.example(tokenizer, node_id))
         if fits(input_ids):
             kept.append(int(node_id))
             lengths.append(len(input_ids))
@@ -215,7 +282,7 @@ def main():
               f"p99 {lengths[int(len(lengths) * 0.99)]:,}, max {lengths[-1]:,}")
 
     # The eval set is frozen and is not filtered — Stage 5 has to handle its overflow.
-    over = sum(not fits(encode(tokenizer, *corpus.example(n))[0]) for n in eval_nodes)
+    over = sum(not fits(encode(tokenizer, *corpus.example(tokenizer, n))[0]) for n in eval_nodes)
     print(f"\neval set: {over}/{len(eval_nodes)} nodes overflow the context "
           f"({over / len(eval_nodes):.1%}) — left in place, Stage 5's problem")
 

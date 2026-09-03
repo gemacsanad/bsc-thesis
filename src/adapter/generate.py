@@ -215,7 +215,7 @@ def main():
             prompt, target, _ = capped_example(tokenizer, corpus, embeddings, node_id)
             return prompt, target
     else:
-        example = corpus.example
+        example = lambda node_id: corpus.example(tokenizer, node_id)  # noqa: E731
 
     # --- models -----------------------------------------------------------
     print(f"Loading {args.model} in {dtype} …")
