@@ -609,3 +609,116 @@ on CPU before the GPU hours.
   only that they compute the same quantity.
 - Backward through the boolean selection scatters into a zero tensor of the full sequence shape
   (~35 MB at batch 1). Accounted for, not eliminated.
+
+---
+
+## Step 7 — making the verify scripts test what they claim
+
+**Done 2026-09-04.** Two of the three pre-flight scripts were passing for the wrong reason.
+
+### `verify_lora_prefix.py` — GQA was untested
+
+The script built its model as `LlamaConfig(num_attention_heads=4, num_key_value_heads=4)`.
+With `kv == q` the cache layout could have been wrong in exactly the dimension Qwen3 introduces
+and every assertion would still have held. Switched to `Qwen3Config(..., num_attention_heads=4,
+num_key_value_heads=2, head_dim=16, sliding_window=None)`, matching `verify_generation.py`, and
+the prefix is now built from `num_key_value_heads` and `config.head_dim` rather than from the
+query-head count and `hidden_size // heads`.
+
+**It matters twice over here, which the plan did not anticipate.** `LORA_TARGETS` is
+`["q_proj", "v_proj"]`, and under GQA those two projections no longer have the same output
+width — `q_proj` serves the query heads, `v_proj` the KV heads. So check 1 now also names the
+adapter widths instead of only counting parameters:
+
+```
+lora_B widths {'q_proj': 64, 'v_proj': 32}
+```
+
+and asserts the two differ. On Qwen3-14B that is 5120 against 1024. With `kv == q` a LoRA bug
+that assumed one shape for both would have been invisible; it is now a failing assertion.
+
+`lora.py` itself needed no change: `q_proj`/`v_proj` are Qwen3's names too, and
+`inject_adapter_in_model` handles the asymmetric widths.
+
+### The same script was also testing a loss path that no longer exists
+
+`forward_with_prefix` was documented as *"the training call, verbatim from `train.step_loss`"*
+and passed `labels=` — which is precisely what step 6 removed. The claim had gone stale within
+one commit, and a stale verification is worse than none.
+
+Split in two, so each check uses the right instrument:
+
+- `forward_with_prefix` returns **full logits**, for the three checks that compare two models
+  position by position — that is exactly what the sliced head throws away, so it must not be
+  used there;
+- `loss_with_prefix` mirrors the real `step_loss`: `llm.model(...)` then `sliced_loss`.
+
+Check 2 (gradients reach the prefix and every LoRA tensor) now runs through `loss_with_prefix`,
+with `labels[:, :4] = -100` so the slicing is actually exercised. That makes it a genuinely new
+check: `peft` injects into `llm.model`, which is the submodule step 6 started calling directly,
+so this is the first thing that proves the gradient still reaches LoRA when the head is bypassed
+on the way in.
+
+### `verify_capped_prompts.py` — check 1 had gone vacuous
+
+Its first check compared `train.py`'s embedding source (a numpy view of the graph's feature
+matrix) against `generate.py`'s (a memory-map of the same file), asserting identical prompts.
+Since step 2 froze the reference lists, **neither script consults that array to build a
+prompt**, so the comparison was two calls that could not disagree.
+
+Inverted rather than deleted. The live path is now called a second time with `None` where the
+embedding matrix goes:
+
+```python
+blind = capped_example(tokenizer, corpus, None, node_id)
+assert (prompt, target, refs) == blind
+```
+
+Identical output proves the array is *not read*, which is the same guarantee the old check was
+reaching for and is still true. It is not vacuous — confirmed by calling the recompute branch
+the same way, which raises `TypeError`. If a recompute ever creeps back into the live path, this
+fails instead of quietly showing Qwen a different bibliography than Vicuna saw.
+
+A coverage assertion was added ahead of the sampling loop: every node in the three frozen sets
+must have an entry in `prompt_refs_capped.json`. A missing node raises `KeyError` deep inside
+training otherwise, hours in, and a 100-node sample would not find it.
+
+`verify_generation.py` needed nothing — its `Qwen3Config`, `kv=2 q=4` and the `4.51.3` pin all
+landed in step 3.
+
+### Results — all four scripts, exit 0
+
+```
+verify_capped_prompts.py
+  wrapper  ChatML, thinking disabled, 154+247 chars of prompt text intact
+  frozen   9,501 nodes, all present in prompt_refs_capped.json
+  train 100 | valid 100 | eval 100 nodes ok
+  largest prompt 3,425 tokens, 319 under budget
+
+verify_sliced_loss.py
+  no prefix / with prefix / padding — all within 5e-07 of the labels= path
+
+verify_lora_prefix.py
+  prefix layout (1, 4, 2, 2, 32, 16) — 2:1 GQA exercised
+  1. 14,336 LoRA parameters in 8 modules; logits move by 0.178; widths q_proj 64, v_proj 32
+  2. gradients reach the prefix and all 16 LoRA tensors through checkpointing and the sliced head
+  3. 16 saved tensors reload bit-identically
+  4. generation cache path matches training, max logit error 0.0e+00
+
+verify_generation.py
+  patched: 20/20 tokens match; forward pass and PrefixCache within 2.7e-07
+```
+
+### Known limitations
+
+- **`verify_lora_prefix.py` does not run in this experiment.** Stage 7 is `LORA=0`; the job
+  script gates it on `$LORA`. It was fixed to keep it honest for Stage 6d, not because this run
+  depends on it, and it has therefore never run against a real Qwen3-14B.
+- **`lora.py`'s docstring still says Vicuna-7B and `LlamaForCausalLM`.** Both are now wrong.
+  `model_swap_qwen.md` §8 lists the file as not touched, so this is reported rather than edited.
+  The reasoning in it — why `q_proj`/`v_proj`, why `inject_adapter_in_model` over
+  `get_peft_model` — carries over to Qwen3 unchanged.
+- The GQA ratio under test is 2:1; Qwen3-14B's is 5:1. The layout is exercised, the ratio is not
+  reproduced. Nothing in the cache path depends on the ratio, only on `kv != q`.
+- `verify_capped_prompts.py` still runs at `--sample 100` in the job script. The all-9,501-node
+  budget check from step 5 is a manual `--sample 0` run, not part of the pre-flight.
