@@ -14,6 +14,7 @@ import shutil
 import time
 
 import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
@@ -99,6 +100,26 @@ def collate(tokenizer, example, node_ids, device):
     return input_ids.to(device), labels.to(device), mask.to(device)
 
 
+def sliced_loss(llm, hidden, labels):
+    """Cross-entropy over the supervised positions only. -> a scalar, mean over target tokens.
+
+    `llm(..., labels=...)` runs `lm_head` over every position. With Qwen3's 151,936-token
+    vocabulary that is a ~1 GB bf16 logits tensor plus its fp32 copy for the loss, on a ~3,400
+    token sequence — and roughly 93% of it is thrown away, because labels are -100 across the
+    whole prompt. Selecting the hidden states first computes the identical number from ~250
+    rows instead of ~3,400. On a 29.6 GB model on a 40 GB card that is the difference between
+    fitting and not.
+
+    Identical, not approximately so: this is the same shift, the same fp32 upcast and the same
+    mean over non-ignored tokens that `ForCausalLMLoss` performs internally. verify_sliced_loss.py
+    is what holds that claim to 1e-4 against the `labels=` path.
+    """
+    # position i predicts token i+1 — the shift `labels=` does internally
+    keep = labels[:, 1:] != -100
+    logits = llm.lm_head(hidden[:, :-1][keep]).float()
+    return F.cross_entropy(logits, labels[:, 1:][keep])
+
+
 def step_loss(llm, encoder, adapter, batch, input_ids, labels, mask, dtype):
     """One forward pass. Returns (mean loss over this batch's target tokens, the prefix)."""
     graph_vector = encoder(batch.x, batch.edge_index, batch.batch_size)
@@ -107,15 +128,16 @@ def step_loss(llm, encoder, adapter, batch, input_ids, labels, mask, dtype):
     p, (b, length) = NUM_PREFIX_TOKENS, input_ids.shape
     prefix_mask = torch.ones(b, p, dtype=mask.dtype, device=mask.device)
 
-    loss = llm(
+    # `llm.model`, not `llm`: the head is applied in sliced_loss, on the supervised rows only.
+    # LoRA is injected in place by peft, so the injected modules are still inside `llm.model`.
+    hidden = llm.model(
         input_ids=input_ids,
         past_key_values=PrefixCache(prefix),
         attention_mask=torch.cat([prefix_mask, mask], dim=1),
         cache_position=torch.arange(p, p + length, device=input_ids.device),
         use_cache=False,
-        labels=labels,
-    ).loss
-    return loss, prefix
+    ).last_hidden_state
+    return sliced_loss(llm, hidden, labels), prefix
 
 
 def graph_fraction(adapter, prefix):

@@ -87,6 +87,11 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # wrong references yield a fluent abstract, not an error — so it runs before the GPU hours.
     python verify_capped_prompts.py || exit 1
 
+    # And that the loss train.py computes is the one transformers would have computed. The
+    # head is applied to the supervised positions only, to keep a 151,936-token vocabulary
+    # off the card; a wrong shift or denominator there also just trains.
+    python verify_sliced_loss.py || exit 1
+
     # Same idea for LoRA: it edits the module tree the prefix is injected into, and every way
     # that can go wrong yields fluent text rather than an error.
     [ -n "${LORA:-}" ] && { python verify_lora_prefix.py || exit 1; }

@@ -514,3 +514,98 @@ closed.
   never re-run — `model_swap_qwen.md` §6 forbids it — so this is recorded, not repaired.
 - The chat template is frozen against the tokenizer as downloaded on 2026-09-03. The freeze is
   the guard, not a guarantee it will never change upstream.
+
+---
+
+## Step 6 — computing the loss on the supervised positions only
+
+**Done 2026-09-04.** The first step in this migration whose motive is memory rather than correctness. Qwen3-14B is
+**29.6 GB** in bf16 on a **40 GB** A100, and the thing that does not fit alongside it is not the
+weights or the activations — it is the logits, because Qwen's vocabulary is **151,936** tokens,
+4.75× Vicuna's 32,000.
+
+### The waste, measured
+
+`train.py` used to ask the LLM for its own loss (`llm(..., labels=labels).loss`), which runs
+`lm_head` over every position in the sequence. But labels are `-100` across the entire prompt —
+only the target abstract carries loss. Over 300 random train nodes under the Qwen tokenizer:
+
+| | mean | max |
+|---|---|---|
+| sequence length (prompt + target) | 3,075 | 3,793 |
+| positions carrying a label | **219** | 831 |
+
+**7.1% of the logits were used. The other 92.9% were computed, materialised, upcast to fp32 for
+the cross-entropy, and discarded.**
+
+| at the mean sequence | full | sliced |
+|---|---|---|
+| logits, bf16 | 0.87 GB | 0.06 GB |
+| fp32 copy for the loss | 1.74 GB | 0.12 GB |
+| **total** | **~2.6 GB** | **~0.19 GB** |
+
+So ~2.4 GB at the mean and ~3.2 GB at the longest sequence, on a card with roughly 10 GB free
+after the weights. The plan's estimate (§6: 35.2 → 31.7 GB peak) was in the right place.
+
+### The change
+
+`step_loss` now calls `llm.model(...)` for hidden states and applies the head itself:
+
+```python
+keep = labels[:, 1:] != -100
+logits = llm.lm_head(hidden[:, :-1][keep]).float()
+return F.cross_entropy(logits, labels[:, 1:][keep])
+```
+
+Three details make this the *same* number rather than a similar one, and each is a place a
+silent bug would live:
+
+- **the shift.** Position `i` predicts token `i+1`; `labels=` does this internally, so doing it
+  here by hand is the off-by-one risk.
+- **the fp32 upcast.** `ForCausalLMLoss` upcasts before the cross-entropy. Skipping it would
+  compute a slightly different loss in bf16 and nothing would say so.
+- **the denominator.** `reduction="mean"` over the selected rows is a mean over the batch's
+  target tokens — the same denominator, because the selection *is* the set of non-ignored
+  positions.
+
+`validate` needed no change: it calls `step_loss`.
+
+`llm.model`, not `llm`, is also what keeps this compatible with Stage 6d — `peft` injects LoRA
+in place, so the injected modules are still inside `llm.model`.
+
+### Verification — `verify_sliced_loss.py` (new)
+
+The claim "mathematically identical" is checked against the `labels=` path itself, on a 4-layer
+random Qwen3 in **float32** (bf16 rounding would swamp the tolerance the check exists to
+enforce). Three checks, because the failure is silent in the usual way — a wrong shift or
+denominator produces a plausible loss that falls during training:
+
+```
+no prefix:   5.542445 vs 5.542445  (error 4.8e-07), head ran on 40/64 positions
+with prefix: 5.547050 vs 5.547050  (error 4.8e-07)
+padding:     5.551479 batched vs 5.551479 token-weighted  (error 1.2e-07, 32 tokens of padding)
+```
+
+1. **equivalence, no prefix** — isolates the slicing from the injection.
+2. **equivalence through `PrefixCache`** — the exact call `step_loss` makes.
+3. **padding neutrality** — a right-padded batch of two unequal sequences (40 and 72 tokens,
+   32 of padding) gives the token-weighted mean of the same two computed singly. This is the
+   Stage-4 check re-run, and it is not redundant: the selection now indexes the label tensor
+   directly, where a padded row would be a wrong answer rather than an error.
+
+All three land at ~5e-07 against a 1e-4 tolerance. `verify_generation.py` still passes
+unchanged.
+
+The script is wired into `run_train_adapter.sh` next to `verify_capped_prompts.py`, so it runs
+on CPU before the GPU hours.
+
+### Known limitations
+
+- **Peak VRAM is still an estimate.** The saving above is arithmetic from measured token counts,
+  not a reading off `torch.cuda.max_memory_allocated`. Step 8's pilot run is what measures it —
+  and it is the same gap left open by skipping the step-1 GPU load test.
+- The tolerance is checked at `hidden_size=64, vocab=256`. It is a bookkeeping check, not a
+  numerical-stability one; nothing here says the two paths agree to 1e-4 at Qwen3-14B's width,
+  only that they compute the same quantity.
+- Backward through the boolean selection scatters into a zero tensor of the full sequence shape
+  (~35 MB at batch 1). Accounted for, not eliminated.
