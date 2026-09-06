@@ -722,3 +722,63 @@ verify_generation.py
   reproduced. Nothing in the cache path depends on the ratio, only on `kv != q`.
 - `verify_capped_prompts.py` still runs at `--sample 100` in the job script. The all-9,501-node
   budget check from step 5 is a manual `--sample 0` run, not part of the pre-flight.
+
+---
+
+## Steps 8 + 9 — the training run, with the pilot folded into it
+
+**Set up 2026-09-06. Run pending.**
+
+The plan called step 8 a separate pilot: one epoch on a subset, to measure tokens/sec and peak
+VRAM before committing to the full job. It is not being run as a separate job.
+
+The reason is that a pilot buys nothing a checkpointing run does not already give. Every number
+step 8 was meant to produce lands inside the first hour of the real run — peak VRAM at the first
+optimizer step, `train/tokens_per_sec` within minutes, `gate/mean_abs` and
+`prefix/graph_fraction` over the first ~100 steps, all live in W&B. Meanwhile every epoch is
+checkpointed, so nothing is thrown away if the run is killed after one. What a pilot *would*
+cost is a second GPU allocation on a shared queue, which is the scarce resource here.
+
+The one thing given up: an OOM is now discovered while holding a 48 h allocation rather than a
+short one. That is a scheduling annoyance, not lost work — `torch.cuda.OutOfMemoryError` fires
+in the first optimizer step, and the queue time is the same either way.
+
+### What changed
+
+| | was | now | why |
+|---|---|---|---|
+| `config.EPOCHS` | 3 | 10 | 3 was set for the Vicuna LoRA run. Early stopping (`PATIENCE = 2`) decides the real length; 10 is a ceiling, not a target. |
+| `SIF` | `adapter-gpu.sif` | `adapter-qwen-gpu.sif` | the image built in step 1 |
+| `CKPT_DIR` | `$BASE_DIR/checkpoints` | `$BASE_DIR/checkpoints/qwen14b` | see below |
+| `LORA` | 1 | 0 | era 1 had no LoRA, and +0.473 was measured without it |
+| `--wandb-run` | `adapter-gnn2-$JOB` | `adapter-qwen14b-gnn2-$JOB` | the two are otherwise indistinguishable in the project |
+
+**The checkpoint directory is not cosmetic.** The resume block takes the newest `epoch*.pt` in
+`CKPT_DIR` and `best.pt` is a fixed name, so sharing a directory with the Vicuna run would
+resume from the wrong checkpoint. `train.py` refuses a resume across a change of `--sets` or
+`--gnn-layers`, but it has no way to know the base model changed underneath it: the adapter's
+output shape moved from 32x2x32x10x128 to 40x2x8x32x128, so the load would fail on a shape
+mismatch rather than train something wrong — loudly, but hours into a queue.
+
+### Walltime
+
+48 h will not hold ten epochs. At the plan's ~10-11 h/epoch estimate for Qwen3-14B at batch 1
+(7,750 train nodes, ~3,075-token mean), one job covers roughly four epochs. The run is therefore
+expected to time out and be resubmitted; the resume block handles it, and the patience counter
+survives because `train.py` stores it in the checkpoint, so early stopping still fires across
+job boundaries. The estimate itself has never been measured — the first epoch of this run is
+what measures it.
+
+### What to watch in the first hour
+
+`gate/mean_abs` rising and `prefix/graph_fraction > 0`. The gate initialises at exactly zero, so
+the graph pathway gets no gradient at initialisation and has to learn its way open. A falling
+train loss against a flat gate means the LLM is learning the task **without** the graph — the
+one failure mode worth killing the job over rather than waiting out.
+
+### Known limitations
+
+- Peak VRAM is still unmeasured, as it has been since step 1. The arithmetic says 29.6 GB of
+  weights plus ~2.4 GB saved by the sliced head fits a 40 GB A100; nothing has confirmed it.
+- The ~10-11 h/epoch figure is a FLOP-ratio estimate scaled off an unvalidated Vicuna estimate.
+  Treat the resubmit count as unknown until epoch 1 lands.

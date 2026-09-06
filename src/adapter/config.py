@@ -108,7 +108,7 @@ SEED = 42
 DEFAULT_SETS = "capped"     # which frozen node sets; --sets legacy reproduces the old runs
 
 # The run schedule, previously literals in hpc/komondor/jobs/run_train_adapter.sh.
-EPOCHS = 3                 # upper bound; early stopping usually ends the run sooner
+EPOCHS = 10                 # upper bound; early stopping usually ends the run sooner
 PATIENCE = 2                # epochs without a better validation loss before stopping
 BATCH_SIZE = 1              # micro-batch; 1 x 16 keeps the effective batch at 16, which is the
 GRAD_ACCUM = 16             # invariant. Was 2 x 8 — halved because Qwen3-14B is 29.6 GB of

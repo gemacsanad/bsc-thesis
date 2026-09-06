@@ -10,7 +10,7 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Trains the GraphSAGE encoder + prefix adapter against a frozen Vicuna-7B.
+# Trains the GraphSAGE encoder + prefix adapter against a frozen Qwen3-14B.
 # The LLM is never updated; only checkpoints/epoch*.pt are written (~196 MB each:
 # 65 MB of weights plus AdamW's two moment buffers, which --resume needs).
 #
@@ -18,10 +18,10 @@
 # (not passed on the command line), the same way train_graphsage_full.py does it.
 #
 # Prerequisites:
-#   - adapter-gpu.sif built (hpc/komondor/containers/adapter-gpu.def)
+#   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def)
 #   - data/frozen/training_sets_capped.json present (produced by src/adapter/prepare_data_capped.py)
 #   - .env at the repo root containing WANDB_KEY=...
-#   - lmsys/vicuna-7b-v1.5 already in $BASE_DIR/.hf_cache — compute nodes cannot download it
+#   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes cannot download it
 #   - checkpoints/ holding no run on the *legacy* node sets: train.py refuses to resume one,
 #     so a stale epoch*.pt from the uncapped experiment aborts this job at startup. Move it
 #     to checkpoints/legacy-uncapped/ before the first capped run.
@@ -31,11 +31,13 @@
 # so they are changed in one place and this script does not restate them. What is passed below
 # is only what differs between two submissions.
 #
-# Walltime is 48 h against config.EPOCHS = 10 and PATIENCE = 2, so the run usually ends well
-# before that. The estimate is ~4.3 h per epoch — 7,750 nodes at a ~3,428-token mean, 2.9x the
-# token count of the old 4,000-node set — and it has never been checked on a real A100. The
-# resume below covers a timeout, and the patience counter survives it because train.py stores
-# it in the checkpoint.
+# Walltime is 48 h against config.EPOCHS = 10 and PATIENCE = 2, and 48 h is NOT enough for ten
+# epochs. The estimate is ~10-11 h per epoch under Qwen3-14B at batch 1 — 7,750 nodes at a
+# ~3,075-token mean — so this job covers roughly four epochs and then times out. That is the
+# intended shape: resubmit it, and the block below resumes from the newest epoch file. The
+# patience counter survives the resubmit because train.py stores it in the checkpoint, so
+# early stopping still fires across job boundaries. Nothing has measured the per-epoch cost on
+# a real A100 yet; the first epoch of this run is what does.
 #
 # Encoder depth: edit --gnn-layers and CKPT_DIR below, submit, then edit them again for the
 # next depth. That is safe, and only because it is *this* file: sbatch copies the batch script
@@ -51,10 +53,16 @@
 # whose recorded depth differs from --gnn-layers, so the mistake aborts rather than trains.
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
-SIF=$BASE_DIR/adapter-gpu.sif
+SIF=$BASE_DIR/adapter-qwen-gpu.sif
 
-CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
-LORA=1                                  # 1 also trains LoRA on the LLM's q/v projections
+# Its own directory, and not optional. The resume below takes the newest epoch*.pt it finds and
+# best.pt is a fixed name, so sharing a directory with the Vicuna checkpoints would resume from
+# and overwrite the wrong run. train.py refuses a resume across a change of --sets or
+# --gnn-layers, but it has no way to know the base model changed underneath it.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b
+LORA=0                                  # 1 also trains LoRA on the LLM's q/v projections;
+                                        # off here because era 1 had none, and the +0.473 gap
+                                        # this run is compared against was measured without it
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
@@ -100,6 +108,6 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
         --gnn-layers 2 \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "adapter-gnn2-$SLURM_JOB_ID" \
+        --wandb-run "adapter-qwen14b-gnn2-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '
