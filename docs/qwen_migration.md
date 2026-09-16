@@ -782,3 +782,92 @@ one failure mode worth killing the job over rather than waiting out.
   weights plus ~2.4 GB saved by the sliced head fits a 40 GB A100; nothing has confirmed it.
 - The ~10-11 h/epoch figure is a FLOP-ratio estimate scaled off an unvalidated Vicuna estimate.
   Treat the resubmit count as unknown until epoch 1 lands.
+
+---
+
+## Step 10 — the generation job
+
+**Set up 2026-09-09. Run pending.** Training finished; this is the job that produces the two
+CSVs the +0.473 comparison is re-measured against.
+
+`run_generate_eval.sh` had not been touched since `ee55816` (2026-08-30) and was still a Vicuna
+job. It was the last file in the pipeline carrying the old model, because nothing in steps 1-9
+needed it — which is exactly why it was easy to miss.
+
+### What changed
+
+| | was | now | why |
+|---|---|---|---|
+| `SIF` | `adapter-gpu.sif` | `adapter-qwen-gpu.sif` | the step-1 image. The old one has transformers 4.39.3 |
+| `CKPT_DIR` | `$BASE_DIR/checkpoints` | `$BASE_DIR/checkpoints/qwen14b` | must match `run_train_adapter.sh`; see below |
+| `ARM` | `adapter-gnn2` | `adapter-qwen14b-gnn2` | otherwise the run directory is indistinguishable from the five Vicuna `adapter-gnn2` runs already in `experiments/` |
+| `RUN_BASELINE` | 0 | **1** | see below |
+| baseline output | `_vicuna-baseline` | `_qwen14b-baseline` | it is not Vicuna |
+| walltime | 12 h | 24 h | ~7 h/condition x 2; see below |
+| pre-flight | `verify_generation.py` | + `verify_capped_prompts.py` | see below |
+
+### `RUN_BASELINE` is the one that would not have failed
+
+The other two model-dependent settings abort: the wrong image trips
+`verify_generation.py`'s `transformers == 4.51.3` assertion within seconds, and the wrong
+checkpoint directory trips `load_state_dict` on a shape mismatch — the adapter output moved
+from `32x2x32x10x128` to `40x2x8x32x128` — a few minutes in, once the 29.6 GB model is on the
+card. Both are loud, and both cost only queue time.
+
+`RUN_BASELINE=0` is not. It was correct for the 08-23 to 08-25 Vicuna runs, where a baseline
+under identical decoding already existed and re-running it was ~3 GPU-hours for a
+byte-identical file (`adapter.md`, Stage 6a). Under Qwen3-14B there is **no baseline anywhere**,
+and the run would have completed normally, produced one well-formed CSV, and left the arm it
+has to be subtracted from missing. That is this project's characteristic failure shape — a
+plausible artifact rather than an error — arriving through a configuration value rather than
+through code.
+
+The Vicuna baselines cannot substitute. Different model, and behind a different chat wrapper:
+step 5's whole argument is that the frozen arm is the one a wrapper change lands on.
+
+### `verify_capped_prompts.py` added to the pre-flight
+
+`run_train_adapter.sh` runs it; this job did not, because when it was written the prompt path
+was a pure function of the tokenizer and `verify_generation.py` was the only silent failure in
+reach. Since step 2 that is no longer true: both arms read their bibliographies out of
+`prompt_refs_capped.json`, and the coverage assertion added in step 7 is what catches a node
+missing from that file before 945 nodes of generation instead of hours into it. It also pins
+the ChatML wrapper, which both arms are generated behind and only one of them is trained for.
+
+~20 s on CPU against a 24 h job.
+
+### Walltime
+
+~7 h per condition, from the old ~2.9 h Vicuna estimate scaled by 2x for parameter count and
+1.25x for `MAX_NEW_TOKENS` 256 -> 320. Two conditions is ~14.5 h, so 12 h would have timed out
+mid-baseline. 24 h absorbs a ~1.6x miss on top of that.
+
+Both factors are arithmetic, and the 2.9 h being scaled was itself never measured on an A100
+(`adapter_evaluation.md` records it as a guess). This is an estimate stacked on an estimate;
+the first condition to finish is what replaces it. Generation is resumable, so a timeout costs
+a queue wait, not work.
+
+### Verified
+
+Shell logic exercised locally under `bash` with `BASE_DIR` redirected at a fixture tree —
+everything that can be checked off Komondor:
+
+| case | result |
+|---|---|
+| empty `checkpoints/qwen14b/` | prints the error, exits 1 |
+| `epoch1/2/10.pt`, no `best.pt` | selects **epoch10** (`sort -V`, not lexical) |
+| `best.pt` present | selects `best.pt` over epoch10 |
+| stale `checkpoints/best.pt` from the Vicuna run | **not** selected; `$CKPT` resolves to `/app/checkpoints/qwen14b/best.pt` |
+
+`bash -n` passes. Nothing else in the script can be tested off Komondor.
+
+### Known limitations
+
+- **Nothing here has run.** Whether Qwen3-14B generates within the walltime, and whether the
+  945 prompts stay inside the 3,744-token budget in practice, are both unmeasured — step 5's
+  budget check says the largest is 3,627, but that was the tokenizer, not a generation run.
+- **The gate is not checked by this job.** If `gate/mean_abs` stayed flat during training, the
+  adapter arm will score like the baseline and the job will still complete normally. Read the
+  W&B curve before spending 14 GPU-hours on the comparison.
+- **`RUN_GATE0=0`.** Correct at `LORA=0` — the gate=0 arm is redundant with the frozen-LLM
+  baseline when the LLM is untouched — but it means this run has two arms, not three.

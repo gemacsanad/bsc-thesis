@@ -1,0 +1,161 @@
+% ============================================================
+% BME VIK TDK abstract — VARIANT 4: the combined stack (F2 + F3 + F4)
+%
+% Fourth of the framings. This is the thesis-scale version: it keeps
+% variant 3's objective (novelty as a generative residual) but puts
+% the two results it depends on in front of it, in the order in which
+% they have to be established.
+%
+%   Stage 1 — the model, and its calibration on the part of a paper
+%     the bibliography DOES determine, measured without an LLM judge.
+%   Stage 2 (was variant 2) — attribution. Is that recovery a fact
+%     about graph structure, or only about having more text?
+%   Stage 3 (was variant 3) — the part the bibliography does not
+%     determine, read as novelty.
+%
+% ORDER: model first, then attribution, then novelty. An earlier draft
+% led with the controls; that forward-referenced the prefix before the
+% architecture was introduced, and made the controls read as a
+% defensive gate rather than as attribution of a result already shown.
+%
+% The load-bearing claim is that these are not three projects: stages
+% 2 and 3 are the two halves of one residual, and stage 1 is what
+% makes either of them a statement about the graph.
+%
+% Structure follows the official one-page sample:
+% https://portal.vik.bme.hu/files/00000047.pdf
+%   - max 1 page, min ~20 lines of body text
+%   - NO header, footer, or page numbers
+%   - figures/equations only if strictly necessary
+%   - own contribution must be clearly separated from cited work
+%   - body must cover: methodology, key results, conclusions
+%
+% NUMBERS: three slots, one per stage — the margin between the
+% graph-conditioned model and the text-matched baseline; the share of
+% downstream performance recovered from generated node text; and the
+% validation figures for the novelty measure. Do not submit without
+% them; the official sample requires key results in the body.
+%
+% LENGTH WARNING: this variant carries three stages in the space v1
+% and v2 use for one. It is at the page limit. If it overflows after
+% translation to Hungarian (which runs longer), cut from stage 1 —
+% the control suite can be named without being enumerated.
+%
+% NOTE ON LANGUAGE: the official TDK conference language is Hungarian
+% (English talks require prior agreement with the section chair, per
+% the official sample). This English draft is for internal review with
+% Bálint/Dani; translate to Hungarian before submission unless an
+% English exception is confirmed.
+% ============================================================
+
+\documentclass[12pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{mathptmx}      % Times-like font
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\pagestyle{empty}          % <- enforces "no header/footer/page numbers"
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% ---------- Title ----------
+\begin{center}
+    {\Large\bfseries What a Citation Graph Determines, and What It Does Not: \\
+    From Graph-Conditioned Language Models to a Measure of Novelty}
+\end{center}
+
+\vspace{0.8em}
+
+% ---------- Authors ----------
+\begin{center}
+    Gema Csanád IV. Inf, gemacsanad@gmail.com \\
+
+\end{center}
+
+\vspace{0.4em}
+
+% ---------- Consultant ----------
+\begin{center}
+    Consultant: Unyi Dániel
+\end{center}
+
+\vspace{1.2em}
+
+% ==========================================================
+% BODY
+% ==========================================================
+
+A citation graph represents scientific literature as a network: each
+node is a publication, each edge a citation from one paper to
+another, and every node carries that paper's abstract as its text
+content. A reference list records the problem a paper attacks, the
+methods it borrows and the community it belongs to. We ask how much
+of a paper that record determines — and we use both halves of the
+answer: what a citation neighbourhood predicts about a paper is
+recoverable data, and what it fails to predict is a measure of the
+paper's novelty.
+
+Methodologically, a graph neural network encodes the citation
+neighbourhood — the cited papers, and their references in turn,
+beyond what could fit in a prompt — into a continuous representation,
+which a trained adapter projects into soft prefix tokens injected
+into the attention layers of a language model. The model generates
+the target paper's abstract from this representation together with
+the plain text of the directly cited papers, never seeing the
+target's own words. The target's features are masked and edges run
+from cited to citing paper, so nothing published after the target can
+reach it.
+
+How much of a paper this recovers is measured without a language
+model as judge. The generated text is substituted for the real node
+attributes, and we measure how much of the downstream performance
+that real text supports — node classification on the citation graph —
+survives the substitution. This is an objective criterion, and it
+answers a practical question in its own right: which nodes in a graph
+with missing text can be restored from their neighbourhood, and which
+can only be described in outline.
+
+Whether that recovery is a fact about graph structure, or merely
+about having more text, is a separate question, and the one existing
+work leaves open. Structure is usually given to a language model by
+encoding a neighbourhood into a continuous vector and injecting it
+alongside the neighbours' text, and gains are then credited to the
+structure. But text is the cheaper channel, and a model offered the
+same information twice has no reason to learn the harder one; prior
+graph-conditioned models report end-task performance only, so this is
+never tested. We test it against a text-matched baseline receiving
+the same neighbourhood content as plain text within the same token
+budget, and against prefixes built from a disabled or a shuffled
+neighbourhood, which separate the prefix's content from its presence.
+
+The remainder is the measurement. A paper's contribution is by
+definition its departure from the work it cites, so the discrepancy
+between the predicted and the actual abstract estimates its novelty.
+Reference-based measures score the atypicality of cited journals and
+discard content; perplexity-based measures ask whether a text is
+unusual in general rather than given this paper's own antecedents.
+Here the expectation is built from the paper's own reference list.
+Because such a residual confounds novelty with model error and with
+incomplete coverage, it is read relative to matched papers of the
+same field, year and reference count — and only against a model whose
+accuracy where prediction is possible has already been established.
+
+Our own contribution is this argument and the system that carries it:
+the judge-free calibration of what a citation neighbourhood recovers,
+the controls that decide whether that recovery is structural, and the
+formulation and validation of novelty as a conditional generative
+residual. Novelty has no ground truth, so validation is the
+substantive difficulty; we approach it through axiomatic properties
+any such measure should satisfy, separation of recognised landmark
+papers from matched controls, and correlation with the disruption
+index and later citation impact on the same graph. One quantity, two
+uses: what a bibliography predicts is data that can be restored, and
+what it fails to predict is what makes a paper worth reading.
+
+\end{document}

@@ -5,6 +5,7 @@ rather than a rewrite of what came before.
 
 | File | Covers |
 |---|---|
+| [`project_overview.md`](project_overview.md) | The non-specialist introduction: the research question, the data, the method in plain terms, the milestone timeline, and what has been found. Start here if you are not going to read the code. |
 | [`adapter.md`](adapter.md) | Stages 1–4 of the current model: eligible nodes and the frozen eval set, the graph tensors and loaders, the GraphSAGE encoder, the prefix adapter, prefix injection into a frozen Vicuna, training, W&B telemetry, the container and the training job. |
 | [`adapter_evaluation.md`](adapter_evaluation.md) | Stage 5: generating the two evaluation CSVs, and what is held fixed between the adapter and baseline conditions. |
 | [`hpc_migration.md`](hpc_migration.md) | Moving the Komondor project onto this layout in place, keeping the Vicuna cache, the trained adapter and the S2 download. |

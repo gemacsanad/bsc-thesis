@@ -1,0 +1,148 @@
+% ============================================================
+% BME VIK TDK abstract — FINAL
+%
+% Supersedes v1-v5 in docs/framing/. Keeps v5's opening (the
+% contribution-is-a-departure observation), and rebuilds the body as
+% an argument that unfolds rather than a set of parallel stages:
+%
+%   1. thesis + the task           (opening from v5, task line from v1)
+%   2. the model that generates the abstract
+%   3. WHAT IT CANNOT RECOVER — the specific methodology — and why
+%      that is a property of the task, not of the model   <- the hinge
+%   4. therefore the residual is the novelty
+%   5. how to measure it credibly, and validate it
+%
+% Paragraph 3 is load-bearing. Everything before it earns it and
+% everything after it depends on it. If a reviewer attacks one
+% paragraph it will be that one, so the number that goes in it must be
+% the best-supported number in the paper.
+%
+% LENGTH: ~470 words of body, cut from v5's 604 to fit one page.
+%   For reference: v1 = 364 words, v2 = 464, v3 = 543, v4 = 635, v5 = 604.
+% What was sacrificed, deliberately: the attribution controls (the
+% text-matched baseline, the disabled and shuffled prefixes) lose
+% their paragraph and survive as one clause at the end of paragraph 2.
+% The full control suite belongs in the paper, not here. Also cut: the
+% LLM-as-reviewer line, and the per-axis breakdown of the residual.
+%
+% NUMBERS: two slots. Paragraph 3 takes the recoverable-vs-
+% unrecoverable figures (domain/problem/task against methodology, and
+% the share of downstream node-classification performance that
+% survives substitution); paragraph 5 takes the validation figures.
+% Do not submit without them — the official sample requires key
+% results in the body.
+%
+% Structure follows the official one-page sample:
+% https://portal.vik.bme.hu/files/00000047.pdf
+%   - max 1 page, min ~20 lines of body text
+%   - NO header, footer, or page numbers
+%   - figures/equations only if strictly necessary
+%   - own contribution must be clearly separated from cited work
+%   - body must cover: methodology, key results, conclusions
+%
+% NOTE ON LANGUAGE: the official TDK conference language is Hungarian.
+% This English draft is for internal review with Bálint/Dani.
+% Translate before submission unless an English exception is agreed
+% with the section chair; the Hungarian preamble (babel[magyar], the
+% author/consultant block) is already set up in abstract.tex.
+% Hungarian runs longer than English — recheck the page fit after
+% translating, and cut from paragraph 4's positioning clauses first.
+% ============================================================
+
+\documentclass[12pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{mathptmx}      % Times-like font
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\pagestyle{empty}          % <- enforces "no header/footer/page numbers"
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% ---------- Title ----------
+\begin{center}
+    {\Large\bfseries What Its Own References Cannot Anticipate: \\
+    Measuring Scientific Novelty on a Citation Graph}
+\end{center}
+
+\vspace{0.8em}
+
+% ---------- Authors ----------
+\begin{center}
+    Gema Csanád IV. Inf, gemacsanad@gmail.com \\
+
+\end{center}
+
+\vspace{0.4em}
+
+% ---------- Consultant ----------
+\begin{center}
+    Consultant: Unyi Dániel
+\end{center}
+
+\vspace{1.2em}
+
+% ==========================================================
+% BODY
+% ==========================================================
+
+A paper's contribution is, by definition, its departure from the work
+it cites: anything already contained in its references would not be a
+contribution. We turn that observation into a measurement of
+scientific novelty. In a citation graph — each node a publication,
+each edge a citation from one paper to another, every node carrying
+that paper's abstract as its text content — we study one task: given
+a paper's reference list, but withholding the paper's own abstract
+entirely, generate what that abstract says.
+
+A graph neural network encodes the citation neighbourhood — the cited
+papers, and their references in turn, beyond what could fit in a
+prompt — into a continuous representation, which a trained adapter
+projects into soft prefix tokens injected into the attention layers
+of a language model, alongside the plain text of the directly cited
+papers. The target's own features are masked and edges run from cited
+to citing paper, so nothing published after it can reach it. Whether
+the graph carries anything the neighbours' text does not already
+convey is tested against a text-matched baseline given the same
+content within the same token budget.
+
+What this recovers is not uniform, and the pattern is the result
+everything else rests on. A paper's research domain, its problem and
+its task are largely determined by its bibliography and are recovered
+well. Its specific methodology is not, and sits near the floor even
+for far stronger models. That is not a shortcoming of the model but a
+property of the task: a paper's method is precisely the part its
+references do not contain. The recoverable half we measure without a
+language model as judge: generated text is substituted for the real
+node attributes, and we ask how much of the downstream
+node-classification performance survives.
+
+The unrecoverable half is the measurement. We take the discrepancy
+between the predicted and the actual abstract as an estimate of how
+much of a paper could not have been anticipated from its own
+antecedents. Existing novelty measures are not conditioned on those
+antecedents: reference-based scores treat a paper as a combination of
+cited journals and discard its content, while perplexity-based scores
+ask whether a text is unusual in general rather than given what this
+paper was built on. Ours is conditional and generative — the
+expectation is constructed from the paper's own reference list.
+
+Such a residual confounds novelty with model error and with
+incomplete bibliographic coverage, so it is read relative to matched
+papers of the same field, year and reference count rather than as an
+absolute score. Validation is the substantive difficulty, since
+novelty has no ground truth; we approach it without one, through
+axiomatic properties any such measure should satisfy, separation of
+recognised landmark papers from matched controls, and correlation
+with the disruption index and later citation impact. Our own
+contribution is the model, the measurement of what a bibliography
+does and does not determine, and the formulation and validation of
+novelty as a conditional generative residual.
+
+\end{document}

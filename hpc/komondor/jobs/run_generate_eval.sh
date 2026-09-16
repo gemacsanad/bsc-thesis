@@ -5,15 +5,15 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=6000M
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --output=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.out
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
 # Stage 5 — generates both evaluation CSVs over the frozen 945-node capped eval set:
 #
-#   experiments/<date>_vicuna-baseline/generations.csv   frozen Vicuna-7B, no prefix
-#   experiments/<date>_$ARM/generations.csv              GraphSAGE + prefix adapter, same frozen Vicuna
+#   experiments/<date>_qwen14b-baseline/generations.csv  frozen Qwen3-14B, no prefix
+#   experiments/<date>_$ARM/generations.csv              GraphSAGE + prefix adapter, same frozen Qwen3
 #
 # Both conditions run back to back in ONE job, on the same node and the same GPU, so nothing but
 # the prefix differs between the two files. Greedy decoding, bf16, batch size 1 — see
@@ -22,27 +22,31 @@
 # RUN_BASELINE=0 skips the control and halves the walltime. Only do that when the decoding
 # settings are unchanged from a run whose baseline already exists — the GNN gap is a difference
 # between the two arms, so a baseline generated under different decoding cannot be reused.
+# It is 1 here and must stay 1 for the first Qwen run: no Qwen3-14B baseline exists anywhere,
+# and the Vicuna one is a different model behind a different chat wrapper.
 #
 # RUN_GATE0=1 adds a third arm: the checkpoint's own weights with the gate forced to zero, so
 # the prefix is node-independent. Under LoRA that is the control that isolates the graph — the
-# frozen-Vicuna arm differs from the adapter by two things at once, LoRA and the graph, while
-# gate=0 differs by only the graph. Without LoRA it is redundant with the baseline.
+# frozen-LLM arm differs from the adapter by two things at once, LoRA and the graph, while
+# gate=0 differs by only the graph. Without LoRA it is redundant with the baseline, and this
+# run is LORA=0.
 #
 # Nothing is trained and nothing is written to W&B; no .env is needed.
 #
 # Prerequisites:
-#   - adapter-gpu.sif built (hpc/komondor/containers/adapter-gpu.def) — the same image train.py used,
-#     with no extra packages: generate.py imports nothing train.py did not
-#   - a checkpoint in checkpoints/ (produced by run_train_adapter.sh)
-#   - lmsys/vicuna-7b-v1.5 already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
+#   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def) — the same image
+#     train.py used, with no extra packages: generate.py imports nothing train.py did not
+#   - a checkpoint in checkpoints/qwen14b/ (produced by run_train_adapter.sh)
+#   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
-# Walltime is 12 h against an estimated ~2.9 h per condition (945 nodes x 256 greedy tokens at
-# batch size 1, twice — 1.9x the old 495-node set, and none of them lost to overflow). That
-# estimate has never been checked on a real A100. Lower it once one condition has actually been
-# timed — the cost is queue time, and the resume below covers a timeout anyway.
+# Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
+# estimate of ~2.9 h (945 nodes, batch size 1) by 2x for Qwen3-14B's parameter count and 1.25x
+# for MAX_NEW_TOKENS going 256 -> 320. Both factors are arithmetic, and the 2.9 h it scales was
+# itself never checked on a real A100 — so treat 24 h as absorbing a miss, not as a measurement.
+# The resume below covers a timeout anyway; lower it once one condition has been timed.
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
-SIF=$BASE_DIR/adapter-gpu.sif
+SIF=$BASE_DIR/adapter-qwen-gpu.sif
 
 mkdir -p $BASE_DIR/logs
 
@@ -50,9 +54,15 @@ mkdir -p $BASE_DIR/logs
 # suffix to match. Nothing here selects an architecture — generate.py reads the encoder depth
 # back out of the checkpoint — so a wrong directory scores another run's weights, but can
 # never build the wrong encoder for them.
-CKPT_DIR=$BASE_DIR/checkpoints          # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
-ARM=adapter-gnn2                        # experiments/<date>-<job>_$ARM/
-RUN_BASELINE=0                          # 0 to generate the adapter arm only
+#
+# It must match run_train_adapter.sh's CKPT_DIR. The Qwen run writes to checkpoints/qwen14b/;
+# $BASE_DIR/checkpoints still holds the Vicuna run, and best.pt is a fixed name in both, so
+# the unqualified directory would silently select the wrong model's weights. The load fails on
+# a shape mismatch rather than scoring the wrong thing — the adapter output moved from
+# 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b  # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+ARM=adapter-qwen14b-gnn2                # experiments/<date>-<job>_$ARM/
+RUN_BASELINE=1                          # 0 to generate the adapter arm only
 RUN_GATE0=0                             # 1 adds the gate=0 arm (see below)
 
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
@@ -95,10 +105,16 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # so it runs before the GPU hours, not after.
     python verify_generation.py || exit 1
 
+    # And that generate.py builds the bibliographies the frozen sets were selected under —
+    # both arms read them from data/frozen/prompt_refs_capped.json, and a node quietly
+    # recomputed under the Qwen tokenizer would be shown different evidence than Vicuna saw.
+    # ~20 s on CPU, and it also pins the ChatML wrapper both arms are generated behind.
+    python verify_capped_prompts.py || exit 1
+
     if [ "$RUN_BASELINE" = 1 ]; then
-        echo "=== baseline: frozen Vicuna-7B, no prefix ==="
+        echo "=== baseline: frozen Qwen3-14B, no prefix ==="
         python generate.py --mode baseline \
-            --output "/app/experiments/${RUN_TAG}_vicuna-baseline/generations.csv"
+            --output "/app/experiments/${RUN_TAG}_qwen14b-baseline/generations.csv"
     else
         echo "=== baseline skipped (RUN_BASELINE=0) ==="
     fi
@@ -109,7 +125,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
             --output "/app/experiments/${RUN_TAG}_${ARM}-gate0/generations.csv"
     fi
 
-    echo "=== adapter: GraphSAGE + prefix adapter + frozen Vicuna-7B ($ARM) ==="
+    echo "=== adapter: GraphSAGE + prefix adapter + frozen Qwen3-14B ($ARM) ==="
     python generate.py --mode adapter --checkpoint "$CKPT" \
         --output "/app/experiments/${RUN_TAG}_${ARM}/generations.csv"
 '

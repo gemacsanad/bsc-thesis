@@ -47,9 +47,7 @@ _KEYS = """{
 }
 """
 
-# --- R1: the rubric every existing number in the project was produced with ----
-# Verbatim from src/evaluation/evaluate_results.py. Present so the other three are measured
-# against a known quantity: it must reproduce the +0.473 era-1 gap, or something else moved.
+
 R1 = _HEAD + _KEYS + """
 Rubrics:
 - accuracy  (1-10): How closely does the generated abstract align with the core scientific \
@@ -57,11 +55,7 @@ objective, problem domain, and baseline methodologies of the original? \
 Penalise explicit contradictions; do not penalise creative but plausible predictions.
 """ + _COHERENCE + "\n" + _LANGUAGE
 
-# --- R2: problem and task only ------------------------------------------------
-# Methodology is not recoverable from a bibliography — docs/adapter.md puts wrong_methodology
-# at 70% for Vicuna and 95% for gpt-5.4-mini — so a third of R1's accuracy definition scores a
-# dimension no arm can achieve. That is variance that cannot discriminate, and it pins both
-# arms near the floor (46.7% of baseline scores are <= 2 under R1).
+
 R2 = _HEAD + _KEYS + """
 Rubrics:
 - accuracy  (1-10): How closely does the generated abstract identify the same research \
@@ -77,9 +71,7 @@ techniques while addressing a different problem or a different task scores low. 
 Penalise explicit contradictions; do not penalise omission of detail.
 """ + _COHERENCE + "\n" + _LANGUAGE
 
-# --- R3: the same thing, decomposed ------------------------------------------
-# Diagnostic rather than headline. If the adapter's advantage is concentrated in scope and
-# problem rather than task, that is the finding, and no aggregate score shows it.
+
 R3 = _HEAD + """{
   "accuracy":  <int 1-10>,
   "domain":    <int 1-10>,

@@ -1,0 +1,114 @@
+% ============================================================
+% BME VIK TDK abstract — VARIANT 1: problem-first, method-as-solution
+% (GNN + Adapter + LoRA + Contrastive loss)
+%
+% This is one of two abstract framings for the supervisors to compare
+% and choose between. This variant leads with the missing-abstract
+% problem and presents the architecture as the proposed solution.
+% The second variant (falsifiability/grounding-question framing, per
+% tdk-winning-strategy.md) is a separate file.
+%
+% Structure follows the official one-page sample:
+% https://portal.vik.bme.hu/files/00000047.pdf
+%   - max 1 page, min ~20 lines of body text
+%   - NO header, footer, or page numbers
+%   - figures/equations only if strictly necessary
+%   - own contribution must be clearly separated from cited work
+%   - body must cover: methodology, key results, conclusions
+%
+% NOTE ON LANGUAGE: the official TDK conference language is Hungarian
+% (English talks require prior agreement with the section chair, per
+% the official sample). This English draft is for internal review with
+% Bálint/Dani; translate to Hungarian before submission unless an
+% English exception is confirmed.
+% ============================================================
+
+\documentclass[12pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{mathptmx}      % Times-like font
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\pagestyle{empty}          % <- enforces "no header/footer/page numbers"
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% ---------- Title ----------
+\begin{center}
+    {\Large\bfseries Graph Conditioned Abstract Generation for Cross-Field Synthesis}
+\end{center}
+
+\vspace{0.8em}
+
+% ---------- Authors ----------
+\begin{center}
+    Gema Csanád IV. Inf, gemacsanad@gmail.com \\
+    
+\end{center}
+
+\vspace{0.4em}
+
+% ---------- Consultant ----------
+\begin{center}
+    Consultant: Unyi Dániel 
+\end{center}
+
+\vspace{1.2em}
+
+% ==========================================================
+% BODY
+% ==========================================================
+
+A citation graph represents scientific literature as a network: each
+node is a publication, each edge is a citation from one paper to
+another, and every node carries that paper's abstract as its text
+content. We study a specific task on this graph: given a target
+paper's reference list, but withholding the target paper's own abstract
+entirely, generate what that abstract says. The model never sees the
+target paper's own words, it only sees which other papers it points
+to, and what those papers say.
+
+This is a meaningful test of whether a paper's contribution is
+legible purely from its position in the graph. A paper's abstract
+typically connects and synthesises ideas from several otherwise
+unrelated fields, and its reference list is the only trace of
+that synthesis available before the abstract itself exists.
+Reconstructing the abstract from references alone tests whether this
+cross-field connection is recoverable from the graph, independently
+of the target paper's own text.
+
+We approach this task with a system that combines a graph neural
+network (GNN) with a language model. The language model generates the
+target abstract conditioned on two things: the plain text of the
+directly-cited papers' abstracts, and a structural embedding produced
+by the GNN. The GNN aggregates information from beyond the
+directly-cited papers themselves, capturing how these papers connect
+to each other and to the wider citation network. An adapter
+module projects this structural embedding into soft prefix tokens,
+injected into every attention layer of the language model, which is
+fine-tuned with LoRA. A contrastive alignment loss between the GNN
+embedding and a frozen text encoding of the true target abstract
+encourages the structural embedding to be directly predictive of the
+target's content during training.
+
+We construct the task on ogbn-arxiv-TA, a citation graph of computer
+science papers extended with cross-domain reference nodes, so that
+the cross-field citations central to the task are actually present
+in a paper's neighbourhood. Generation quality is measured with
+ROUGE,  BERTScore, and an LLM-as-judge protocol, comparing
+the full model against a text-only baseline that
+receives only the same directly-cited papers' abstracts. This
+isolates whether the structural embedding adds predictive signal
+beyond what is already visible in the directly-cited papers' own
+text.
+
+\vspace{1em}
+
+
+\end{document}

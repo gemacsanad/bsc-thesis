@@ -1,0 +1,157 @@
+% ============================================================
+% BME VIK TDK abstract — VARIANT 5: novelty-led (recommended)
+%
+% Fifth framing, and the one I would submit. It carries the same
+% three pieces of work as variant 4, but weights them differently.
+%
+%   v3 (abstract-v3-novelty.tex)  — novelty alone. One claim, but
+%     says "graph-conditioned" without ever earning it: no control
+%     separates the graph from the neighbours' text.
+%   v4 (abstract-v4-stack.tex)    — all three as equal stages. Airtight
+%     logically, but the hook lands in paragraph five and it reads as
+%     a roadmap rather than a finding.
+%   v5 (this file)                — novelty leads; the calibration and
+%     the attribution controls appear as the two conditions that make
+%     the residual readable, not as stages of their own.
+%
+% The structural bet: an abstract is read in its first three sentences,
+% and a jury remembers one claim, not three. v5 spends its opening on
+% the idea and its middle on why the idea is trustworthy. The controls
+% lose top billing but lose none of their content — paragraph four
+% still commits to every experiment v4 promised.
+%
+% Structure follows the official one-page sample:
+% https://portal.vik.bme.hu/files/00000047.pdf
+%   - max 1 page, min ~20 lines of body text
+%   - NO header, footer, or page numbers
+%   - figures/equations only if strictly necessary
+%   - own contribution must be clearly separated from cited work
+%   - body must cover: methodology, key results, conclusions
+%
+% NUMBERS: two slots. Paragraph four takes the calibration figure
+% (share of downstream performance recovered) and the margin over the
+% text-matched baseline; paragraph five takes the validation figures.
+% Do not submit without them — the official sample requires key
+% results in the body.
+%
+% NOTE ON LANGUAGE: the official TDK conference language is Hungarian
+% (English talks require prior agreement with the section chair, per
+% the official sample). This English draft is for internal review with
+% Bálint/Dani; translate to Hungarian before submission unless an
+% English exception is confirmed. Hungarian runs longer — if it
+% overflows, cut the third sentence of paragraph two (the
+% LLM-as-reviewer line) first; it is the least load-bearing.
+% ============================================================
+
+\documentclass[12pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage[a4paper, margin=2.5cm]{geometry}
+\usepackage{mathptmx}      % Times-like font
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\pagestyle{empty}          % <- enforces "no header/footer/page numbers"
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% ---------- Title ----------
+\begin{center}
+    {\Large\bfseries What Its Own References Cannot Anticipate: \\
+    A Generative Measure of Scientific Novelty}
+\end{center}
+
+\vspace{0.8em}
+
+% ---------- Authors ----------
+\begin{center}
+    Gema Csanád IV. Inf, gemacsanad@gmail.com \\
+
+\end{center}
+
+\vspace{0.4em}
+
+% ---------- Consultant ----------
+\begin{center}
+    Consultant: Unyi Dániel
+\end{center}
+
+\vspace{1.2em}
+
+% ==========================================================
+% BODY
+% ==========================================================
+
+A paper's contribution is, by definition, its departure from the work
+it cites: anything already contained in its references would not be a
+contribution. We turn that observation into a measurement of
+scientific novelty. In a citation graph — where each node is a
+publication, each edge a citation from one paper to another, and
+every node carries that paper's abstract as its text content — we
+train a model to predict a paper's abstract from its citation
+neighbourhood alone, with the paper's own text withheld entirely, and
+take the discrepancy between the predicted and the actual abstract as
+an estimate of how much of the paper could not have been anticipated
+from its own antecedents.
+
+Novelty is currently measured in two ways, neither conditioned on an
+individual paper's own antecedents. Reference-based measures score
+how atypical the combination of cited journals is, discarding content
+altogether. Language-model measures score the perplexity of a paper's
+text, asking whether it is unusual in general rather than unusual
+given what this particular paper was built on. A third line asks a
+language model to read a paper and judge its novelty, which
+reproduces the judge's priors rather than measuring anything. Ours is
+conditional and generative: the expectation a paper is scored against
+is constructed from that paper's own reference list.
+
+Methodologically, a graph neural network encodes the citation
+neighbourhood — the cited papers, and their references in turn,
+beyond what could fit in a prompt — into a continuous representation,
+which a trained adapter projects into soft prefix tokens injected
+into the attention layers of a language model. Generation is
+conditioned on this representation together with the plain text of
+the directly cited papers. The target's own features are masked and
+edges run from cited to citing paper, so nothing published after it
+can reach it. The residual is scored separately for research domain,
+problem, task and methodology, which a bibliography determines to
+very different degrees.
+
+A residual is only as meaningful as the prediction it is taken from,
+and two things have to be established before it can be read as
+novelty. The first is accuracy where prediction is possible, which we
+measure without a language model as judge: generated text is
+substituted for the real node attributes, and we ask how much of the
+downstream node-classification performance that real text supports
+survives the substitution. The second is that the prediction is
+structural rather than merely well-informed — against a text-matched
+baseline given the same neighbourhood content as plain text within
+the same token budget, and against prefixes built from a disabled or
+a shuffled neighbourhood, we test whether the graph carries anything
+the neighbours' own text does not already convey, which prior
+graph-conditioned models, reporting end-task performance only, never
+test.
+
+The residual still confounds novelty with incomplete bibliographic
+coverage, so it is read relative to matched papers of the same field,
+year and observed reference count rather than as an absolute score.
+Validation is the substantive difficulty, since novelty has no ground
+truth; we approach it without one, through axiomatic properties any
+such measure should satisfy, separation of recognised landmark papers
+from matched controls, and correlation with the disruption index and
+later citation impact computed on the same graph.
+
+Our own contribution is the formulation of novelty as a conditional
+generative residual, the graph-conditioned model that produces it,
+the two controls that make the residual interpretable, and the
+validation. We report where the measure agrees with existing
+reference-based and perplexity-based scores and, more informatively,
+where it disagrees: the papers whose wording is conventional but
+whose content their own antecedents could not have anticipated, and
+the reverse.
+
+\end{document}
