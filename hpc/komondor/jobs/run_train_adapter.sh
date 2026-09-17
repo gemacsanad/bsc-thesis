@@ -10,7 +10,9 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Trains the GraphSAGE encoder + prefix adapter against a frozen Qwen3-14B.
+# Trains the GraphSAGE encoder + prefix adapter against a frozen Qwen3-14B, soft-prompt-only:
+# the prompt is one fixed system message and user turn with no references, so the prefix is
+# the only channel to the paper (src/adapter/text.py, docs/soft_prompt_only.md).
 # The LLM is never updated; only checkpoints/epoch*.pt are written (~196 MB each:
 # 65 MB of weights plus AdamW's two moment buffers, which --resume needs).
 #
@@ -59,7 +61,9 @@ SIF=$BASE_DIR/adapter-qwen-gpu.sif
 # best.pt is a fixed name, so sharing a directory with the Vicuna checkpoints would resume from
 # and overwrite the wrong run. train.py refuses a resume across a change of --sets or
 # --gnn-layers, but it has no way to know the base model changed underneath it.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b
+# graphonly: separate from checkpoints/qwen14b/, which holds the text-path run. train.py refuses
+# to resume across a prompt change, but the fixed best.pt name would still be overwritten.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly
 LORA=0                                  # 1 also trains LoRA on the LLM's q/v projections;
                                         # off here because era 1 had none, and the +0.473 gap
                                         # this run is compared against was measured without it
@@ -90,10 +94,10 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     cd /app/src/adapter
     nvidia-smi
 
-    # Cheap and CPU-only (~20 s): re-proves that the prompts train.py will build are the ones
-    # the frozen node sets were selected under. The failure it guards against is silent — the
-    # wrong references yield a fluent abstract, not an error — so it runs before the GPU hours.
-    python verify_capped_prompts.py || exit 1
+    # Cheap and CPU-only (seconds): pins the exact graph-only prompt, checks it carries no
+    # reference text, and that every frozen node has a trainable target. A moved chat template
+    # yields fluent text, not an error — so it runs before the GPU hours.
+    python verify_graph_only_prompt.py || exit 1
 
     # And that the loss train.py computes is the one transformers would have computed. The
     # head is applied to the supervised positions only, to keep a 151,936-token vocabulary
@@ -108,6 +112,6 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
         --gnn-layers 2 \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "adapter-qwen14b-gnn2-$SLURM_JOB_ID" \
+        --wandb-run "adapter-qwen14b-graphonly-gnn2-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '

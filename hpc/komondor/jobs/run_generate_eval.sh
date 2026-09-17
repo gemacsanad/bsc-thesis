@@ -22,8 +22,10 @@
 # RUN_BASELINE=0 skips the control and halves the walltime. Only do that when the decoding
 # settings are unchanged from a run whose baseline already exists — the GNN gap is a difference
 # between the two arms, so a baseline generated under different decoding cannot be reused.
-# It is 1 here and must stay 1 for the first Qwen run: no Qwen3-14B baseline exists anywhere,
-# and the Vicuna one is a different model behind a different chat wrapper.
+# It is 0 for the soft-prompt-only run. Its baseline would get the graph-only prompt with no
+# prefix — no information about the paper at all — and write one identical abstract for all 945
+# nodes under greedy decoding. The comparison arm is the existing text-path Qwen baseline,
+# experiments/2026-09-10-14364743_qwen14b-baseline (docs/soft_prompt_only.md).
 #
 # RUN_GATE0=1 adds a third arm: the checkpoint's own weights with the gate forced to zero, so
 # the prefix is node-independent. Under LoRA that is the control that isolates the graph — the
@@ -36,7 +38,7 @@
 # Prerequisites:
 #   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def) — the same image
 #     train.py used, with no extra packages: generate.py imports nothing train.py did not
-#   - a checkpoint in checkpoints/qwen14b/ (produced by run_train_adapter.sh)
+#   - a checkpoint in checkpoints/qwen14b-graphonly/ (produced by run_train_adapter.sh)
 #   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
 # Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
@@ -60,9 +62,12 @@ mkdir -p $BASE_DIR/logs
 # the unqualified directory would silently select the wrong model's weights. The load fails on
 # a shape mismatch rather than scoring the wrong thing — the adapter output moved from
 # 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b  # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
-ARM=adapter-qwen14b-gnn2                # experiments/<date>-<job>_$ARM/
-RUN_BASELINE=1                          # 0 to generate the adapter arm only
+# The soft-prompt-only run writes to checkpoints/qwen14b-graphonly/. Pointing this at
+# checkpoints/qwen14b/ instead would pass the shape check; generate.py refuses it on the
+# checkpoint's recorded prompt mode.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly  # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+ARM=adapter-qwen14b-graphonly-gnn2      # experiments/<date>-<job>_$ARM/
+RUN_BASELINE=0                          # 0 to generate the adapter arm only
 RUN_GATE0=0                             # 1 adds the gate=0 arm (see below)
 
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
@@ -105,11 +110,9 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # so it runs before the GPU hours, not after.
     python verify_generation.py || exit 1
 
-    # And that generate.py builds the bibliographies the frozen sets were selected under —
-    # both arms read them from data/frozen/prompt_refs_capped.json, and a node quietly
-    # recomputed under the Qwen tokenizer would be shown different evidence than Vicuna saw.
-    # ~20 s on CPU, and it also pins the ChatML wrapper both arms are generated behind.
-    python verify_capped_prompts.py || exit 1
+    # And that generate.py builds the exact graph-only prompt the adapter was trained behind,
+    # with no reference text in it. Seconds on CPU.
+    python verify_graph_only_prompt.py || exit 1
 
     if [ "$RUN_BASELINE" = 1 ]; then
         echo "=== baseline: frozen Qwen3-14B, no prefix ==="

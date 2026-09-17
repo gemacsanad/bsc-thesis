@@ -48,6 +48,59 @@ def frozen_refs():
     return _frozen_refs
 
 
+# --- The live prompt: soft-prompt-only (2026-09-16) ------------------------------------------
+# No reference block. Everything the model learns about the target paper arrives through the
+# graph prefix, so the text is identical for every node and the prefix is the only thing that
+# differs between two papers.
+#
+# The system message is the era-4 instruction (experiments/prompt_sensitivity_gpt/prompts.py),
+# the best of the four under Qwen3-14B (5.333 vs era 1's 3.875 on 48 nodes), with the phrases
+# that pointed at a listed bibliography re-pointed at the context the prefix supplies.
+#
+# Everything below this block — SYSTEM, INSTRUCTION, build_prompt, capped_example — is the old
+# text path. train.py and generate.py no longer call it; it stays so freeze_prompt_refs.py,
+# prepare_data_capped.py and verify_capped_prompts.py still run. See docs/soft_prompt_only.md.
+PROMPT = "graph-only"       # recorded in every checkpoint; the text-path runs had no such key
+
+GRAPH_ONLY_SYSTEM = (
+    "You are a scientific writing assistant. "
+    "The context you have been given encodes the reference list of one paper, whose own "
+    "abstract is missing. That paper is not among its references: it is a separate, more "
+    "recent work that cites all of them. "
+    "Reconstruct its abstract as continuous prose covering, in order: the problem it "
+    "addresses; what the work it cites has already established about that problem; what it "
+    "does about what remains open, described by the mechanism it uses the kind of model, "
+    "data or analysis rather than by a name; and what it evaluates. "
+    "Where the context leaves the paper's specific contribution undetermined, state what "
+    "it does determine about its problem and approach, and stop there — a correct general "
+    "statement is worth more than a specific guess. "
+    "Write in the voice of the paper's own authors: never mention the cited works as a "
+    "collection, how many there are, or the authors, and do not restate any single one "
+    "of them. "
+    "Write plain prose of 150-180 words, with no markup, mathematical notation or headings. "
+    "Output ONLY the abstract text."
+)
+
+GRAPH_ONLY_USER = "Write the abstract."
+
+
+def build_graph_only_prompt(tokenizer):
+    """The one prompt every node gets, in Qwen3's ChatML with thinking disabled.
+
+    A short user turn is kept rather than ending on the system message: a chat-tuned model
+    answering with no user turn at all is off-distribution, and the frozen arm would pay for it.
+    """
+    return tokenizer.apply_chat_template(
+        [{"role": "system", "content": GRAPH_ONLY_SYSTEM},
+         {"role": "user", "content": GRAPH_ONLY_USER}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def graph_only_example(tokenizer, corpus, node_id):
+    """-> (prompt, target) for one node. The single builder train.py and generate.py share."""
+    return build_graph_only_prompt(tokenizer), corpus.abstract[node_id]
+
+
 SYSTEM = (
     "A chat between a curious user and an artificial intelligence assistant. "
     "The assistant gives helpful, detailed, and polite answers to the user's questions."

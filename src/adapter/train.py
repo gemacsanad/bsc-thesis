@@ -25,16 +25,15 @@ from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FI
                     PATIENCE, SEED, WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader
 from model import GraphSAGEEncoder, PrefixAdapter
-from text import Corpus, capped_example, encode
+from text import PROMPT, Corpus, encode, graph_only_example
 
-# Which frozen node sets to train on. The two are not interchangeable: the legacy sets were
-# selected on the assumption that a node's whole reference list fits the context, the capped
-# sets on the assumption that it is trimmed to its centroid (text.capped_example). Pairing
-# one set with the other prompt builder silently trains on prompts nobody measured, so the
-# choice is recorded in the checkpoint and generate.py refuses a mismatch.
+# Which frozen node sets to train on. Since the soft-prompt-only change the prompt no longer
+# depends on the choice — no references are shown — so this selects nodes only. It is still
+# recorded in the checkpoint and generate.py refuses a mismatch, because the two sets cover
+# different nodes and different out-degree ranges.
 SETS = {
-    "capped": ("training_sets_capped.json", True),
-    "legacy": ("training_sets.json", False),
+    "capped": "training_sets_capped.json",
+    "legacy": "training_sets.json",
 }
 
 
@@ -84,7 +83,7 @@ class PrefixCache(Cache):
 def collate(tokenizer, example, node_ids, device):
     """Tokenise one batch of nodes, right-padded. Labels are -100 on prompt and padding.
 
-    `example` is the (prompt, target) builder for the chosen node sets — capped or legacy.
+    `example` is the (prompt, target) builder — text.graph_only_example, bound to a tokenizer.
     """
     seqs = [encode(tokenizer, *example(n)) for n in node_ids]
     width = max(len(ids) for ids, _ in seqs)
@@ -225,7 +224,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # --- data -------------------------------------------------------------
-    sets_file, capped = SETS[args.sets]
+    sets_file = SETS[args.sets]
     with open(os.path.join(FROZEN_DIR, sets_file)) as f:
         sets = json.load(f)
     print(f"{args.sets} sets ({sets_file}): "
@@ -242,15 +241,8 @@ def main():
     if tokenizer.pad_token is None:                        # Llama ships without one
         tokenizer.pad_token = tokenizer.eos_token
 
-    # data.x is already the voyage embedding matrix the GNN reads, and .numpy() is a view of
-    # the same memory — so the centroid distances cost no extra load and no extra 1.6 GB.
-    if capped:
-        embeddings = data.x.numpy()
-        def example(node_id):
-            prompt, target, _ = capped_example(tokenizer, corpus, embeddings, node_id)
-            return prompt, target
-    else:
-        example = lambda node_id: corpus.example(tokenizer, node_id)  # noqa: E731
+    # No references in the prompt: the graph prefix is the only channel to the target paper.
+    example = lambda node_id: graph_only_example(tokenizer, corpus, node_id)  # noqa: E731
 
     # --- models -----------------------------------------------------------
     print(f"Loading {BASE_MODEL} in {dtype} …")
@@ -317,7 +309,14 @@ def main():
         was = ckpt.get("sets", "legacy")     # checkpoints predating --sets are all legacy
         assert was == args.sets, (
             f"{args.resume} was trained on the '{was}' node sets but --sets is "
-            f"'{args.sets}'; the prompts differ, so this would not be a continuation")
+            f"'{args.sets}'; the nodes differ, so this would not be a continuation")
+        # The one mismatch nothing else catches: a Qwen text-path checkpoint has exactly the
+        # shapes of a graph-only one, so it would load cleanly and continue a prefix trained to
+        # sit beside ~13 abstracts as if it had to carry the paper alone.
+        was_prompt = ckpt.get("prompt", "text")  # checkpoints predating PROMPT read abstracts
+        assert was_prompt == PROMPT, (
+            f"{args.resume} was trained with the '{was_prompt}' prompt but this run uses "
+            f"'{PROMPT}'; use a separate --out-dir")
         # A depth mismatch would already fail on the conv keys below, but the message would
         # name tensors rather than the mistake — and with several depths sharing one
         # checkpoint tree, picking up the wrong run is the likely way to get here.
@@ -439,7 +438,7 @@ def main():
         torch.save({"encoder": encoder.state_dict(), "adapter": adapter.state_dict(),
                     "lora": lora_state_dict(llm) if args.lora else None,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-                    "epoch": epoch + 1, "step": opt_step, "sets": args.sets,
+                    "epoch": epoch + 1, "step": opt_step, "sets": args.sets, "prompt": PROMPT,
                     "gnn_layers": args.gnn_layers,
                     "valid_loss": losses["graph"], "best_loss": best_loss,
                     "bad_epochs": bad_epochs}, path)
