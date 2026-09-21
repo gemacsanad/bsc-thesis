@@ -38,10 +38,15 @@ old 10 tokens. T was raised to 32 to hold the graph pathway's capacity fixed, si
 that is the quantity that has to be constant for the two runs to be comparable.
 
 The cost lives in the output, not the input, so the output is factorised: a shared
-trunk compresses the graph vector, one small code is emitted per (layer, role), and
-a single decoder shared by all 80 of them expands each code to that layer's prefix.
-Each layer sees the graph through a 96-d projection, but 80 x 96 = 7680 code
-dimensions across all layers, so collectively they can still read all 1024.
+trunk transforms the graph vector at full 1024 width, one small code is emitted per
+(layer, role), and two decoders — one for keys, one for values — expand each code to
+that layer's prefix. Each is shared across all 40 layers of its role.
+
+Keys and values are decoded separately because they do different jobs in different
+spaces: keys decide where attention goes (a real Qwen3 key is k_norm-ed per head and
+rotated by RoPE), values carry what is written back. One shared decoder forced both
+into the same subspace. Each (layer, role) reads the graph through a 192-d code, and
+80 x 192 = 15,360 code dimensions collectively cover all 1024.
 
 The graph supplies an offset, not the whole prefix. `base` is a node-independent
 learned prefix — classic prefix tuning — and `gate` starts at zero, so training
@@ -118,8 +123,10 @@ class PrefixAdapter(nn.Module):
         )
         # one matrix for all 2 * num_layers heads, split apart by the reshape below
         self.codes = nn.Linear(trunk_dim, num_layers * 2 * code_dim)
-        # shared by every (layer, role) 
-        self.decoder = nn.Linear(code_dim, num_prefix_tokens * num_kv_heads * head_dim)
+        # index 0 decodes keys, index 1 values; each is shared across all layers of its role
+        self.decoders = nn.ModuleList(
+            nn.Linear(code_dim, num_prefix_tokens * num_kv_heads * head_dim) for _ in range(2)
+        )
 
         # node-independent prefix: plain prefix tuning, and what gate=0 falls back to
         self.base = nn.Parameter(
@@ -134,7 +141,8 @@ class PrefixAdapter(nn.Module):
         # (tokens, kv_heads, head_dim) matches how the model reshapes a k/v projection.
         # For Qwen3-14B that projection is 8 x 128 = 1024 wide, not hidden_size (5120) —
         # under GQA the k/v projections are narrower than q.
-        delta = self.decoder(c).view(
+        delta = torch.stack([self.decoders[role](c[:, :, role]) for role in range(2)], dim=2)
+        delta = delta.view(
             b, self.num_layers, 2, self.num_prefix_tokens, self.num_kv_heads, self.head_dim
         )
         delta = delta.transpose(3, 4)          # -> (heads, tokens), the cache layout
@@ -206,6 +214,20 @@ if __name__ == "__main__":
         opened = adapter(out)
     assert not torch.equal(prefix, opened), "opening the gate changed nothing"
     print("gate=1: the graph embedding moves the prefix")
+
+    # Each decoder must write only its own role. A stack or view along the wrong axis would
+    # interleave keys and values and still produce the right shape.
+    for role, name in enumerate(("keys", "values")):
+        bias = adapter.decoders[role].bias
+        with torch.no_grad():
+            reference, saved = adapter(out), bias.clone()
+            bias.add_(1.0)
+            moved = adapter(out)
+            bias.copy_(saved)          # not sub_: +1 then -1 does not round-trip in float
+        changed = (moved != reference).flatten(3).any(-1).any(0).any(0)   # per role
+        assert changed.tolist() == [role == 0, role == 1], \
+            f"the {name} decoder moved {changed.tolist()} (keys, values)"
+    print("separate decoders: the key decoder moves only keys, the value decoder only values")
 
     # End to end, with the gate open so the trunk actually sits on the path — a
     # shape or dtype break between the two halves shows up here.

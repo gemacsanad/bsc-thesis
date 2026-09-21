@@ -38,7 +38,7 @@
 # Prerequisites:
 #   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def) — the same image
 #     train.py used, with no extra packages: generate.py imports nothing train.py did not
-#   - a checkpoint in checkpoints/qwen14b-graphonly/ (produced by run_train_adapter.sh)
+#   - a checkpoint in checkpoints/qwen14b-graphonly-kv192/ (produced by run_train_adapter.sh)
 #   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
 # Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
@@ -62,11 +62,12 @@ mkdir -p $BASE_DIR/logs
 # the unqualified directory would silently select the wrong model's weights. The load fails on
 # a shape mismatch rather than scoring the wrong thing — the adapter output moved from
 # 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
-# The soft-prompt-only run writes to checkpoints/qwen14b-graphonly/. Pointing this at
+# The kv192 adapter writes to checkpoints/qwen14b-graphonly-kv192/; the old adapter's checkpoints
+# in checkpoints/qwen14b-graphonly/ no longer load (no `decoders.*` keys). Pointing this at
 # checkpoints/qwen14b/ instead would pass the shape check; generate.py refuses it on the
 # checkpoint's recorded prompt mode.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly  # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
-ARM=adapter-qwen14b-graphonly-gnn2      # experiments/<date>-<job>_$ARM/
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly-kv192  # 3 layers -> $BASE_DIR/checkpoints/gnn3, etc.
+ARM=adapter-qwen14b-graphonly-kv192-gnn2  # experiments/<date>-<job>_$ARM/
 RUN_BASELINE=0                          # 0 to generate the adapter arm only
 RUN_GATE0=0                             # 1 adds the gate=0 arm (see below)
 

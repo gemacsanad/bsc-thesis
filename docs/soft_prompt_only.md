@@ -104,3 +104,197 @@ token) rather than a larger embedding model.
   against ~3,075 before, so
   the ~10-11 h/epoch estimate is now far too high; the first epoch measures it. Faster epochs
   also mean early stopping fires sooner in wall-clock time.
+
+---
+
+## Step 1 — result
+
+**Run 2026-09-16, job 14393649.** `experiments/2026-09-16-14393649_adapter-qwen14b-graphonly-gnn2/`,
+945 rows, 0 errors, 879 distinct generations.
+
+| | `llm_accuracy` | `llm_coherence` | `llm_language` |
+|---|---|---|---|
+| graph-only adapter | **1.954** | 7.526 | 7.566 |
+| text baseline (09-10) | 3.592 | 7.899 | 8.056 |
+
+Paired against the text baseline: **−1.637 ± 0.097** (Wilcoxon p = 2e-115); against the text
+adapter: −1.565 ± 0.108. Accuracy distribution: 321 papers score 1, 441 score 2, 25 score 5 or more.
+
+The prefix alone does not replace ~13 reference abstracts: the text stays fluent and coherent
+(coherence 7.5) but the judge rarely recognises it as the right paper. The generations have not
+been read yet. The per-node outputs are not collapsed — 879 of 945
+are distinct, so the prefix does steer generation — but not toward the right content. Reading which
+topics survive is open.
+
+The wording confound noted in step 1 works *against* this result, not for it: era 4 outscored era 1
+under Qwen, so the drop is not a prompt artefact.
+
+---
+
+## Step 2 — a larger adapter with separate key and value decoders
+
+**Set up 2026-09-17. Run pending.** Architecture only; prompt, node sets, encoder and schedule are
+unchanged from step 1.
+
+### Why
+
+The run showed no overfitting (user's reading of the W&B curves), so capacity is a candidate.
+The old adapter had one structural limit that more parameters in the wrong place would not lift:
+a single decoder, shared by all 80 (layer, role) pairs, so every key and every value prefix was
+drawn from the same 96-dimensional subspace. Keys and values do different jobs in different spaces
+— a real Qwen3 key is RMS-normalised per head (`k_norm`) and rotated by RoPE before it is cached,
+and it decides *where* attention goes; a value carries *what* is written back. Forcing both
+through one linear map is the least defensible sharing in the design.
+
+### Decisions
+
+| | was | now | reasoning |
+|---|---|---|---|
+| decoders | 1, shared by keys and values | **2** (`decoders[0]` keys, `decoders[1]` values), each shared across the 40 layers of its role | the key/value split above; fully per-layer decoders would be ~250M parameters |
+| `CODE_DIM` | 96 | **192** | doubles the directions each (layer, role) can use |
+| `TRUNK_DIM` | 768 | **1024** | removes the only point narrower than the encoder output. Measured cost of 768 was small — PCA of the 7,750 train nodes' reference centroids: 768 components keep 99.83% of variance (512: 99.07%, 256: 95.74%) — so this closes a question rather than fixing a measured loss |
+
+### Parameters
+
+| part | old | new |
+|---|---|---|
+| trunk Linear + LayerNorm | 788,736 | 1,051,648 |
+| codes Linear (→ 40 × 2 × code) | 5,905,920 | 15,744,000 |
+| decoder(s) (→ 32 × 8 × 128) | 3,178,496 | 12,648,448 |
+| `base` + `gate` | 2,621,520 | 2,621,520 |
+| **adapter** | **12,494,672** | **32,065,616** |
+| **+ encoder (4,197,376)** | **16,692,048** | **36,262,992** (2.17×) |
+
+Optimizer state and gradients add ~580 MB of GPU memory against 29.6 GB of frozen Qwen; epoch
+checkpoints grow to ~435 MB. The prefix itself is unchanged at 2,621,440 values per node. At
+`gate = 0` the pathway behind the gate — 33.6M parameters — still gets zero gradient; watch
+`gate/mean_abs` in the first ~100 steps.
+
+### What changed
+
+- `config.py` — `TRUNK_DIM = 1024`, `CODE_DIM = 192`.
+- `model.py` — `self.decoder` → `self.decoders` (a 2-element `ModuleList`); `forward` decodes each
+  role with its own decoder and stacks on the role axis. New smoke-test check: perturbing one
+  decoder moves only its own role.
+- Job scripts — `CKPT_DIR=checkpoints/qwen14b-graphonly-kv192`, run/arm name
+  `adapter-qwen14b-graphonly-kv192-gnn2`.
+
+Old checkpoints do not load into the new adapter (no `decoders.*` keys, different shapes) — loudly.
+Step 1's run is reproduced from commit `b34ab0e`.
+
+### Verified (locally, `DyTAG-qwen`)
+
+| check | result |
+|---|---|
+| `model.py` smoke test | adapter 32,065,616 parameters; prefix `(8, 40, 2, 8, 32, 128)`; mask, gate=0 and gradient checks pass; key decoder moves only keys, value decoder only values |
+| negative control for the new check | stacking on the wrong axis makes the value decoder move keys too — the check catches it |
+| `verify_graph_only_prompt.py`, `verify_sliced_loss.py`, `verify_generation.py` | all exit 0, unchanged results |
+
+The new check's first version was itself wrong: restoring the bias with `add_(1)` then `sub_(1)`
+does not round-trip in float, so it reported keys moving. Restored from a saved copy instead.
+
+### Known limitations
+
+- **Step 1's result suggests capacity may not be the main constraint.** The prefix already produces
+  879 distinct outputs; the failure is content, not variety. A larger adapter is a reasonable
+  test, not an expected fix.
+- Both decoders are still shared across all 40 layers.
+- Walltime estimates in the job scripts are unchanged and still unmeasured for graph-only sequences.
+
+---
+
+## Step 2 — result, and what the failure actually is
+
+**Run 2026-09-17, job 14395431.** `experiments/2026-09-17-14395431_adapter-qwen14b-graphonly-kv192-gnn2/`,
+945 rows, 0 errors, 809 distinct generations. Training loss improved over step 1 (W&B); the
+evaluation did not.
+
+| | `llm_accuracy` | `llm_coherence` | `llm_language` | rouge1 | bertscore f1 |
+|---|---|---|---|---|---|
+| step 2, kv192 adapter | **1.737** | 7.423 | 7.544 | 0.288 | 0.834 |
+| step 1, original adapter | 1.954 | 7.526 | 7.566 | 0.295 | 0.837 |
+| text adapter (09-10) | 3.520 | 7.873 | 7.923 | 0.341 | 0.845 |
+| text baseline (09-10) | 3.592 | 7.900 | 8.056 | 0.336 | 0.846 |
+
+Paired over the same 945 nodes: **−0.218 ± 0.065** against step 1 (Wilcoxon p = 2.8e-10),
+−1.855 ± 0.092 against the text baseline. Improved on 178 nodes, worsened on 305, tied on 462.
+
+So this is not a second collapse. The collapse happened at step 1; a 2.17x larger adapter moved
+it a further fifth of a point *down*. The prediction recorded in step 2's limitations — that
+capacity was not the constraint — held, and the sign is informative.
+
+### The larger adapter made the output more generic, not more specific
+
+| | step 1 | step 2 | real abstracts |
+|---|---|---|---|
+| distinct word types across all 945 outputs | 4,817 | **4,194** | — |
+| type/token ratio | 0.0429 | **0.0377** | — |
+| rows sharing the single most common 8-word opening | 60 | **232** | — |
+| rows whose opening is one of the top 2 | 108 | **423** | — |
+| mean pairwise TF-IDF similarity between the 945 outputs | 0.0629 | **0.0670** | 0.0375 |
+| accuracy ≥ 5 | 25 | **2** | — |
+
+The 65 nodes that scored ≥ 4 in step 1 average **2.20** in step 2 (from 4.46). The extra capacity
+was spent on the part of the loss that is shared across all papers: "We propose a novel approach
+to the problem of …". Lower training loss and lower accuracy are consistent, not contradictory —
+cross-entropy over a ~219-token abstract is dominated by generic scientific English, and the
+tokens that identify *which* paper it is are a small minority of it. More parameters buy more of
+the majority.
+
+### The graph's identifying information never reaches the output
+
+Two probes, both on the 945 eval nodes, neither using the judge.
+
+**How identifiable is the generated text?** Rank each generation's own gold abstract among all
+945 golds by TF-IDF cosine (chance top-1 = 0.1%):
+
+| run | top-1 | top-10 | median rank |
+|---|---|---|---|
+| step 2, kv192 | 2.9% | 14.2% | 142 |
+| step 1 | 4.3% | 21.6% | 71 |
+| text adapter | 36.5% | 73.7% | 3 |
+| text baseline | 43.5% | 82.1% | 2 |
+
+**Does a better graph signal produce a better abstract?** The plain reference centroid retrieves
+the correct paper for 64.3% of these nodes. Split the nodes on that:
+
+| | n | step 2 accuracy | step 1 accuracy |
+|---|---|---|---|
+| centroid retrieves the right paper | 608 | 1.743 | 1.949 |
+| centroid does not | 337 | 1.724 | 1.964 |
+
+**Flat.** The identifying content of the graph vector — the 64.3% — has no measurable effect on
+the generated abstract. What does get through is coarse and topical: accuracy rises weakly with
+reference count (1.53 at ≤ 28 references to 1.86 at > 75), and read side by side the outputs do
+land in the right field. Node 161266's gold is RL graph-to-sequence question generation and the
+model writes seq2seq question generation on SQuAD; node 1121's gold is formal languages for
+ecological modelling and the model writes model checking for concurrent programs. Right
+neighbourhood, wrong paper, and usually a more prototypical and older-sounding paper than the
+real one.
+
+That is the finding: **the prefix carries topic and not identity**, and step 2 made it carry
+topic more fluently.
+
+### The implementation was audited and is not at fault
+
+| check | result |
+|---|---|
+| `python model.py` | 32,065,616 parameters, prefix `(8, 40, 2, 8, 32, 128)`, mask / gate=0 / gate=1 / gradient checks pass |
+| role separation + its negative control | pass; the key decoder moves only keys |
+| `stack(dim=2)` → `view` → `transpose(3,4)` | `stack` returns a contiguous tensor, so the view is well defined and the layout still matches `base` |
+| delta magnitude relative to `base` | 16.90 (step 1 config) → 16.79 (step 2 config) — the trunk's LayerNorm makes the scale independent of both widths, so there is no init-scale regression |
+| optimizer coverage | `list(adapter.parameters())` includes the `ModuleList`; every parameter got a gradient |
+| checkpoint loading | `load_state_dict` is strict in both `train.py` and `generate.py`; a stale checkpoint fails loudly |
+
+The step-2 diff is four hunks and none of them is wrong. The result is real.
+
+### Known limitations of this analysis
+
+- **No gate=0 arm for this run.** `RUN_GATE0=0`, so what the base prefix writes on its own at
+  eval time is still unmeasured. Given the flat centroid table it is likely close to 1.7, but
+  that is the control the claim deserves and it has not been run.
+- **Two runs, one bundle.** Step 2 changed three things at once (one decoder → two, code 96 →
+  192, trunk 768 → 1024). The −0.218 cannot be attributed to any one of them, and is not worth
+  another run to separate.
+- **TF-IDF retrieval is a lexical proxy.** It understates a paraphrase. It is used only to
+  compare runs against each other, where that bias is shared.

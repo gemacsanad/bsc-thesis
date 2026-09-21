@@ -85,8 +85,13 @@ HEAD_DIM = 128              # read off config.head_dim, which Qwen3 states expli
 # GQA model — it is recorded as a limitation, not fixed. See docs/model_swap_qwen.md §3.
 # Costs 22 more of the 4,096 context tokens, and only in the adapter arm.
 NUM_PREFIX_TOKENS = 32
-TRUNK_DIM = 768
-CODE_DIM = 96
+# Stage 8 step 2 (2026-09-17): were 768 and 96, with one decoder shared by keys and values.
+# 1024 means nothing is compressed between the encoder output and the codes (768 kept 99.83% of
+# the variance of reference centroids, so this closes a question more than a measured loss);
+# 192 doubles the directions each (layer, role) can use. Adapter 12,494,672 -> 32,065,616
+# parameters. See docs/soft_prompt_only.md, step 2.
+TRUNK_DIM = 1024
+CODE_DIM = 192
 BASE_INIT_STD = 0.02        # the base model's own initializer_range; 0.02 for both Llama-2
                             # and Qwen3, so this value is unchanged by the swap
 
@@ -120,8 +125,8 @@ WANDB_PROJECT = "dytag-adapter"
 
 # --- Stage 4b: LoRA on the frozen LLM ----------------------------------------
 # Off unless train.py is given --lora, and off for the Stage 7 Qwen run — era 1 had no LoRA.
-# Only q_proj and v_proj, on all 40 layers: 80 modules, 10.5M parameters, against the 16.7M of
-# the encoder and adapter together (4.2M + 12.5M, measured by `python model.py`).
+# Only q_proj and v_proj, on all 40 layers: 80 modules, 10.5M parameters, against the 36.3M of
+# the encoder and adapter together (4.2M + 32.1M, measured by `python model.py`).
 # Under GQA the two targets are different sizes — q_proj is 5120 x 5120, v_proj only
 # 5120 x 1024 — so per layer it is 16 x (5120+5120) + 16 x (5120+1024) = 262,144.
 # Was 8.4M on Vicuna: 64 modules of a uniform 4096 x 4096.
