@@ -578,3 +578,60 @@ frozen LLM now known to suppress identifiability ~7x on the same prefix.
   oracle's deficit larger, not smaller.
 - **This is a ceiling, not a method.** It says the channel can carry identity when handed a
   perfect vector, not that a GNN can produce one.
+
+## Step 5 — the graph arm, rerun with LoRA
+
+### Why
+
+Step 4 established that a frozen Qwen3-14B cannot read this prefix: the same 32-token,
+40-layer channel carrying the same single 1024-d vector went from 0.4% to 12.0% top-1
+identifiability when LoRA was added. Every graph arm in steps 1 and 2 was measured under that
+frozen model. Their nulls are therefore measurements of a crippled apparatus, not of the graph,
+and the honest headline number for this whole stage does not yet exist.
+
+### Decisions
+
+- **Exactly one change against step 2's graph run** (`checkpoints/qwen14b-graphonly-kv192`):
+  `--lora`. Same 2-layer encoder, same kv192 adapter, same graph-only prompt, same 10 epochs,
+  same node sets. Step 4 changed two things at once and consequently cannot split its
+  1.25 → 2.71 between LoRA and the oracle vector; this run is built not to repeat that.
+- **`gate=0` runs this time.** It keeps the LoRA weights and disconnects only the graph, so
+  `adapter − gate0` is the graph's contribution and nothing else. Steps 1-4 all shipped
+  without it.
+- **`gate=0` is a floor, not a paired control.** `text.build_graph_only_prompt` takes no node
+  argument, so at gate=0 both prompt and prefix are node-independent and greedy decoding emits
+  one identical abstract for all 945 nodes. The scores still vary, because each row is scored
+  against a different gold — the 945-row mean is what LoRA plus a generic prefix earns knowing
+  nothing about the paper. Per-node comparisons against it would be measuring the golds.
+- **Branched from the oracle work, not from before it.** The `--oracle` additions to
+  `train.py`/`generate.py` are inert when the flag is not passed, and keeping them means the
+  HPC copy of `src/adapter/` does not change at all between step 4 and step 5.
+
+### What changed
+
+`hpc/komondor/jobs/run_train_adapter.sh` and `hpc/komondor/jobs/run_generate_eval.sh` only:
+`--oracle` dropped from all three invocations, `CKPT_DIR` → `checkpoints/qwen14b-graphonly-kv192-lora`,
+`ARM` → `graphonly-qwen14b-kv192-lora`, W&B run renamed. No Python changed.
+
+### How to read the result
+
+Against step 4's oracle (12.0% top-1, judge 2.71), which is the ceiling for this channel, and
+step 2's frozen graph arm (1.7%, 1.74), which is the same encoder on the broken apparatus.
+
+- **Lands near 12%** — the encoder is already saturating the channel. Mean-pooled GraphSAGE
+  extracts what a perfect vector would, and GATv2 or per-neighbour tokens have no headroom to
+  recover. Spend the effort on the channel instead.
+- **Lands near 4-6%** — a real encoder gap exists between pooled neighbours and a perfect
+  vector. That is the number that justifies per-neighbour tokens.
+- **Stays near 1.7%** — LoRA helps the oracle and not the graph, which would say the
+  neighbours' embeddings do not determine the target at all. The Voyage probe (below) is the
+  cheap way to check that before building anything.
+
+### Known limitations
+
+- **Still no era-4 945-node text baseline**, so the absolute comparison remains against a
+  prompt known to be ~1.46 points weak on the 48-node stratified sample.
+- **The `gate=0` arm spends ~7 h to produce one distinct string.** Left on because the
+  walltime fits and the control has been lost once already.
+- **Walltime is untested with the encoder training.** Step 4 bypassed the encoder under
+  `--oracle`; this run adds 2-hop neighbourhood sampling and an encoder backward pass per step.

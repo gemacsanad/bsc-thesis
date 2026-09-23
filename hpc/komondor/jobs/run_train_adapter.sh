@@ -10,30 +10,33 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# ORACLE CEILING RUN (--oracle) WITH LoRA. This is NOT a result arm. The encoder is bypassed
-# and the adapter is fed the target abstract's OWN voyage embedding, so this arm sees the answer
-# it is asked to write. It measures one thing the graph runs cannot separate: whether Qwen3-14B
-# can be steered by a KV prefix decoded from a single dense vector at all. If it writes generic
-# abstracts anyway, the prefix->LLM channel is the bottleneck and no better graph, aggregator or
-# embedding model can help. See docs/soft_prompt_only.md, step 4.
+# GRAPH + LoRA. This IS a result arm — the headline number of the whole soft-prompt-only
+# stage, and the first graph run measured on an apparatus that works.
 #
-# Two things changed against step 3's run, and both close a hole in it:
+# Trains the GraphSAGE encoder and prefix adapter against Qwen3-14B, soft-prompt-only: the
+# prompt is one fixed system message and user turn with no references, so the prefix is the
+# only channel to the paper (src/adapter/text.py). See docs/soft_prompt_only.md, step 5.
 #
-#   --lora    Step 3 held the LLM frozen, so its null result reads "a *frozen* Qwen cannot read
-#             this prefix" — a weaker claim than the one the project needs. LoRA is the only
-#             untested fix for that, and the oracle is where it can be read cleanly: LoRA has no
-#             per-paper information of its own, so if the outputs become paper-specific, the
-#             identity can only have arrived through the prefix.
-#   10 epochs Step 3 ran 2 against the graph runs' 10, so "undertrained" was a live alternative
-#             explanation for its collapse (198 distinct outputs from 945 nodes). Matching the
-#             budget removes it.
+# Why rerun a configuration that already produced a null. Steps 1 and 2 held the LLM frozen and
+# read ~chance identifiability as "the graph contributes nothing". Step 4 then ran the oracle
+# — a perfect target vector through the same 32-token, 40-layer prefix — twice, frozen and with
+# LoRA, and top-1 identifiability moved from 0.4% to 12.0% (chance 0.11%) with no change to the
+# channel at all. The prefix was always carrying paper identity; a frozen Qwen could not read
+# it. That makes every graph null so far a measurement of a crippled apparatus, and this run is
+# what replaces them.
 #
-# Trains the prefix adapter against Qwen3-14B, soft-prompt-only: the prompt is one
-# fixed system message and user turn with no references, so the prefix is the only channel to
-# the paper (src/adapter/text.py).
+# Exactly one thing changes against step 2's graph run (checkpoints/qwen14b-graphonly-kv192):
+#
+#   --lora    trains rank-16 adapters on the LLM's q/v projections alongside the prefix.
+#
+# Everything else is held: same 2-layer encoder, same kv192 adapter, same graph-only prompt,
+# same 10 epochs, same node sets. That discipline is deliberate. Step 4 changed two things at
+# once (LoRA and the oracle) and its 1.25 -> 2.71 therefore cannot be split between them; this
+# run is the control that makes the next architecture decision attributable.
+#
 # Qwen3-14B's own weights are never written; only checkpoints/epoch*.pt are written (~560 MB
 # each: 145 MB of adapter weights plus AdamW's two moment buffers, which --resume needs, and
-# ~126 MB more than step 3 because the LoRA tensors and their moments now ride along.
+# ~126 MB more than the frozen runs because the LoRA tensors and their moments now ride along.
 # 10 epochs at ~560 MB is ~5.6 GB if every epoch improves — watch the quota).
 #
 # Metrics go live to Weights & Biases. WANDB_KEY is read from the repo-root .env by train.py itself
@@ -53,16 +56,16 @@
 # so they are changed in one place and this script does not restate them. What is passed below
 # is only what differs between two submissions.
 #
-# --epochs is NOT passed any more, so config.EPOCHS = 10 applies — the same budget the graph
-# runs of steps 1 and 2 had. Step 3 passed --epochs 2 on the argument that a ceiling only has to
-# show whether the channel can carry identity at all. That argument did not survive its own
-# result: the run came back at chance identifiability with 198 distinct outputs from 945 nodes,
-# which is exactly what an undertrained prefix also looks like, and the two cannot be told
-# apart from one short run. Early stopping (PATIENCE = 2) ends it sooner if it is going to.
-# Graph-only sequences average ~460 tokens against the ~3,075 the 10-11 h/epoch estimate was
-# built on, so 10 epochs may still fit the 48 h — but that estimate has never been checked on a
-# real A100, and this is the first run that will actually test it, so the resume below matters
-# more here than it did. Expect to resubmit.
+# --epochs is NOT passed, so config.EPOCHS = 10 applies — the same budget steps 1, 2 and 4 had.
+# Holding it there is part of the single-change discipline above: a graph arm trained for a
+# different number of epochs than the run it is compared against would confound the comparison
+# the same way step 4's two simultaneous changes did. Early stopping (PATIENCE = 2) ends it
+# sooner if it is going to.
+#
+# Walltime: step 4 ran this budget with LoRA on graph-only sequences and finished, so 48 h is
+# no longer a guess for the epoch count — but the encoder now trains too (it was bypassed
+# under --oracle), which adds a sampled 2-hop neighbourhood load and a backward pass per step.
+# Expect it to be slower than step 4, not faster. The resume below covers a timeout.
 #
 # Encoder depth: edit --gnn-layers and CKPT_DIR below, submit, then edit them again for the
 # next depth. That is safe, and only because it is *this* file: sbatch copies the batch script
@@ -84,19 +87,20 @@ SIF=$BASE_DIR/adapter-qwen-gpu.sif
 # best.pt is a fixed name, so sharing a directory with the Vicuna checkpoints would resume from
 # and overwrite the wrong run. train.py refuses a resume across a change of --sets or
 # --gnn-layers, but it has no way to know the base model changed underneath it.
-# oracle-kv192-lora: the ceiling run on the kv192 adapter, with LoRA. Its own directory, and
-# NOT the same one as step 3's frozen-LLM oracle run: train.py refuses to resume across a change
-# of --lora (the prefix would continue against LLM weights it never saw) and across a change of
-# --oracle, but best.pt is a fixed name in both, so pointing this at checkpoints/
-# qwen14b-oracle-kv192 would abort the job at startup at best and overwrite step 3's result at
-# worst. Step 3's directory is the comparison arm for this run — leave it intact.
+# graphonly-kv192-lora: the graph run on the kv192 adapter, with LoRA. Its own directory, and
+# NOT step 2's checkpoints/qwen14b-graphonly-kv192: train.py refuses to resume across a change
+# of --lora (the prefix would continue against LLM weights it never saw), but best.pt is a fixed
+# name in both, so pointing this at step 2's directory would abort the job at startup at best
+# and overwrite step 2's result at worst. Step 2's directory is the comparison arm for this
+# run — leave it intact. Same argument against checkpoints/qwen14b-oracle-kv192-lora, which
+# holds step 4's ceiling run and differs only by --oracle.
 # graphonly: separate from checkpoints/qwen14b/, which holds the text-path run. train.py refuses
 # to resume across a prompt change, but the fixed best.pt name would still be overwritten.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-oracle-kv192-lora
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly-kv192-lora
 LORA=1                                  # also trains LoRA on the LLM's q/v projections. ON here,
-                                        # and it is the point of the run: every arm of this
-                                        # project so far has held the LLM frozen, so every null
-                                        # result is a statement about a frozen model only
+                                        # and it is the point of the run: every *graph* arm so
+                                        # far has held the LLM frozen, so every graph null is a
+                                        # statement about a frozen model only
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
@@ -140,9 +144,8 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
 
     python train.py \
         --gnn-layers 2 \
-        --oracle \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "oracle-qwen14b-kv192-lora-$SLURM_JOB_ID" \
+        --wandb-run "graphonly-qwen14b-kv192-lora-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '

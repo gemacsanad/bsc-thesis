@@ -10,10 +10,9 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# ORACLE CEILING RUN (--oracle). NOT a result arm: the adapter is fed the target abstract's own
-# voyage embedding, so this arm sees the answer it is asked to write. Its score bounds what any
-# graph could achieve through this prefix, and must never be reported beside the graph arms
-# without that label. See docs/soft_prompt_only.md, step 4.
+# GRAPH + LoRA. A result arm — scores the checkpoint from run_train_adapter.sh's step-5 run,
+# the first graph arm measured with the LLM able to read the prefix. See
+# docs/soft_prompt_only.md, step 5.
 #
 # Stage 5 — generates the evaluation CSV over the frozen 945-node capped eval set:
 #
@@ -32,25 +31,34 @@
 # nodes under greedy decoding. The comparison arm is the existing text-path Qwen baseline,
 # experiments/2026-09-10-14364743_qwen14b-baseline (docs/soft_prompt_only.md).
 #
-# RUN_GATE0=1 adds a third arm: the checkpoint's own weights with the gate forced to zero, so
-# the prefix is node-independent. It is 1 here, and this is the first run where it is not
-# optional. This run trains LoRA, so the adapter arm differs from the 2026-09-10 frozen-LLM
-# baseline by TWO things at once — LoRA and the oracle vector — and a gain could be credited to
-# either. gate=0 keeps the LoRA weights and disconnects only the vector, so adapter-minus-gate0
-# is the oracle's contribution and nothing else. Steps 1, 2 and 3 all shipped without it and all
-# three recorded that as a known limitation; it is the missing control of this whole stage.
+# RUN_GATE0=1 adds a second arm: the checkpoint's own weights with the gate forced to zero, so
+# the prefix is node-independent. It is 1 here and it is not optional — it is the control the
+# whole stage has been missing. This run trains LoRA, so the adapter arm differs from step 2's
+# frozen graph run by TWO things at once, LoRA and the graph, and a gain could be credited to
+# either. gate=0 keeps the LoRA weights and disconnects only the graph, so adapter-minus-gate0
+# is the graph's contribution and nothing else. Steps 1-4 all shipped without it; step 4's job
+# asked for it and it did not land, which is why step 4 still cannot separate LoRA from its
+# oracle vector.
 #
-# It needs --oracle too. generate.py loads the checkpoint for gate0 exactly as for adapter, and
-# load_adapter asserts the recorded `oracle` flag matches the command line, so omitting it here
-# aborts the arm. The flag is harmless in this mode: the oracle vector is still computed and
-# then multiplied by a zero gate.
+# Read it as a FLOOR, not as a paired control. In the graph-only regime the prompt carries no
+# node id either (text.build_graph_only_prompt takes no node argument), so at gate=0 both the
+# prompt and the prefix are node-independent and greedy decoding emits ONE identical abstract
+# for all 945 nodes. The scores still vary, because each row is scored against a different
+# gold, so the 945-row mean is a real number — it is what LoRA plus a generic prefix earns
+# knowing nothing about the paper. But "improved on N nodes" against it would be measuring the
+# golds, not the model.
+#
+# That also means the arm spends ~7 h to produce one distinct string. It is left on because
+# the walltime fits both arms and this run must not lose the control a second time; if the GPU
+# budget is tight, the cheap equivalent is to generate a handful of nodes, verify the output is
+# constant, and replicate it across the 945 rows for scoring.
 #
 # Nothing is trained and nothing is written to W&B; no .env is needed.
 #
 # Prerequisites:
 #   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def) — the same image
 #     train.py used, with no extra packages: generate.py imports nothing train.py did not
-#   - a checkpoint in checkpoints/qwen14b-oracle-kv192-lora/ (produced by run_train_adapter.sh)
+#   - a checkpoint in checkpoints/qwen14b-graphonly-kv192-lora/ (produced by run_train_adapter.sh)
 #   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
 # Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
@@ -74,15 +82,16 @@ mkdir -p $BASE_DIR/logs
 # the unqualified directory would silently select the wrong model's weights. The load fails on
 # a shape mismatch rather than scoring the wrong thing — the adapter output moved from
 # 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
-# This run writes to checkpoints/qwen14b-oracle-kv192-lora/ — NOT step 3's frozen-LLM oracle
-# directory. An oracle checkpoint has exactly the shapes of a graph one, so the directory alone
-# would not catch a mix-up — generate.py refuses it on the checkpoint's recorded `oracle` flag,
-# and --oracle below must match it. The LoRA tensors ride in the checkpoint and generate.py
-# injects them automatically, so there is no LoRA flag to keep in sync here.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-oracle-kv192-lora
-ARM=oracle-qwen14b-kv192-lora           # experiments/<date>-<job>_$ARM/
+# This run reads checkpoints/qwen14b-graphonly-kv192-lora/ — NOT step 4's oracle directory.
+# An oracle checkpoint has exactly the shapes of a graph one, so the directory alone would not
+# catch a mix-up; generate.py refuses it on the checkpoint's recorded `oracle` flag, which is
+# why --oracle is absent from both invocations below and must stay absent. The LoRA tensors
+# ride in the checkpoint and generate.py injects them automatically, so there is no LoRA flag
+# to keep in sync here.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly-kv192-lora
+ARM=graphonly-qwen14b-kv192-lora        # experiments/<date>-<job>_$ARM/
 RUN_BASELINE=0                          # 0 to generate the adapter arm only
-RUN_GATE0=1                             # the control that isolates the oracle from LoRA (above)
+RUN_GATE0=1                             # the control that isolates the graph from LoRA (above)
 
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
 # early stopping the *last* epoch is by definition worse than the best one, so picking the
@@ -137,13 +146,13 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     fi
 
     if [ "$RUN_GATE0" = 1 ]; then
-        echo "=== gate=0: the same weights with the graph disconnected ==="
-        python generate.py --mode gate0 --oracle --checkpoint "$CKPT" \
+        echo "=== gate=0: the same weights and LoRA with the graph disconnected ==="
+        echo "    node-independent prompt AND prefix — expect one identical abstract x945"
+        python generate.py --mode gate0 --checkpoint "$CKPT" \
             --output "/app/experiments/${RUN_TAG}_${ARM}-gate0/generations.csv"
     fi
 
-    echo "=== ORACLE CEILING: target-embedding prefix + frozen Qwen3-14B ($ARM) ==="
-    echo "    this arm sees the abstract it is asked to write — a ceiling, not a result"
-    python generate.py --mode adapter --oracle --checkpoint "$CKPT" \
+    echo "=== graph + LoRA: GraphSAGE prefix + LoRA-tuned Qwen3-14B ($ARM) ==="
+    python generate.py --mode adapter --checkpoint "$CKPT" \
         --output "/app/experiments/${RUN_TAG}_${ARM}/generations.csv"
 '
