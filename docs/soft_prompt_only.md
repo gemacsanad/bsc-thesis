@@ -298,3 +298,283 @@ The step-2 diff is four hunks and none of them is wrong. The result is real.
   another run to separate.
 - **TF-IDF retrieval is a lexical proxy.** It understates a paraphrase. It is used only to
   compare runs against each other, where that bias is shared.
+
+---
+
+## Step 3 — the oracle ceiling run
+
+**Set up 2026-09-21. Run pending.** Branch `feature/oracle-prefix`.
+
+### Why
+
+Step 2 established that the prefix carries topic and not identity, and that the graph's
+identifying content has no measurable effect on the output (1.743 against 1.724, split on
+whether the reference centroid retrieves the right paper). That leaves two candidate causes,
+which none of the runs so far can tell apart:
+
+1. **The graph vector is the problem** — a mean over references does not describe the citing
+   paper well enough, and a better aggregator, encoder objective or embedding model would fix it.
+2. **The prefix → LLM channel is the problem** — a frozen Qwen3-14B cannot be steered into
+   writing a specific paper by a KV prefix decoded from one dense vector, whatever that vector
+   contains.
+
+The oracle separates them in one run. The encoder is bypassed and the adapter is fed the
+**target abstract's own voyage embedding** — a perfect 1,024-d description of the paper it is
+being asked to write. Everything downstream is unchanged.
+
+- If the oracle writes recognisable abstracts, the channel works and cause 1 is the one to fix.
+  The contrastive head, a non-pooling aggregator and a better embedding model all become
+  worth their cost.
+- If the oracle still writes generic abstracts, cause 2 holds and none of those three can help,
+  because they all improve the vector that the oracle already supplies perfectly.
+
+**Its score is a ceiling, never a result.** This arm sees the answer. It is not comparable to
+any arm that does not, and must not be reported beside one without that label.
+
+### Decisions
+
+| decision | reasoning |
+|---|---|
+| oracle vector = the seed node's own feature | that feature *is* the voyage embedding of the target abstract, which is why `GraphSAGEEncoder` masks it. The oracle skips the mask and the encoder both |
+| kv192 adapter kept, not reverted to step 1's | user's decision; keeps the ceiling directly comparable to step 2 (1.737), the most recent arm |
+| `--epochs 2`, not 10 | the ceiling only has to show whether the channel can carry identity at all. Graph-only sequences average ~460 tokens, so two epochs are cheap |
+| encoder excluded from the optimizer in oracle mode | it is bypassed, so its parameters would sit in AdamW collecting no gradient and inflate the reported trainable count |
+| prompt, node sets, decoding and schedule unchanged | one variable moves |
+| no gate=0 arm | still `RUN_GATE0=0`. It remains the missing control from step 2 and is not added here |
+
+### What changed
+
+- `model.py` — `oracle_vector(batch)`, the one function both scripts call, returning the seed
+  rows of `batch.x`. Smoke test asserts it equals the seeds' stored embeddings, is not the
+  encoder output, and has the right shape.
+- `train.py` — `--oracle` and `--epochs`. `step_loss` and `validate` take the flag; the
+  checkpoint records `oracle`; resume refuses a mismatch. `--epochs` replaces `config.EPOCHS`
+  in the loop, the exhaustion check and the W&B config.
+- `generate.py` — `--oracle`, threaded into `iter_prefixes`; `load_adapter` asserts the flag
+  matches the checkpoint. Both scripts print a banner naming the arm as a ceiling.
+- Job scripts — `CKPT_DIR=checkpoints/qwen14b-oracle-kv192`, run/arm name
+  `oracle-qwen14b-kv192`, `--oracle --epochs 2`.
+
+An oracle checkpoint has exactly the shapes of a graph one, so the recorded `oracle` flag is
+the only thing preventing the two from continuing or scoring each other. It is asserted on
+resume and on load, like `prompt` and `gnn_layers` before it.
+
+### How to run
+
+```
+sbatch hpc/komondor/jobs/run_train_adapter.sh     # --oracle --epochs 2
+sbatch hpc/komondor/jobs/run_generate_eval.sh     # --oracle, adapter arm only
+```
+
+### Verified (locally, `DyTAG-qwen`)
+
+| check | result |
+|---|---|
+| `model.py` smoke test | oracle shape `(8, 1024)`, equals the seeds' stored embeddings, cosine 0.020 to the (untrained) encoder output; all previous checks still pass |
+| `verify_graph_only_prompt.py`, `verify_sliced_loss.py`, `verify_generation.py` | exit 0, unchanged |
+| both job scripts | `bash -n` clean |
+| CLI | `--oracle` and `--epochs` present in both scripts' `--help` |
+
+### Known limitations
+
+- **The oracle is an upper bound on the channel, not on the method.** It says what this
+  prefix shape can carry at best; a different injection point (input embeddings, cross
+  attention) is not covered.
+- **Two epochs is short.** If the oracle scores poorly, "not enough training" is a live
+  alternative explanation, and the validation curve is what has to rule it out.
+- **Still no gate=0 arm**, so the floor of this prompt with a node-independent prefix remains
+  unmeasured.
+
+---
+
+## Step 3 — result: the channel, not the encoder
+
+**Run 2026-09-21, job 14411691.** `experiments/2026-09-21-14411691_oracle-qwen14b-kv192/`,
+945 rows, 5 judge errors, **198 distinct generations**.
+
+Scored with the same TF-IDF identifiability probe step 2 used — rank each generation's own gold
+among all 945 golds, chance top-1 = 0.11%:
+
+| arm | top-1 | top-10 | median rank | `llm_accuracy` | distinct | word types |
+|---|---|---|---|---|---|---|
+| text baseline (09-10, era 1) | 40.5% | 80.3% | 2 | 3.592 | 945 | 10,701 |
+| graph-only step 1 | 3.9% | 21.6% | 71 | 1.954 | 879 | 4,817 |
+| graph-only step 2 (kv192) | 2.6% | 13.7% | 141 | 1.737 | 809 | 4,194 |
+| **oracle** | **0.3%** | **2.0%** | **405** | **1.249** | **198** | **884** |
+
+(The probe reproduces step 2's published figures to within 0.4 points, so it is the same
+instrument.)
+
+**The oracle is at chance.** Handed a perfect 1,024-d embedding of the very abstract it is asked
+to write, the model produces text no more identifiable than a random draw — median rank 405
+against a chance median of 473. 736 of 945 rows open with one of two phrases. One identical
+600-token abstract about image classification was emitted 75 times, including for a
+self-supervised representation-learning paper (node 2629) and an Arabic NLP paper (node 5182).
+
+Read against the two candidate causes step 3 was set up to separate, this is cause 2: the
+prefix → LLM channel is the bottleneck. A better aggregator, encoder objective or embedding
+model all improve the vector the oracle already supplies perfectly, so none of them can help.
+
+**Specifying one of 945 papers takes about 10 bits.** The oracle supplies a 1,024-d float
+vector. Whatever fails here, it is not the channel's width — which is also why "the pooled
+vector loses information" does not survive as an explanation for steps 1 and 2.
+
+### Two caveats, one of them serious
+
+- **The oracle ran 2 epochs; steps 1 and 2 ran 10 with early stopping.** A collapsed, generic
+  output is also what an undertrained prefix looks like, and one short run cannot tell the two
+  apart. This is what step 4 exists to close, and until it does the conclusion above is
+  *strongly indicated, not established*.
+- **The 5 judge errors** (`ERROR: max retries exceeded`) are excluded from the mean rather than
+  imputed; at 5/945 the choice cannot move the result.
+
+### A correction to step 1's headline gap
+
+Step 1 reports graph-only at −1.637 against the 3.592 text baseline and notes a wording
+confound without quantifying it. It is now quantified, and it is large. The 945-node baseline is
+**era 1** — verified here, not assumed: its generations are byte-identical to
+`experiments/prompt_sensitivity_qwen/01_era1/` on 48/48 shared nodes, and 0/48 for eras 2, 3
+and 4. The graph-only runs use the **era-4** system message. On the 48 nodes where all arms
+exist:
+
+| same 48 nodes | `llm_accuracy` |
+|---|---|
+| gpt-5.6-luna, text, era 4 | 5.812 |
+| Qwen3-14B, text, era 4 | 5.333 |
+| Qwen3-14B, text, era 1 (= the 945 baseline) | 3.875 |
+| graph-only step 1 | 1.896 |
+| graph-only step 2 | 1.833 |
+| oracle | 1.438 |
+
+Like for like at era 4, the graph-only gap is about **−3.44**, not −1.637. The confound runs
+against the result, as step 1 said — but by twice as much as the published number implies. An
+era-4 text baseline over all 945 nodes does not exist and is owed.
+
+It is also worth recording what the same table says about the model gap: gpt-5.6-luna leads
+Qwen3-14B by **0.48** on identical references and instructions. Era 1 → era 4 is worth +1.46 to
+Qwen. The prompt, not the model, is most of that distance. (These 48 were stratified on era-2/3
+score movement, so absolute means are not estimates of the 945; the paired comparisons are.)
+
+---
+
+## Step 4 — the oracle with LoRA, at full epoch budget
+
+**Set up 2026-09-22. Run pending.** Branch `feature/oracle-prefix`.
+
+### Why
+
+Step 3's result has two holes, and one run closes both.
+
+**Every arm of this project has held the LLM frozen.** `lora.py` has been written, documented
+and verified by `verify_lora_prefix.py` since Stage 6d, and `LORA=0` in every job script that
+has ever run. So step 3's null says "a *frozen* Qwen3-14B cannot be steered by this prefix",
+which is weaker than the claim the project needs in order to abandon soft prompts. LoRA is the
+only untested fix for the cause step 3 diagnosed.
+
+**The oracle is where LoRA can be read cleanly.** The standing worry about LoRA — recorded in
+`project_overview.md` — is that it may learn the task faster than the gate learns the graph, and
+so absorb the effect being measured. That worry does not apply here: **LoRA has no per-paper
+information.** It is 80 modules of weights shared across all 7,750 training papers. If the
+outputs become paper-specific, the identity can only have arrived through the prefix. Nothing
+else in the run knows which paper it is.
+
+**And 10 epochs, not 2**, so that "undertrained" stops being an alternative explanation.
+
+The decision rule is set before the run, not after it:
+
+- **Identifiability rises well above chance** → the channel works once the LLM can adapt to it.
+  Steps 1–3 then measured a frozen model, not a graph, and the soft-prompt track reopens — at
+  which point a non-pooling aggregator (learned queries over neighbour states, one or two
+  prefix tokens per neighbour) becomes the right next build, since pooling ~599 2-hop papers
+  into one vector is a real loss once the channel can carry more than topic.
+- **Identifiability stays at chance** → the KV-prefix-from-a-pooled-vector shape cannot carry
+  identity, with a matched-budget oracle ceiling to prove it was never the encoder's fault.
+  That is a complete negative result and the justification for changing task.
+
+### Decisions
+
+| decision | reasoning |
+|---|---|
+| `--lora` on, r=16, q_proj/v_proj | unchanged from `config.py`; the prefix arrives as extra keys and values, so those two projections decide how much of it is read (`lora.py`) |
+| `--epochs` dropped, so `config.EPOCHS = 10` | matches steps 1 and 2. Passing `--epochs 10` would restate a constant, which this job script deliberately does not do |
+| its own `CKPT_DIR`, `qwen14b-oracle-kv192-lora` | `train.py` refuses to resume across a change of `--lora`, but `best.pt` is a fixed name — sharing step 3's directory would abort at best and overwrite the comparison arm at worst |
+| **`RUN_GATE0=1`** | the missing control of this entire stage. This run differs from the 09-10 baseline by two things at once (LoRA and the oracle vector); gate=0 keeps LoRA and disconnects only the vector, so adapter − gate0 is the oracle's contribution alone |
+| judged by identifiability first, `llm_accuracy` second | the judge cannot distinguish "generic but fluent" from "specific but wrong" as sharply as the retrieval probe does, and step 3 is the evidence |
+| architecture, prompt, node sets, decoding unchanged | one variable moves — two, counting the epoch budget, and that one only restores a matched setting |
+
+### What changed
+
+Job scripts only. `--lora`, `--oracle` and the epoch budget already compose in `train.py`, and
+`generate.py` injects LoRA from the checkpoint automatically with no flag to keep in sync.
+
+- `run_train_adapter.sh` — `LORA=1`, `CKPT_DIR=…-lora`, `--epochs 2` removed, W&B run renamed.
+- `run_generate_eval.sh` — `CKPT_DIR`/`ARM` follow, `RUN_GATE0=1`, and `--oracle` added to the
+  gate0 invocation (`load_adapter` asserts the recorded flag for *every* non-baseline mode, so
+  omitting it there would abort the arm).
+
+### How to run
+
+```
+sbatch hpc/komondor/jobs/run_train_adapter.sh     # resubmit on timeout; resumes by itself
+sbatch hpc/komondor/jobs/run_generate_eval.sh     # after training; adapter + gate0 arms
+```
+
+### What to watch in the first ~100 steps
+
+`gate/mean_abs` and `prefix/graph_fraction`. At `gate = 0` the pathway behind the gate gets zero
+gradient and has to bootstrap; if LoRA drives the loss down while the gate stays shut, the run
+will end with a good validation loss and a disconnected prefix, which reads as a null but is
+not one. That is a distinguishable failure and it is already logged.
+
+### Known limitations
+
+- **Checkpoints grow to ~560 MB** (LoRA tensors plus their AdamW moments). Ten epochs is ~5.6 GB
+  if every epoch improves.
+- **Walltime is untested at this budget.** Step 3 ran 2 epochs; the 10-11 h/epoch estimate in
+  the job script predates graph-only sequences and is far too high, but has still never been
+  measured. Expect to resubmit; the resume path handles it.
+- **A positive result here is a ceiling, not a method.** It would say the channel can carry
+  identity when handed a perfect vector — not that a GNN can produce one.
+- **Still no era-4 945-node text baseline**, so the absolute comparison for any graph arm
+  remains against a prompt known to be 1.46 points weak.
+
+## Step 4 — result: LoRA opens the channel
+
+`experiments/2026-09-22-14422070_oracle-qwen14b-kv192-lora/`, 945 nodes, greedy, era-4
+graph-only prompt. Identifiability is the TF-IDF cosine rank of a generation's own gold among
+all 945 golds; chance is 0.11% top-1, median rank 473.
+
+| arm | LLM | epochs | top-1 | med rank | distinct | judge acc |
+|---|---|---|---|---|---|---|
+| oracle (step 3) | frozen | 2 | 0.4% | 404 | 198 | 1.25 |
+| **oracle + LoRA (step 4)** | **LoRA** | **10** | **12.0%** | **17** | **944** | **2.71** |
+| graph-only kv192 (step 2) | frozen | 10 | 1.7% | 152 | 809 | 1.74 |
+| text baseline (era 1) | frozen | — | 39.4% | 2 | 945 | 3.59 |
+
+**Step 3's conclusion was wrong.** It read the oracle's collapse as proof that the prefix→LLM
+channel could not carry paper identity, and concluded that no better graph, aggregator or
+embedding could help. Channel width never changed between the two oracle runs — same 32 tokens,
+same 40 layers, same single 1024-d vector in — and top-1 identifiability moved from 3.6x chance
+to 109x chance. The prefix was always carrying identity. A *frozen* Qwen could not read it.
+
+That re-partitions the remaining gap into two measurable pieces:
+
+- **1.7% → 12%** (graph → oracle) is the encoder's: pooling, aggregation, how much of the
+  neighbourhood reaches the vector.
+- **12% → 39%** (oracle → text) is the channel's: adapter capacity, prefix width, LoRA rank.
+
+Neither is yet sized honestly, because every graph arm in steps 1-2 was measured under the
+frozen LLM now known to suppress identifiability ~7x on the same prefix.
+
+### Known limitations
+
+- **The `gate=0` arm did not run.** No `-gate0` experiment directory exists, so LoRA's own
+  contribution is still not separated from the oracle vector's. Part of 1.25 → 2.71 may be
+  LoRA alone writing better generic abstracts.
+- **Generations average 121 words against the golds' 174**, so ROUGE is partly penalising
+  length rather than content.
+- **The text comparison is cross-era.** The baseline is era 1; the oracle uses era 4. An era-4
+  text baseline would be higher still (+1.46 on the 48-node stratified sample), making the
+  oracle's deficit larger, not smaller.
+- **This is a ceiling, not a method.** It says the channel can carry identity when handed a
+  perfect vector, not that a GNN can produce one.

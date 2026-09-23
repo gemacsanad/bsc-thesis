@@ -94,6 +94,30 @@ class GraphSAGEEncoder(nn.Module):
         return h[:batch_size]
 
 
+def oracle_vector(batch):
+    """The ceiling experiment's stand-in for the encoder: the seed's OWN voyage embedding.
+
+    This deliberately leaks the answer. A node's feature is the embedding of that node's
+    abstract — the very abstract the model is asked to write — which is why
+    GraphSAGEEncoder masks it before any message passing. Here the mask is skipped and the
+    encoder bypassed entirely, so the adapter receives a perfect 1,024-d description of the
+    target and no graph at all.
+
+    It measures one thing the graph runs cannot separate: whether a frozen Qwen3-14B can be
+    steered by a KV prefix decoded from a single dense vector *at all*. If even this writes
+    generic abstracts, the prefix->LLM channel is the bottleneck and no better graph,
+    aggregator or embedding model can help; if it writes the right paper, the channel works
+    and the graph side is what to fix.
+
+    Its output is a ceiling, never a result: the number is not comparable to any arm that
+    does not see the target, and must never be reported beside one without that label.
+
+    Relies on the seeds occupying rows 0..batch_size-1, which graph.py asserts — the same
+    invariant the mask relies on.
+    """
+    return batch.x[:batch.batch_size]
+
+
 class PrefixAdapter(nn.Module):
     """Graph embedding -> per-layer key/value prefixes for a frozen Qwen3-14B.
 
@@ -189,6 +213,16 @@ if __name__ == "__main__":
         out2 = model(perturbed, batch.edge_index, batch.batch_size)
     assert torch.equal(out, out2), "seed features leak into the output"
     print("seed features do not affect the output (mask works)")
+
+    # The oracle must be the seed's own feature and nothing else — if it silently returned
+    # the masked or aggregated vector, the ceiling run would quietly measure the graph again.
+    oracle = oracle_vector(batch)
+    assert oracle.shape == (batch.batch_size, IN_CHANNELS)
+    assert torch.equal(oracle, data.x[batch.n_id[:batch.batch_size]]), \
+        "oracle_vector is not the seed nodes' own stored embedding"
+    assert not torch.allclose(oracle, out), "oracle_vector returned the encoder output"
+    print(f"oracle: {tuple(oracle.shape)}, the seeds' own embeddings, "
+          f"cosine to encoder output {F.cosine_similarity(oracle, out).mean():.3f}")
 
     # --- prefix adapter ---------------------------------------------------
     adapter = PrefixAdapter()

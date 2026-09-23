@@ -5,6 +5,7 @@ Usage:
     python adapter/train.py --wandb                             # track metrics online
     python adapter/train.py --sets legacy                       # the old 4,000/495 run
     python adapter/train.py --gnn-layers 3 --out-dir checkpoints/gnn3
+    python adapter/train.py --oracle --epochs 2                 # ceiling run, see --oracle
 """
 
 import argparse
@@ -24,7 +25,7 @@ from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FI
                     LEARNING_RATE, LOG_EVERY, LORA_R, LORA_TARGETS, NUM_PREFIX_TOKENS,
                     PATIENCE, SEED, WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader
-from model import GraphSAGEEncoder, PrefixAdapter
+from model import GraphSAGEEncoder, PrefixAdapter, oracle_vector
 from text import PROMPT, Corpus, encode, graph_only_example
 
 # Which frozen node sets to train on. Since the soft-prompt-only change the prompt no longer
@@ -119,9 +120,10 @@ def sliced_loss(llm, hidden, labels):
     return F.cross_entropy(logits, labels[:, 1:][keep])
 
 
-def step_loss(llm, encoder, adapter, batch, input_ids, labels, mask, dtype):
+def step_loss(llm, encoder, adapter, batch, input_ids, labels, mask, dtype, oracle=False):
     """One forward pass. Returns (mean loss over this batch's target tokens, the prefix)."""
-    graph_vector = encoder(batch.x, batch.edge_index, batch.batch_size)
+    graph_vector = oracle_vector(batch) if oracle else encoder(
+        batch.x, batch.edge_index, batch.batch_size)
     prefix = adapter(graph_vector).to(dtype)
 
     p, (b, length) = NUM_PREFIX_TOKENS, input_ids.shape
@@ -151,7 +153,8 @@ def graph_fraction(adapter, prefix):
 
 
 @torch.no_grad()
-def validate(llm, encoder, adapter, loader, tokenizer, example, device, dtype):
+def validate(llm, encoder, adapter, loader, tokenizer, example, device, dtype,
+             oracle=False):
     """Token-weighted mean loss, with the graph on and with the gate forced to zero.
 
     The second number is the ablation the whole design turns on — same weights, graph
@@ -172,7 +175,7 @@ def validate(llm, encoder, adapter, loader, tokenizer, example, device, dtype):
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
             n_tokens = int((labels != -100).sum())
             loss, _ = step_loss(llm, encoder, adapter, batch.to(device),
-                                input_ids, labels, mask, dtype)
+                                input_ids, labels, mask, dtype, oracle)
             loss_sum += loss.item() * n_tokens
             token_sum += n_tokens
 
@@ -199,6 +202,17 @@ def main():
     ap.add_argument("--out-dir", default=CHECKPOINT_DIR,
                     help="one directory per depth; two depths sharing one would overwrite "
                          "each other's best.pt")
+    ap.add_argument("--epochs", type=int, default=EPOCHS,
+                    help="upper bound on epochs; a flag rather than a config edit for the "
+                         "same reason --gnn-layers is one — it differs between submissions "
+                         "that may be queued at the same time. Recorded in the checkpoint "
+                         "only through 'epoch', so lowering it on a resume just stops sooner")
+    ap.add_argument("--oracle", action="store_true",
+                    help="CEILING EXPERIMENT, not a result: bypass the encoder and feed the "
+                         "adapter the target abstract's own embedding (model.oracle_vector). "
+                         "Measures whether a KV prefix from one dense vector can steer the "
+                         "frozen LLM at all. The arm sees the answer, so its score is not "
+                         "comparable to any arm that does not")
     ap.add_argument("--lora", action="store_true",
                     help="also train LoRA adapters on the LLM's q/v projections (lora.py). "
                          "Without it the LLM is frozen, as in every run up to now")
@@ -217,6 +231,12 @@ def main():
     # Imported here, like wandb above, so a run without --lora does not depend on peft.
     if args.lora:
         from lora import add_lora, load_lora_state, lora_state_dict
+
+    if args.oracle:
+        print("=" * 78, "\nORACLE CEILING RUN — the adapter is fed the target abstract's own "
+              "embedding.\nThe encoder is bypassed and the seed mask does not apply: this arm "
+              "sees the\nanswer. Its score is a ceiling on the prefix channel, never a result.\n"
+              + "=" * 78, flush=True)
 
     torch.manual_seed(SEED)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -265,10 +285,14 @@ def main():
 
     encoder = GraphSAGEEncoder(num_layers=args.gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
-    trainable = list(encoder.parameters()) + list(adapter.parameters()) + lora_params
+    # In oracle mode the encoder is bypassed, so its parameters would sit in the optimizer
+    # collecting no gradient. Excluding them keeps the reported count honest.
+    encoder_params = [] if args.oracle else list(encoder.parameters())
+    trainable = encoder_params + list(adapter.parameters()) + lora_params
     n_trainable = sum(p.numel() for p in trainable)
-    print(f"{args.gnn_layers}-layer encoder over {args.gnn_layers} sampled hops; "
-          f"trainable parameters: {n_trainable:,}")
+    which = ("encoder bypassed (oracle)" if args.oracle else
+             f"{args.gnn_layers}-layer encoder over {args.gnn_layers} sampled hops")
+    print(f"{which}; trainable parameters: {n_trainable:,}")
 
     optimizer = AdamW(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -285,7 +309,7 @@ def main():
             # and a run whose config omits its own batch size is not comparable to anything.
             config={**vars(args), "trainable_parameters": n_trainable,
                     "model": BASE_MODEL, "seed": SEED,
-                    "epochs": EPOCHS, "patience": PATIENCE,
+                    "epochs": args.epochs, "patience": PATIENCE,
                     "batch_size": BATCH_SIZE, "grad_accum": GRAD_ACCUM,
                     "effective_batch_size": BATCH_SIZE * GRAD_ACCUM,
                     "eval_every": EVAL_EVERY, "log_every": LOG_EVERY,
@@ -331,6 +355,13 @@ def main():
             f"{args.resume} was trained {'with' if was_lora else 'without'} LoRA but --lora "
             f"is {'set' if args.lora else 'not set'}; the LLM's weights differ between the "
             f"two, so the prefix would continue against a model it never saw")
+        # An oracle checkpoint and a graph one have identical shapes, so this is the only
+        # thing standing between a ceiling run and a graph run continuing each other.
+        was_oracle = ckpt.get("oracle", False)
+        assert was_oracle == args.oracle, (
+            f"{args.resume} was trained {'with' if was_oracle else 'without'} --oracle but "
+            f"--oracle is {'set' if args.oracle else 'not set'}; one arm sees the target "
+            f"abstract and the other does not, so this would not be a continuation")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
         if args.lora:
@@ -346,9 +377,9 @@ def main():
     # The job script resubmits blindly after a timeout, so it will eventually resubmit a run
     # that has nothing left to do. Say so and exit, rather than entering an empty epoch loop
     # and failing on the summary that follows it.
-    if start_epoch >= EPOCHS or (PATIENCE and bad_epochs >= PATIENCE):
+    if start_epoch >= args.epochs or (PATIENCE and bad_epochs >= PATIENCE):
         why = ("early stopping already fired" if PATIENCE and bad_epochs >= PATIENCE
-               else f"--epochs is {EPOCHS}")
+               else f"--epochs is {args.epochs}")
         print(f"nothing to do: checkpoint is at epoch {start_epoch} and {why}")
         if run is not None:
             run.finish()
@@ -359,13 +390,13 @@ def main():
     adapter.train()
     running, running_n, tokens, clock = 0.0, 0, 0, time.time()
 
-    for epoch in range(start_epoch, EPOCHS):
+    for epoch in range(start_epoch, args.epochs):
         for i, batch in enumerate(train_loader):
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
 
             loss, prefix = step_loss(llm, encoder, adapter, batch.to(device),
-                                     input_ids, labels, mask, dtype)
+                                     input_ids, labels, mask, dtype, args.oracle)
             (loss / GRAD_ACCUM).backward()
 
             running += loss.item()
@@ -405,7 +436,7 @@ def main():
 
             if opt_step % EVAL_EVERY == 0:
                 losses = validate(llm, encoder, adapter, valid_loader, tokenizer,
-                                  example, device, dtype)
+                                  example, device, dtype, args.oracle)
                 print(f"  valid @ step {opt_step}: graph {losses['graph']:.4f}  "
                       f"gate=0 {losses['gate=0']:.4f}  "
                       f"delta {losses['gate=0'] - losses['graph']:+.4f}", flush=True)
@@ -418,7 +449,7 @@ def main():
         # End-of-epoch validation is what early stopping reads. The periodic --eval-every
         # checks above exist for the curve; this one decides whether the run continues.
         losses = validate(llm, encoder, adapter, valid_loader, tokenizer, example,
-                          device, dtype)
+                          device, dtype, args.oracle)
         improved = losses["graph"] < best_loss
         if improved:
             best_loss, bad_epochs = losses["graph"], 0
@@ -439,7 +470,7 @@ def main():
                     "lora": lora_state_dict(llm) if args.lora else None,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "epoch": epoch + 1, "step": opt_step, "sets": args.sets, "prompt": PROMPT,
-                    "gnn_layers": args.gnn_layers,
+                    "gnn_layers": args.gnn_layers, "oracle": args.oracle,
                     "valid_loss": losses["graph"], "best_loss": best_loss,
                     "bad_epochs": bad_epochs}, path)
         print(f"saved {path}")
@@ -453,7 +484,7 @@ def main():
 
         if PATIENCE and bad_epochs >= PATIENCE:
             print(f"\nearly stop: {bad_epochs} epochs without improvement on the validation "
-                  f"loss (best {best_loss:.4f}); {EPOCHS - epoch - 1} epoch(s) skipped")
+                  f"loss (best {best_loss:.4f}); {args.epochs - epoch - 1} epoch(s) skipped")
             break
 
         clock = time.time()

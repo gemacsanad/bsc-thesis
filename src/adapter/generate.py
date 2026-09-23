@@ -71,7 +71,7 @@ from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
                     FROZEN_DIR, GNN_LAYERS, JOINT_DIR,
                     MAX_LENGTH, MAX_NEW_TOKENS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
 from graph import load_graph, make_loader
-from model import GraphSAGEEncoder, PrefixAdapter
+from model import GraphSAGEEncoder, PrefixAdapter, oracle_vector
 from prefix_generation import generate_with_prefix, patch_for_prefix
 from text import PROMPT, Corpus, graph_only_example
 
@@ -98,7 +98,7 @@ def remap_encoder(state):
             for key, value in state.items()}
 
 
-def load_adapter(path, device, sets, llm):
+def load_adapter(path, device, sets, llm, oracle):
     """Restore the trained encoder and adapter from a `train.py` checkpoint.
 
     Also returns the encoder depth, which is read off the checkpoint rather than passed in:
@@ -121,6 +121,13 @@ def load_adapter(path, device, sets, llm):
     was_prompt = checkpoint.get("prompt", "text")   # predating PROMPT means abstracts were shown
     assert was_prompt == PROMPT, (
         f"{path} was trained with the '{was_prompt}' prompt but generation uses '{PROMPT}'")
+    # An oracle checkpoint has exactly the shapes of a graph one. Generating an oracle-trained
+    # prefix from graph vectors (or the reverse) is fluent and wrong, so it is refused here.
+    was_oracle = checkpoint.get("oracle", False)
+    assert was_oracle == oracle, (
+        f"{path} was trained {'with' if was_oracle else 'without'} --oracle but generation "
+        f"has --oracle {'set' if oracle else 'not set'}; the adapter would be fed a kind of "
+        f"vector it was never trained on")
     gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
     encoder = GraphSAGEEncoder(num_layers=gnn_layers).to(device)
     adapter = PrefixAdapter().to(device)
@@ -142,7 +149,7 @@ def load_adapter(path, device, sets, llm):
 
 
 @torch.no_grad()
-def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers):
+def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers, oracle=False):
     """Yield `(node_id, prefix)` for each node, in the order given. `prefix` is None in
     baseline mode.
 
@@ -158,7 +165,8 @@ def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers):
     for batch in make_loader(data, node_ids, batch_size=1, shuffle=False,
                              gnn_layers=gnn_layers):
         batch = batch.to(device)
-        graph_vector = encoder(batch.x, batch.edge_index, batch.batch_size)
+        graph_vector = (oracle_vector(batch) if oracle
+                        else encoder(batch.x, batch.edge_index, batch.batch_size))
         yield int(batch.n_id[0]), adapter(graph_vector)
 
 
@@ -174,6 +182,12 @@ def main():
     ap.add_argument("--sets", choices=sorted(SETS), default=DEFAULT_SETS,
                     help="which frozen eval nodes to generate for; 'legacy' reproduces the "
                          "uncapped 495-node runs")
+    ap.add_argument("--oracle", action="store_true",
+                    help="CEILING EXPERIMENT, not a result: feed the adapter the target "
+                         "abstract's own embedding instead of the encoder output "
+                         "(model.oracle_vector). Must match how the checkpoint was trained, "
+                         "which is asserted. The arm sees the answer it is asked to write, "
+                         "so its score belongs beside no other arm without that label")
     ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     args = ap.parse_args()
 
@@ -208,7 +222,13 @@ def main():
     encoder = adapter = data = None
     gnn_layers = GNN_LAYERS
     if args.mode != "baseline":
-        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets, llm)
+        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets, llm,
+                                                    args.oracle)
+        if args.oracle:
+            print("=" * 78, "\nORACLE CEILING RUN — the adapter is fed the target abstract's "
+                  "own embedding.\nThis arm sees the answer. Its score is a ceiling on the "
+                  "prefix channel,\nnever a result, and is not comparable to any arm that "
+                  "does not see the target.\n" + "=" * 78, flush=True)
         # `gate0` is the ablation validate() runs every epoch, carried through to generation:
         # the same weights, the same LoRA, with the graph disconnected from the prefix. Under
         # LoRA it is the honest control, since the frozen-Vicuna arm differs by two things.
@@ -249,8 +269,9 @@ def main():
                     repetition_penalty=REPETITION_PENALTY,
                     pad_token_id=tokenizer.pad_token_id)
 
-    for i, (node_id, prefix) in enumerate(iter_prefixes(eval_nodes, encoder, adapter,
-                                                        data, device, gnn_layers), start=1):
+    for i, (node_id, prefix) in enumerate(iter_prefixes(eval_nodes, encoder, adapter, data,
+                                                        device, gnn_layers, args.oracle),
+                                          start=1):
         if node_id in done:
             continue
 
