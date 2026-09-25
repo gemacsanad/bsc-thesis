@@ -42,3 +42,17 @@ logs/
 
 # DuckDB scratch space
 duckdb_tmp/
+
+# LaTeX build artifacts (thesis/)
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.xdv
