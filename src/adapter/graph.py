@@ -39,11 +39,13 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import coalesce, remove_self_loops
 
-from config import FROZEN_DIR, GNN_LAYERS, JOINT_DIR, num_neighbors
+from config import (FROZEN_DIR, GNN_LAYERS, JOINT_DIR, NUM_NEIGHBOUR_TOKENS,
+                    num_neighbors)
 
 
 def load_graph(embeddings=None, edges=None):
@@ -75,6 +77,48 @@ def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0,
         shuffle=shuffle,
         num_workers=num_workers,
     )
+
+
+def centroid_distances(x):
+    """-> (N,) cosine distance of each row to the centroid direction of the set.
+
+    The torch twin of neighbour_cap.centroid_distances, which is numpy and runs on the CPU
+    over frozen reference lists. This one runs per training step on whatever device the
+    batch is on, so a round trip through numpy would cost a sync every step. The two must
+    agree; verify_neighbour_tokens.py is what holds them to it.
+    """
+    normed = F.normalize(x.float(), dim=1)
+    centroid = F.normalize(normed.mean(0), dim=0)
+    return ((1.0 - normed @ centroid) / 2.0).abs()
+
+
+def select_neighbour_rows(batch, max_tokens=NUM_NEIGHBOUR_TOKENS, seed_row=0):
+    """-> batch-local rows of the seed's 1-hop neighbours, closest to the centroid first.
+
+    The 1-hop neighbours of a seed are exactly the papers it cites: edge_index is stored
+    reversed (cited, citing), so the in-edges of `seed_row` are its references. graph.py's
+    main() asserts that direction against edges.csv.
+
+    Capped at `max_tokens` by the same centroid score the text prompt trims by
+    (neighbour_cap.rank_refs), so the graph arm and the text arm select the *same*
+    references and the comparison between them is about the encoding, not the sample.
+
+    Ordered closest-first because these become input embeddings and therefore receive RoPE
+    positions: position then encodes relevance rather than an arbitrary row order. It is a
+    choice, not a neutral default — a set is being given an order it does not have.
+
+    Batch size 1 only, which is BATCH_SIZE everywhere in this stage. A wider batch needs
+    padding and a per-seed mask, because k varies per node; the assert is here so that
+    change fails loudly rather than silently taking seed 0's neighbours for every row.
+    """
+    assert batch.batch_size == 1, (
+        f"select_neighbour_rows handles batch_size 1, got {batch.batch_size}; k varies "
+        f"per node, so a wider batch needs padding and a mask")
+    rows = batch.edge_index[0][batch.edge_index[1] == seed_row]
+    if rows.numel() <= 1:
+        return rows
+    order = torch.argsort(centroid_distances(batch.x[rows]), stable=True)
+    return rows[order[:max_tokens]]
 
 
 def main():

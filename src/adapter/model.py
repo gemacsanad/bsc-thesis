@@ -1,16 +1,24 @@
 """
-Stage 3 — GraphSAGE encoder and prefix adapter.
+Stage 3 — graph encoder, prefix adapter and neighbour-token adapter.
 
-Encodes a target node's reference neighbourhood into a single vector, and turns
-that vector into the key/value prefixes injected into every layer of a frozen
-Qwen3-14B.
+Encodes a target node's reference neighbourhood, and turns it into the two channels
+that reach a frozen Qwen3-14B:
 
-`GNN_LAYERS` SAGEConv layers (all 1024 wide, mean aggregation) over the batches
-produced by graph.py, so the encoder sees the node's references at layer 1 and
-the references of those references at layer 2. The default is 2; `--gnn-layers`
-on train.py and graph.py runs deeper encoders, and the loader's hop count follows
-it — a layer reading from an unsampled hop would aggregate incomplete
-neighbourhoods and produce a plausible result rather than an error.
+  * the **pooled** seed vector -> key/value prefixes injected at every one of the 40
+    layers (PrefixAdapter), unchanged since step 2;
+  * each **1-hop neighbour** -> one ordinary input embedding prepended to the prompt
+    (NeighbourTokenAdapter), added in stage 9.
+
+`GNN_LAYERS` message-passing layers (all 1024 wide) over the batches produced by
+graph.py, so the encoder sees the node's references at layer 1 and the references
+of those references at layer 2. The default is 2; `--gnn-layers` on train.py and
+graph.py runs deeper encoders, and the loader's hop count follows it — a layer
+reading from an unsampled hop would aggregate incomplete neighbourhoods and produce
+a plausible result rather than an error.
+
+`GNN_CONV` picks the aggregation. It is "gatv2" since stage 9 — learned attention
+over the references rather than GraphSAGE's unweighted mean — and "sage" reproduces
+every run up to step 5.
 
 Seed masking
 ------------
@@ -61,37 +69,114 @@ Usage:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import GATv2Conv, SAGEConv
 
-from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GNN_LAYERS, HEAD_DIM,
-                    HIDDEN_CHANNELS, IN_CHANNELS, NUM_KV_HEADS, NUM_LAYERS,
-                    NUM_PREFIX_TOKENS, OUT_CHANNELS, TRUNK_DIM)
+from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GNN_CONV, GNN_HEADS, GNN_LAYERS,
+                    HEAD_DIM, HIDDEN_CHANNELS, HIDDEN_SIZE, IN_CHANNELS, NUM_KV_HEADS,
+                    NUM_LAYERS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, OUT_CHANNELS,
+                    TRUNK_DIM)
 
 
-class GraphSAGEEncoder(nn.Module):
-    """`num_layers` SAGEConv layers, all 1024 wide. Layer i aggregates hop i, so the loader
-    must sample at least `num_layers` hops — config.num_neighbors() derives that."""
+def _conv(kind, in_dim, out_dim, heads):
+    """One message-passing layer of `kind`, `out_dim` wide whichever kind it is.
+
+    GATv2 emits `heads` x `out_dim // heads` and concatenates, so swapping the kind does not
+    also change the width — the comparison against the GraphSAGE runs stays about aggregation.
+    """
+    if kind == "sage":
+        return SAGEConv(in_dim, out_dim, aggr="mean")
+    assert out_dim % heads == 0, f"{out_dim} channels do not divide into {heads} heads"
+    return GATv2Conv(in_dim, out_dim // heads, heads=heads, concat=True, dropout=0.0)
+
+
+class GraphEncoder(nn.Module):
+    """`num_layers` message-passing layers, all 1024 wide. Layer i aggregates hop i, so the
+    loader must sample at least `num_layers` hops — config.num_neighbors() derives that.
+
+    `conv` picks the aggregation: "gatv2" weights each reference by learned attention,
+    "sage" takes the unweighted mean and reproduces every run up to step 5.
+
+    forward() returns **all** rows, not just the seeds. Stage 9 needs two things out of one
+    pass: the seed's pooled embedding for the KV prefix, and the 1-hop neighbours' own
+    embeddings for the input tokens. Returning `h` and letting the caller slice keeps them
+    consistent by construction — the neighbour tokens are always from the same forward pass
+    as the prefix beside them.
+    """
 
     def __init__(self, in_channels=IN_CHANNELS, hidden_channels=HIDDEN_CHANNELS,
-                 out_channels=OUT_CHANNELS, dropout=DROPOUT, num_layers=GNN_LAYERS):
+                 out_channels=OUT_CHANNELS, dropout=DROPOUT, num_layers=GNN_LAYERS,
+                 conv=GNN_CONV, heads=GNN_HEADS):
         super().__init__()
         assert num_layers >= 1, "the encoder needs at least one conv layer"
+        assert conv in ("sage", "gatv2"), f"unknown conv {conv!r}"
         widths = [in_channels] + [hidden_channels] * (num_layers - 1) + [out_channels]
         self.convs = nn.ModuleList(
-            SAGEConv(widths[i], widths[i + 1], aggr="mean") for i in range(num_layers)
+            _conv(conv, widths[i], widths[i + 1], heads) for i in range(num_layers)
         )
+        self.conv_kind = conv
         self.dropout = dropout
         # unit norm, like the voyage features it replaces
         self.mask = nn.Parameter(torch.randn(in_channels) / in_channels ** 0.5)
 
     def forward(self, x, edge_index, batch_size):
-        """Returns (batch_size, out_channels) — one embedding per seed node."""
+        """Returns (num_nodes, out_channels) — every row of the batch, seeds first."""
         h = torch.cat([self.mask.expand(batch_size, -1), x[batch_size:]])
         for conv in self.convs[:-1]:
             h = F.relu(conv(h, edge_index))
             h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.convs[-1](h, edge_index)      # no activation on the output layer
-        return h[:batch_size]
+        return self.convs[-1](h, edge_index)   # no activation on the output layer
+
+
+class NeighbourTokenAdapter(nn.Module):
+    """One 1-hop neighbour embedding (1024) -> one Qwen3 input embedding (5120).
+
+    Weights are shared across all neighbours, so k is free to vary per node and nothing is
+    tied to a position. The structure mirrors PrefixAdapter deliberately:
+
+        token = scale * LayerNorm(base + gate * proj(h))
+
+    `base` is a node-independent learned token and `gate` starts at zero, so at
+    initialisation every neighbour slot holds the *same* generic vector and training begins
+    as ordinary soft-prompt tuning. Setting gate to zero at eval keeps the k slots and
+    removes only their content, which separates "does it help to have k tokens" from "does
+    it help that they carry neighbour information" — a distinction no other ablation gives.
+
+    `scale` is the mean row norm of the LLM's own embedding matrix, set by `match_embeddings`
+    before training. An unscaled projection of GNN outputs is out of distribution for the
+    embedding layer, and the resulting damage looks like the idea not working rather than
+    like a bug.
+    """
+
+    def __init__(self, in_channels=OUT_CHANNELS, hidden_size=HIDDEN_SIZE,
+                 max_tokens=NUM_NEIGHBOUR_TOKENS):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # how many neighbours get a token; carried here rather than threaded through
+        # step_loss so training and generation read it from the same place
+        self.max_tokens = max_tokens
+        self.in_norm = nn.LayerNorm(in_channels)
+        self.proj = nn.Linear(in_channels, hidden_size)
+        self.out_norm = nn.LayerNorm(hidden_size)
+        self.base = nn.Parameter(torch.randn(hidden_size) * BASE_INIT_STD)
+        self.gate = nn.Parameter(torch.zeros(1))
+        # a buffer, not a constant: it rides in the checkpoint, so generation cannot
+        # silently rescale the tokens the run was trained with
+        self.register_buffer("scale", torch.ones(()))
+
+    @torch.no_grad()
+    def match_embeddings(self, embed_weight):
+        """Set `scale` so a token leaves this module at the norm of a real token embedding.
+
+        LayerNorm leaves ~unit variance per dimension, so the raw output norm is ~sqrt(H);
+        dividing it out and multiplying by the measured mean puts the two on the same scale.
+        """
+        mean_norm = embed_weight.detach().float().norm(dim=1).mean()
+        self.scale.fill_(float(mean_norm / self.hidden_size ** 0.5))
+
+    def forward(self, h):
+        """(k, in_channels) -> (k, hidden_size). k may be zero."""
+        delta = self.proj(self.in_norm(h))
+        return self.scale * self.out_norm(self.base + self.gate * delta)
 
 
 def oracle_vector(batch):
@@ -99,7 +184,7 @@ def oracle_vector(batch):
 
     This deliberately leaks the answer. A node's feature is the embedding of that node's
     abstract — the very abstract the model is asked to write — which is why
-    GraphSAGEEncoder masks it before any message passing. Here the mask is skipped and the
+    GraphEncoder masks it before any message passing. Here the mask is skipped and the
     encoder bypassed entirely, so the adapter receives a perfect 1,024-d description of the
     target and no graph at all.
 
@@ -183,13 +268,14 @@ if __name__ == "__main__":
 
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gnn-layers", type=int, default=GNN_LAYERS)
+    ap.add_argument("--gnn-conv", choices=["sage", "gatv2"], default=GNN_CONV)
     args = ap.parse_args()
 
     data = load_graph()
     with open(os.path.join(FROZEN_DIR, "splits_eligible.json")) as f:
         seeds = json.load(f)["train"]
 
-    model = GraphSAGEEncoder(num_layers=args.gnn_layers)
+    model = GraphEncoder(num_layers=args.gnn_layers, conv=args.gnn_conv)
     print(model)
     print(f"\ntrainable parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -197,22 +283,23 @@ if __name__ == "__main__":
                                   gnn_layers=args.gnn_layers)))
     model.eval()
     with torch.no_grad():
-        out = model(batch.x, batch.edge_index, batch.batch_size)
+        h = model(batch.x, batch.edge_index, batch.batch_size)
+    out = h[:batch.batch_size]
 
     print(f"\nbatch: {batch.num_nodes} nodes, {batch.num_edges} edges, "
           f"batch_size {batch.batch_size}")
-    print(f"output: {tuple(out.shape)}, norms {out.norm(dim=1).min():.3f}"
-          f"–{out.norm(dim=1).max():.3f}")
-    assert out.shape == (batch.batch_size, OUT_CHANNELS)
+    print(f"output: {tuple(h.shape)} (all rows), seeds {tuple(out.shape)}, "
+          f"norms {out.norm(dim=1).min():.3f}–{out.norm(dim=1).max():.3f}")
+    assert h.shape == (batch.num_nodes, OUT_CHANNELS)
 
-    # The seed's own embedding must not reach the output — that is the whole point
+    # The seed's own embedding must not reach the seed's output — that is the whole point
     # of the mask, and a silent failure here would leak the target abstract.
     perturbed = batch.x.clone()
     perturbed[:batch.batch_size] = torch.randn_like(perturbed[:batch.batch_size])
     with torch.no_grad():
-        out2 = model(perturbed, batch.edge_index, batch.batch_size)
+        out2 = model(perturbed, batch.edge_index, batch.batch_size)[:batch.batch_size]
     assert torch.equal(out, out2), "seed features leak into the output"
-    print("seed features do not affect the output (mask works)")
+    print("seed features do not affect the seed output (mask works)")
 
     # The oracle must be the seed's own feature and nothing else — if it silently returned
     # the masked or aggregated vector, the ceiling run would quietly measure the graph again.
@@ -263,12 +350,47 @@ if __name__ == "__main__":
             f"the {name} decoder moved {changed.tolist()} (keys, values)"
     print("separate decoders: the key decoder moves only keys, the value decoder only values")
 
-    # End to end, with the gate open so the trunk actually sits on the path — a
-    # shape or dtype break between the two halves shows up here.
+    # --- neighbour token adapter -------------------------------------------
+    from graph import select_neighbour_rows
+
+    ntoken = NeighbourTokenAdapter()
+    print(f"\nneighbour token adapter parameters: "
+          f"{sum(p.numel() for p in ntoken.parameters()):,}")
+
+    # A stand-in for Qwen3's embedding matrix; the real one is passed in train.py.
+    ntoken.match_embeddings(torch.randn(1000, HIDDEN_SIZE) * 0.02)
+    one = next(iter(make_loader(data, seeds[:1], batch_size=1, shuffle=False,
+                                gnn_layers=args.gnn_layers)))
+    with torch.no_grad():
+        h_one = model(one.x, one.edge_index, one.batch_size)
+        rows = select_neighbour_rows(one)
+        tokens = ntoken(h_one[rows])
+    print(f"seed {int(one.n_id[0])}: {len(rows)} neighbour tokens, {tuple(tokens.shape)}, "
+          f"norms {tokens.norm(dim=1).min():.2f}–{tokens.norm(dim=1).max():.2f}")
+    assert tokens.shape == (len(rows), HIDDEN_SIZE)
+
+    # gate=0 is the ablation that keeps the slots and removes their content, so every
+    # token must be the *same* vector — the neighbour-token twin of the prefix's gate=0.
+    assert torch.allclose(tokens, tokens[:1].expand_as(tokens), atol=1e-6), \
+        "gate is zero but the neighbours still move their tokens"
+    print("gate=0: every neighbour token is the same learned vector")
+
+    with torch.no_grad():
+        ntoken.gate.fill_(1.0)
+        opened = ntoken(h_one[rows])
+    assert not torch.allclose(opened, opened[:1].expand_as(opened), atol=1e-6), \
+        "opening the gate left every neighbour token identical"
+    print("gate=1: each neighbour token differs")
+
+    # End to end, with both gates open so the trunk and the projection sit on the path —
+    # a shape or dtype break between the halves shows up here.
     model.train()
     adapter.train()
-    adapter(model(batch.x, batch.edge_index, batch.batch_size)).square().mean().backward()
-    missing = [n for n, p in [*model.named_parameters(), *adapter.named_parameters()]
-               if p.grad is None]
+    ntoken.train()
+    h = model(batch.x, batch.edge_index, batch.batch_size)
+    loss = adapter(h[:batch.batch_size]).square().mean() + ntoken(h[batch.batch_size:]).square().mean()
+    loss.backward()
+    missing = [n for n, p in [*model.named_parameters(), *adapter.named_parameters(),
+                              *ntoken.named_parameters()] if p.grad is None]
     assert not missing, f"no gradient reached: {missing}"
-    print("gradients reach every parameter of both modules")
+    print("gradients reach every parameter of all three modules")

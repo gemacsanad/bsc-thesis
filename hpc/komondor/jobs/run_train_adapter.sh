@@ -10,34 +10,43 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# GRAPH + LoRA. This IS a result arm — the headline number of the whole soft-prompt-only
-# stage, and the first graph run measured on an apparatus that works.
+# STAGE 9 — per-neighbour tokens, GATv2 and r=64, all three at once.
 #
-# Trains the GraphSAGE encoder and prefix adapter against Qwen3-14B, soft-prompt-only: the
-# prompt is one fixed system message and user turn with no references, so the prefix is the
-# only channel to the paper (src/adapter/text.py). See docs/soft_prompt_only.md, step 5.
+# Trains the graph encoder, prefix adapter and neighbour-token adapter against Qwen3-14B,
+# soft-prompt-only: the prompt is one fixed system message and user turn with no references,
+# so the graph is the only channel to the paper (src/adapter/text.py).
+# See docs/soft_prompt_only.md, step 6.
 #
-# Why rerun a configuration that already produced a null. Steps 1 and 2 held the LLM frozen and
-# read ~chance identifiability as "the graph contributes nothing". Step 4 then ran the oracle
-# — a perfect target vector through the same 32-token, 40-layer prefix — twice, frozen and with
-# LoRA, and top-1 identifiability moved from 0.4% to 12.0% (chance 0.11%) with no change to the
-# channel at all. The prefix was always carrying paper identity; a frozen Qwen could not read
-# it. That makes every graph null so far a measurement of a crippled apparatus, and this run is
-# what replaces them.
+# What step 5 found, and why this is the answer to it. Step 5 added LoRA to the graph arm and
+# it got WORSE: judge accuracy 1.737 -> 1.490, distinct abstracts 809 -> 453 of 945, top-1
+# identifiability 1.69% -> 0.95%. That is not noise, it is conditioning collapse — given a
+# prefix carrying little about the paper, a decoder with the capacity to adapt learns to
+# ignore it and emit a good generic abstract instead. The oracle arm rules out the channel as
+# the cause: a *perfect* target vector through the identical 32-token, 40-layer prefix reaches
+# 11.96% top-1. The channel works; the single pooled 1024-d vector is what does not carry the
+# paper. So the fix has to add information, not capacity.
 #
-# Exactly one thing changes against step 2's graph run (checkpoints/qwen14b-graphonly-kv192):
+# Three changes against step 5 (checkpoints/qwen14b-graphonly-kv192-lora):
 #
-#   --lora    trains rank-16 adapters on the LLM's q/v projections alongside the prefix.
+#   neighbour tokens   each 1-hop reference becomes its own input embedding, prepended to the
+#                      prompt (config.NUM_NEIGHBOUR_TOKENS = 64, chosen by centroid distance).
+#                      This is the one that removes the compression; the other two are cheap
+#                      riders on the same run.
+#   --gnn-conv gatv2   learned attention over the references instead of an unweighted mean.
+#   LoRA r=64          four times the rank, plus k_proj, which the neighbour tokens need —
+#                      their keys are computed rather than supplied (src/adapter/lora.py).
 #
-# Everything else is held: same 2-layer encoder, same kv192 adapter, same graph-only prompt,
-# same 10 epochs, same node sets. That discipline is deliberate. Step 4 changed two things at
-# once (LoRA and the oracle) and its 1.25 -> 2.71 therefore cannot be split between them; this
-# run is the control that makes the next architecture decision attributable.
+# Three at once is a deliberate trade against the single-change discipline the earlier steps
+# kept, and it costs attribution: a gain cannot be split between them from this run alone.
+# It was taken because GPU time is short. The ablations that recover the attribution are all
+# cheap and generation-only, and run_generate_eval.sh already carries two of them (gate0 and
+# ngate0) against these same weights.
 #
-# Qwen3-14B's own weights are never written; only checkpoints/epoch*.pt are written (~560 MB
-# each: 145 MB of adapter weights plus AdamW's two moment buffers, which --resume needs, and
-# ~126 MB more than the frozen runs because the LoRA tensors and their moments now ride along.
-# 10 epochs at ~560 MB is ~5.6 GB if every epoch improves — watch the quota).
+# Qwen3-14B's own weights are never written; only checkpoints/epoch*.pt are written. They are
+# larger than step 5's ~560 MB: LoRA goes from 10.5M parameters to ~42M at r=64 with k_proj
+# added, and the neighbour-token adapter adds 5.3M, each carrying AdamW's two moment buffers
+# on top. Budget ~1 GB per epoch and watch the quota — 10 epochs is ~10 GB if every epoch
+# improves.
 #
 # Metrics go live to Weights & Biases. WANDB_KEY is read from the repo-root .env by train.py itself
 # (not passed on the command line), the same way train_graphsage_full.py does it.
@@ -56,16 +65,17 @@
 # so they are changed in one place and this script does not restate them. What is passed below
 # is only what differs between two submissions.
 #
-# --epochs is NOT passed, so config.EPOCHS = 10 applies — the same budget steps 1, 2 and 4 had.
-# Holding it there is part of the single-change discipline above: a graph arm trained for a
+# --epochs is NOT passed, so config.EPOCHS = 10 applies — the same budget every step since 1
+# has had. That one IS held, even though three other things move: an arm trained for a
 # different number of epochs than the run it is compared against would confound the comparison
-# the same way step 4's two simultaneous changes did. Early stopping (PATIENCE = 2) ends it
-# sooner if it is going to.
+# on top of the three changes already being made. Early stopping (PATIENCE = 2) ends it sooner
+# if it is going to.
 #
-# Walltime: step 4 ran this budget with LoRA on graph-only sequences and finished, so 48 h is
-# no longer a guess for the epoch count — but the encoder now trains too (it was bypassed
-# under --oracle), which adds a sampled 2-hop neighbourhood load and a backward pass per step.
-# Expect it to be slower than step 4, not faster. The resume below covers a timeout.
+# Walltime: step 5 ran this budget end to end with the encoder training, so 48 h is measured
+# rather than guessed for the *old* sequence length. This run adds up to 64 input tokens per
+# node on top of a ~250-token prompt, so the forward is roughly 25% longer, and r=64 on three
+# projections costs more in the backward. Expect it to be slower than step 5. The resume
+# below covers a timeout.
 #
 # Encoder depth: edit --gnn-layers and CKPT_DIR below, submit, then edit them again for the
 # next depth. That is safe, and only because it is *this* file: sbatch copies the batch script
@@ -87,20 +97,19 @@ SIF=$BASE_DIR/adapter-qwen-gpu.sif
 # best.pt is a fixed name, so sharing a directory with the Vicuna checkpoints would resume from
 # and overwrite the wrong run. train.py refuses a resume across a change of --sets or
 # --gnn-layers, but it has no way to know the base model changed underneath it.
-# graphonly-kv192-lora: the graph run on the kv192 adapter, with LoRA. Its own directory, and
-# NOT step 2's checkpoints/qwen14b-graphonly-kv192: train.py refuses to resume across a change
-# of --lora (the prefix would continue against LLM weights it never saw), but best.pt is a fixed
-# name in both, so pointing this at step 2's directory would abort the job at startup at best
-# and overwrite step 2's result at worst. Step 2's directory is the comparison arm for this
-# run — leave it intact. Same argument against checkpoints/qwen14b-oracle-kv192-lora, which
-# holds step 4's ceiling run and differs only by --oracle.
+# ntok64-gatv2-lora64: its own directory, and NOT step 5's
+# checkpoints/qwen14b-graphonly-kv192-lora. train.py refuses to resume across a change of
+# --gnn-conv or --neighbour-tokens, so the mistake aborts rather than trains — but best.pt is
+# a fixed name in every one of these directories, so pointing this at step 5's would overwrite
+# the arm this run is measured against. Step 5's directory is the comparison; leave it intact.
+# Same argument against checkpoints/qwen14b-oracle-kv192-lora, which holds the ceiling run.
 # graphonly: separate from checkpoints/qwen14b/, which holds the text-path run. train.py refuses
 # to resume across a prompt change, but the fixed best.pt name would still be overwritten.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly-kv192-lora
-LORA=1                                  # also trains LoRA on the LLM's q/v projections. ON here,
-                                        # and it is the point of the run: every *graph* arm so
-                                        # far has held the LLM frozen, so every graph null is a
-                                        # statement about a frozen model only
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-ntok64-gatv2-lora64
+LORA=1                                  # rank 64 on q/k/v, per config.py. ON here and not
+                                        # optional: the neighbour tokens are input embeddings,
+                                        # so without k_proj the model cannot learn to attend
+                                        # to them at all
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
@@ -142,10 +151,20 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # that can go wrong yields fluent text rather than an error.
     [ -n "${LORA:-}" ] && { python verify_lora_prefix.py || exit 1; }
 
+    # Cheap and CPU-only (~15 s): proves the neighbour tokens mean the same thing in the
+    # one-pass forward training uses and the two-pass prefill generation uses, and that
+    # the 1-hop selection picks the seed own references in neighbour_cap order. Every way
+    # this can be wrong yields fluent text rather than an error.
+    # NOTE: no apostrophes inside this block — it is one single-quoted argument to
+    # bash -lc, and an apostrophe silently ends the quote and splits the script.
+    python verify_neighbour_tokens.py || exit 1
+
     python train.py \
         --gnn-layers 2 \
+        --gnn-conv gatv2 \
+        --neighbour-tokens 64 \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "graphonly-qwen14b-kv192-lora-$SLURM_JOB_ID" \
+        --wandb-run "ntok64-gatv2-lora64-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '

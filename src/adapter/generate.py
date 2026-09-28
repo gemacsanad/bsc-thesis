@@ -68,10 +68,10 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
-                    FROZEN_DIR, GNN_LAYERS, JOINT_DIR,
+                    FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR,
                     MAX_LENGTH, MAX_NEW_TOKENS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
-from graph import load_graph, make_loader
-from model import GraphSAGEEncoder, PrefixAdapter, oracle_vector
+from graph import load_graph, make_loader, select_neighbour_rows
+from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
 from prefix_generation import generate_with_prefix, patch_for_prefix
 from text import PROMPT, Corpus, graph_only_example
 
@@ -129,12 +129,23 @@ def load_adapter(path, device, sets, llm, oracle):
         f"has --oracle {'set' if oracle else 'not set'}; the adapter would be fed a kind of "
         f"vector it was never trained on")
     gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
-    encoder = GraphSAGEEncoder(num_layers=gnn_layers).to(device)
+    gnn_conv = checkpoint.get("gnn_conv", "sage")  # everything before stage 9 was GraphSAGE
+    encoder = GraphEncoder(num_layers=gnn_layers, conv=gnn_conv).to(device)
     adapter = PrefixAdapter().to(device)
     encoder.load_state_dict(remap_encoder(checkpoint["encoder"]))
     adapter.load_state_dict(checkpoint["adapter"])
     encoder.eval()
     adapter.eval()
+
+    # Read off the checkpoint, never off config.py: the neighbour-token width is part of the
+    # sequence the prefix was trained beside, so a run generated at a different k would be
+    # fluent and wrong. `strict` loading also catches a checkpoint whose ntoken is absent.
+    ntoken = None
+    n_tokens = checkpoint.get("neighbour_tokens", 0)
+    if n_tokens:
+        ntoken = NeighbourTokenAdapter(max_tokens=n_tokens).to(device)
+        ntoken.load_state_dict(checkpoint["ntoken"])
+        ntoken.eval()
 
     lora = checkpoint.get("lora")     # None for every checkpoint trained without --lora
     if lora is not None:
@@ -143,15 +154,20 @@ def load_adapter(path, device, sets, llm, oracle):
         load_lora_state(llm, lora)
 
     print(f"loaded {path} (epoch {checkpoint['epoch']}, step {checkpoint['step']}, "
-          f"{gnn_layers}-layer encoder, "
+          f"{gnn_layers}-layer {gnn_conv} encoder, "
+          f"{n_tokens or 'no'} neighbour tokens, "
           f"{'LoRA restored' if lora is not None else 'frozen LLM'})")
-    return encoder, adapter, gnn_layers
+    return encoder, adapter, ntoken, gnn_layers
 
 
 @torch.no_grad()
-def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers, oracle=False):
-    """Yield `(node_id, prefix)` for each node, in the order given. `prefix` is None in
-    baseline mode.
+def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, oracle=False):
+    """Yield `(node_id, prefix, neighbour_tokens)` for each node, in the order given.
+
+    Both tensors are None in baseline mode; `neighbour_tokens` is also None for a checkpoint
+    trained without them. The two come out of ONE encoder pass, the same way training builds
+    them, so the pooled prefix and the neighbour tokens can never describe different
+    neighbourhoods.
 
     In adapter mode the order comes from `NeighborLoader(shuffle=False)`, and the node_id is
     read back off the batch rather than assumed, so a row can never be paired with another
@@ -159,20 +175,31 @@ def iter_prefixes(node_ids, encoder, adapter, data, device, gnn_layers, oracle=F
     """
     if encoder is None:
         for node_id in node_ids:
-            yield node_id, None
+            yield node_id, None, None
         return
 
     for batch in make_loader(data, node_ids, batch_size=1, shuffle=False,
                              gnn_layers=gnn_layers):
         batch = batch.to(device)
-        graph_vector = (oracle_vector(batch) if oracle
-                        else encoder(batch.x, batch.edge_index, batch.batch_size))
-        yield int(batch.n_id[0]), adapter(graph_vector)
+        tokens = None
+        if oracle:
+            graph_vector = oracle_vector(batch)
+        else:
+            h = encoder(batch.x, batch.edge_index, batch.batch_size)
+            graph_vector = h[:batch.batch_size]
+            if ntoken is not None:
+                rows = select_neighbour_rows(batch, ntoken.max_tokens)
+                tokens = ntoken(h[rows]).unsqueeze(0)
+        yield int(batch.n_id[0]), adapter(graph_vector), tokens
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["baseline", "adapter", "gate0"], required=True)
+    ap.add_argument("--mode", choices=["baseline", "adapter", "gate0", "ngate0"],
+                    required=True,
+                    help="gate0 disconnects the graph from BOTH channels; ngate0 keeps the "
+                         "k neighbour slots and empties them, which separates 'k tokens "
+                         "help' from 'their content helps'")
     ap.add_argument("--checkpoint", default=os.path.join(CHECKPOINT_DIR, "epoch2.pt"),
                     help="train.py checkpoint; --mode adapter only")
     ap.add_argument("--model", default=BASE_MODEL)
@@ -219,11 +246,11 @@ def main():
     llm.config.use_cache = True            # train.py disables it; decoding needs it back
     llm.eval()
 
-    encoder = adapter = data = None
+    encoder = adapter = ntoken = data = None
     gnn_layers = GNN_LAYERS
     if args.mode != "baseline":
-        encoder, adapter, gnn_layers = load_adapter(args.checkpoint, device, args.sets, llm,
-                                                    args.oracle)
+        encoder, adapter, ntoken, gnn_layers = load_adapter(args.checkpoint, device,
+                                                            args.sets, llm, args.oracle)
         if args.oracle:
             print("=" * 78, "\nORACLE CEILING RUN — the adapter is fed the target abstract's "
                   "own embedding.\nThis arm sees the answer. Its score is a ceiling on the "
@@ -235,9 +262,27 @@ def main():
         if args.mode == "gate0":
             with torch.no_grad():
                 adapter.gate.zero_()
-            print("gate forced to zero — the prefix is node-independent from here on")
+                # Both channels, or this stops being the "no graph" arm: with the neighbour
+                # tokens still open, zeroing only the prefix would leave the graph's larger
+                # channel running and the control would measure nothing it claims to.
+                if ntoken is not None:
+                    ntoken.gate.zero_()
+            print("both gates forced to zero — prefix and neighbour tokens are "
+                  "node-independent from here on")
+        if args.mode == "ngate0":
+            # Not a no-op on a pooled-only checkpoint — it would be the *adapter* arm under
+            # another name, and land in a directory labelled as an ablation.
+            assert ntoken is not None, (
+                f"--mode ngate0 needs a checkpoint trained with neighbour tokens; "
+                f"{args.checkpoint} has none")
+            with torch.no_grad():
+                ntoken.gate.zero_()
+            print("neighbour gate forced to zero — the k slots stay, their content goes")
         data = load_graph()                                # stays on CPU; sampling runs there
-        patch_for_prefix(llm, NUM_PREFIX_TOKENS)
+        # The neighbour tokens are prefilled into the cache before generate() sees it, so the
+        # cache runs P..P+k long and k varies with the node's out-degree.
+        patch_for_prefix(llm, NUM_PREFIX_TOKENS,
+                         max_extra=ntoken.max_tokens if ntoken is not None else 0)
 
     # After any LoRA injection: peft builds its modules in train mode, and lora_dropout would
     # otherwise be live at generation time, making greedy decoding non-deterministic.
@@ -260,7 +305,10 @@ def main():
     # --- generate ---------------------------------------------------------
     # The prefix occupies real attention positions, so it is charged against the context in
     # both modes — the two CSVs must overflow on the same nodes to stay comparable.
-    budget = MAX_LENGTH - NUM_PREFIX_TOKENS - args.max_new_tokens
+    # The neighbour tokens occupy real attention positions too, so the whole graph side is
+    # charged against the context: P + k + prompt + generation must fit MAX_LENGTH.
+    budget = (MAX_LENGTH - NUM_PREFIX_TOKENS - args.max_new_tokens
+              - (ntoken.max_tokens if ntoken is not None else 0))
     overflowed = 0
 
     # One dict for both branches: the conditions must not drift apart in how they decode, and
@@ -269,9 +317,10 @@ def main():
                     repetition_penalty=REPETITION_PENALTY,
                     pad_token_id=tokenizer.pad_token_id)
 
-    for i, (node_id, prefix) in enumerate(iter_prefixes(eval_nodes, encoder, adapter, data,
-                                                        device, gnn_layers, args.oracle),
-                                          start=1):
+    for i, (node_id, prefix, tokens) in enumerate(
+            iter_prefixes(eval_nodes, encoder, adapter, ntoken, data, device, gnn_layers,
+                          args.oracle),
+            start=1):
         if node_id in done:
             continue
 
@@ -280,7 +329,8 @@ def main():
         n_tokens = input_ids.size(1)
 
         print(f"[{i}/{len(eval_nodes)}] node_id={node_id}  refs={corpus.out_degree(node_id)}  "
-              f"prompt_tokens={n_tokens}", flush=True)
+              f"prompt_tokens={n_tokens}  "
+              f"neighbour_tokens={0 if tokens is None else tokens.size(1)}", flush=True)
 
         if n_tokens > budget:
             overflowed += 1
@@ -292,7 +342,9 @@ def main():
                     new_tokens = out[0, n_tokens:]
                 else:
                     new_tokens = generate_with_prefix(
-                        llm, input_ids, prefix.to(dtype), **decoding)
+                        llm, input_ids, prefix.to(dtype),
+                        neighbour_tokens=None if tokens is None else tokens.to(dtype),
+                        **decoding)
                 generated = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
             except torch.cuda.OutOfMemoryError as e:
                 generated = f"ERROR: CUDA out of memory — {e}"

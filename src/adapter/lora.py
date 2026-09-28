@@ -1,11 +1,20 @@
 """
-Stage 4b — LoRA adapters on the otherwise frozen Vicuna-7B.
+Stage 4b — LoRA adapters on the otherwise frozen LLM.
 
-The prefix enters the LLM through attention, as extra keys and values. `q_proj` and `v_proj`
-are therefore the projections that decide how much of it the model can read, and tuning those
-two is the smallest change that lets the LLM learn to use the prefix rather than merely
-tolerate it. Wider targets (adding `k_proj`/`o_proj`, or the MLP) are more capacity for the
-LLM to learn the task on its own — which is the same capacity that lets it ignore the graph.
+The KV prefix enters the LLM through attention, as extra keys and values. It supplies those
+directly, so `k_proj` and `v_proj` never touch it and `q_proj` alone decides how much of it
+the model can read. That was the whole target list until stage 9, and the reasoning behind
+stopping there still stands: wider targets (`o_proj`, the MLP) are more capacity for the LLM
+to learn the task on its own — which is the same capacity that lets it ignore the graph.
+Step 5 measured that happening. Given a prefix carrying little, r=16 on q/v spent itself
+learning a template: 453 distinct abstracts out of 945, and judge accuracy *below* the frozen
+run it was meant to improve on.
+
+`k_proj` joins the list in stage 9, and only because the neighbour tokens are a different
+kind of object. They are ordinary input embeddings, so unlike the prefix their keys are
+*computed* by `k_proj` at every layer. With it frozen the model has no way to make the new
+tokens attendable, whatever else it learns — so this is the projection the new channel
+depends on, not general capacity. See config.LORA_TARGETS.
 
 `inject_adapter_in_model`, not `get_peft_model`
 -----------------------------------------------

@@ -6,6 +6,7 @@ Usage:
     python adapter/train.py --sets legacy                       # the old 4,000/495 run
     python adapter/train.py --gnn-layers 3 --out-dir checkpoints/gnn3
     python adapter/train.py --oracle --epochs 2                 # ceiling run, see --oracle
+    python adapter/train.py --gnn-conv sage --neighbour-tokens 0  # the step-5 architecture
 """
 
 import argparse
@@ -21,11 +22,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
 
 from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE,
-                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
-                    LEARNING_RATE, LOG_EVERY, LORA_R, LORA_TARGETS, NUM_PREFIX_TOKENS,
-                    PATIENCE, SEED, WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
-from graph import load_graph, make_loader
-from model import GraphSAGEEncoder, PrefixAdapter, oracle_vector
+                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GNN_CONV, GNN_LAYERS, GRAD_ACCUM,
+                    GRAD_CLIP, HIDDEN_SIZE, LEARNING_RATE, LOG_EVERY, LORA_R,
+                    LORA_TARGETS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE, SEED,
+                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
+from graph import load_graph, make_loader, select_neighbour_rows
+from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
 from text import PROMPT, Corpus, encode, graph_only_example
 
 # Which frozen node sets to train on. Since the soft-prompt-only change the prompt no longer
@@ -120,22 +122,63 @@ def sliced_loss(llm, hidden, labels):
     return F.cross_entropy(logits, labels[:, 1:][keep])
 
 
-def step_loss(llm, encoder, adapter, batch, input_ids, labels, mask, dtype, oracle=False):
-    """One forward pass. Returns (mean loss over this batch's target tokens, the prefix)."""
-    graph_vector = oracle_vector(batch) if oracle else encoder(
-        batch.x, batch.edge_index, batch.batch_size)
+def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dtype,
+              oracle=False):
+    """One forward pass. Returns (mean loss over this batch's target tokens, the prefix).
+
+    Two graph channels reach the LLM here, and they are deliberately different kinds of thing:
+
+      * the **pooled** seed embedding becomes a 32-token KV prefix injected at all 40 layers
+        (PrefixAdapter) — unchanged since step 2, so every earlier run stays comparable;
+      * each **1-hop neighbour** becomes one ordinary input embedding prepended to the prompt
+        (NeighbourTokenAdapter), so the 40 layers compute on it rather than only attend to it.
+
+    Sequence layout, and the one cache_position convention generation must match:
+
+        positions 0 .. P-1          KV prefix (in the cache, never in inputs_embeds)
+        positions P .. P+k-1        neighbour tokens
+        positions P+k .. P+k+L-1    the prompt and the target abstract
+
+    `ntoken` is None in oracle mode: that arm bypasses the encoder entirely, so there are no
+    neighbour embeddings to project, and keeping k=0 leaves the ceiling run byte-identical to
+    the one already measured.
+    """
+    p, (b, length) = NUM_PREFIX_TOKENS, input_ids.shape
+    device = input_ids.device
+
+    neighbour_tokens, k = None, 0
+    if oracle:
+        graph_vector = oracle_vector(batch)
+    else:
+        h = encoder(batch.x, batch.edge_index, batch.batch_size)
+        graph_vector = h[:batch.batch_size]
+        if ntoken is not None:
+            rows = select_neighbour_rows(batch, ntoken.max_tokens)
+            neighbour_tokens = ntoken(h[rows]).unsqueeze(0).to(dtype)   # (1, k, hidden)
+            k = neighbour_tokens.size(1)
+
     prefix = adapter(graph_vector).to(dtype)
 
-    p, (b, length) = NUM_PREFIX_TOKENS, input_ids.shape
-    prefix_mask = torch.ones(b, p, dtype=mask.dtype, device=mask.device)
+    # Embedding lookup by hand, because the neighbour tokens have no token ids to look up:
+    # the model is called with inputs_embeds, so the prompt has to be embedded here too.
+    embeds = llm.model.embed_tokens(input_ids)
+    if k:
+        embeds = torch.cat([neighbour_tokens, embeds], dim=1)
+        # -100 over the neighbour positions: they are conditioning, never predicted. The
+        # shift in sliced_loss is computed over this padded tensor, so the k rows must be
+        # present in it rather than trimmed off the hidden states afterwards.
+        labels = torch.cat([torch.full((b, k), -100, dtype=labels.dtype, device=device),
+                            labels], dim=1)
+
+    attention = torch.cat([torch.ones(b, p + k, dtype=mask.dtype, device=device), mask], dim=1)
 
     # `llm.model`, not `llm`: the head is applied in sliced_loss, on the supervised rows only.
     # LoRA is injected in place by peft, so the injected modules are still inside `llm.model`.
     hidden = llm.model(
-        input_ids=input_ids,
+        inputs_embeds=embeds,
         past_key_values=PrefixCache(prefix),
-        attention_mask=torch.cat([prefix_mask, mask], dim=1),
-        cache_position=torch.arange(p, p + length, device=input_ids.device),
+        attention_mask=attention,
+        cache_position=torch.arange(p, p + k + length, device=device),
         use_cache=False,
     ).last_hidden_state
     return sliced_loss(llm, hidden, labels), prefix
@@ -153,38 +196,73 @@ def graph_fraction(adapter, prefix):
 
 
 @torch.no_grad()
-def validate(llm, encoder, adapter, loader, tokenizer, example, device, dtype,
+def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, dtype,
              oracle=False):
-    """Token-weighted mean loss, with the graph on and with the gate forced to zero.
+    """Token-weighted mean loss with the graph on, and with each gate forced to zero.
 
-    The second number is the ablation the whole design turns on — same weights, graph
-    disconnected — so it is measured every time rather than left to a separate run.
+    Three numbers rather than two since stage 9, because there are now two channels and
+    closing them together would not say which one carried anything:
+
+        graph    both channels open — the run's own loss
+        gate=0   the KV prefix disconnected; the neighbour tokens still carry the graph
+        ngate=0  the k neighbour slots kept but emptied; only the pooled prefix carries it
+
+    These are the ablations the design turns on, so they are measured every epoch rather
+    than left to a separate run — step 5 is what happens when the control is missing.
     """
     encoder.eval()
     adapter.eval()
+    if ntoken is not None:
+        ntoken.eval()
     totals = {}
 
-    for name, zero_gate in (("graph", False), ("gate=0", True)):
-        saved = adapter.gate.detach().clone()
-        if zero_gate:
-            adapter.gate.zero_()
+    gates = [("graph", []), ("gate=0", [adapter.gate])]
+    if ntoken is not None:
+        gates.append(("ngate=0", [ntoken.gate]))
+
+    for name, zeroed in gates:
+        saved = [g.detach().clone() for g in zeroed]
+        for g in zeroed:
+            g.zero_()
 
         loss_sum = token_sum = 0
         for batch in loader:
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
             n_tokens = int((labels != -100).sum())
-            loss, _ = step_loss(llm, encoder, adapter, batch.to(device),
+            loss, _ = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
                                 input_ids, labels, mask, dtype, oracle)
             loss_sum += loss.item() * n_tokens
             token_sum += n_tokens
 
-        adapter.gate.copy_(saved)
+        for g, was in zip(zeroed, saved):
+            g.copy_(was)
         totals[name] = loss_sum / token_sum
 
     encoder.train()
     adapter.train()
+    if ntoken is not None:
+        ntoken.train()
     return totals
+
+
+def report(losses):
+    """The validation line: each channel's loss and what closing it costs."""
+    parts = [f"graph {losses['graph']:.4f}"]
+    for name in ("gate=0", "ngate=0"):
+        if name in losses:
+            parts.append(f"{name} {losses[name]:.4f} ({losses[name] - losses['graph']:+.4f})")
+    return "  ".join(parts)
+
+
+def logged(losses):
+    """The same numbers, keyed for W&B. 'delta' keeps its old meaning — the prefix ablation."""
+    out = {"valid/graph": losses["graph"], "valid/gate0": losses["gate=0"],
+           "valid/delta": losses["gate=0"] - losses["graph"]}
+    if "ngate=0" in losses:
+        out["valid/ngate0"] = losses["ngate=0"]
+        out["valid/ndelta"] = losses["ngate=0"] - losses["graph"]
+    return out
 
 
 def main():
@@ -193,9 +271,18 @@ def main():
     # W&B project — is a constant in config.py, so the job script does not restate it.
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--gnn-layers", type=int, default=GNN_LAYERS,
-                    help="GraphSAGE encoder depth; also sets how many hops the loader "
+                    help="encoder depth; also sets how many hops the loader "
                          "samples, so the two can never disagree. A flag rather than a "
                          "config edit because two depths get submitted minutes apart")
+    ap.add_argument("--gnn-conv", choices=["sage", "gatv2"], default=GNN_CONV,
+                    help="message-passing layer: 'gatv2' weights each reference by learned "
+                         "attention, 'sage' takes the unweighted mean and reproduces every "
+                         "run up to step 5. Recorded in the checkpoint; a resume across a "
+                         "change of it is refused, since the parameter names differ")
+    ap.add_argument("--neighbour-tokens", type=int, default=NUM_NEIGHBOUR_TOKENS,
+                    help="ceiling on 1-hop neighbours given their own input token, chosen "
+                         "by centroid distance. 0 disables the channel and reproduces the "
+                         "pooled-only runs. Ignored under --oracle, which has no encoder")
     ap.add_argument("--sets", choices=sorted(SETS), default=DEFAULT_SETS,
                     help="which frozen node sets to train on; 'legacy' reproduces the "
                          "uncapped 4,000/495 runs")
@@ -214,8 +301,10 @@ def main():
                          "frozen LLM at all. The arm sees the answer, so its score is not "
                          "comparable to any arm that does not")
     ap.add_argument("--lora", action="store_true",
-                    help="also train LoRA adapters on the LLM's q/v projections (lora.py). "
-                         "Without it the LLM is frozen, as in every run up to now")
+                    help="also train LoRA adapters on the LLM's attention projections "
+                         "(config.LORA_TARGETS, lora.py). Without it the LLM is frozen. "
+                         "Not optional alongside --neighbour-tokens: those are input "
+                         "embeddings, and k_proj is what makes them attendable")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
@@ -283,15 +372,32 @@ def main():
     llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     llm.train()
 
-    encoder = GraphSAGEEncoder(num_layers=args.gnn_layers).to(device)
+    encoder = GraphEncoder(num_layers=args.gnn_layers, conv=args.gnn_conv).to(device)
     adapter = PrefixAdapter().to(device)
+
+    # None disables the channel entirely rather than running it with k=0: the module would
+    # otherwise sit in the optimizer collecting no gradient, and its (untrained) weights
+    # would ride into the checkpoint as if the arm had used them. Under --oracle there is
+    # no encoder output to project, so the ceiling run keeps the layout it was measured on.
+    ntoken = None
+    if args.neighbour_tokens and not args.oracle:
+        ntoken = NeighbourTokenAdapter(max_tokens=args.neighbour_tokens).to(device)
+        # Scale the tokens to the norm of a real Qwen3 embedding before any training —
+        # an out-of-distribution input embedding degrades quietly, it does not raise.
+        ntoken.match_embeddings(llm.model.embed_tokens.weight)
+        print(f"neighbour tokens: up to {args.neighbour_tokens} per node, "
+              f"{sum(p.numel() for p in ntoken.parameters()):,} parameters, "
+              f"scaled to embedding norm {float(ntoken.scale) * HIDDEN_SIZE ** 0.5:.3f}")
+
     # In oracle mode the encoder is bypassed, so its parameters would sit in the optimizer
     # collecting no gradient. Excluding them keeps the reported count honest.
     encoder_params = [] if args.oracle else list(encoder.parameters())
-    trainable = encoder_params + list(adapter.parameters()) + lora_params
+    ntoken_params = list(ntoken.parameters()) if ntoken is not None else []
+    trainable = encoder_params + list(adapter.parameters()) + ntoken_params + lora_params
     n_trainable = sum(p.numel() for p in trainable)
     which = ("encoder bypassed (oracle)" if args.oracle else
-             f"{args.gnn_layers}-layer encoder over {args.gnn_layers} sampled hops")
+             f"{args.gnn_layers}-layer {args.gnn_conv} encoder over "
+             f"{args.gnn_layers} sampled hops")
     print(f"{which}; trainable parameters: {n_trainable:,}")
 
     optimizer = AdamW(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -316,7 +422,10 @@ def main():
                     "train_nodes": len(sets["train"]), "valid_nodes": len(sets["valid"]),
                     "learning_rate": LEARNING_RATE, "weight_decay": WEIGHT_DECAY,
                     "warmup_steps": WARMUP_STEPS, "grad_clip": GRAD_CLIP,
-                    "num_prefix_tokens": NUM_PREFIX_TOKENS},
+                    "num_prefix_tokens": NUM_PREFIX_TOKENS,
+                    "gnn_conv": args.gnn_conv,
+                    "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
+                    "lora_r": LORA_R, "lora_targets": list(LORA_TARGETS)},
         )
 
     # Early-stopping state lives in the checkpoint: a 10-epoch run does not fit one job, so
@@ -348,6 +457,18 @@ def main():
         assert was_layers == args.gnn_layers, (
             f"{args.resume} was trained with {was_layers} GNN layers but --gnn-layers is "
             f"{args.gnn_layers}; use a separate --out-dir per depth")
+        # A conv mismatch fails on the parameter names below, but only after the 29.6 GB
+        # model is on the card, and the message would name tensors rather than the mistake.
+        was_conv = ckpt.get("gnn_conv", "sage")  # everything before stage 9 was GraphSAGE
+        assert was_conv == args.gnn_conv, (
+            f"{args.resume} was trained with the '{was_conv}' encoder but --gnn-conv is "
+            f"'{args.gnn_conv}'; the layers differ, so use a separate --out-dir")
+        # Neighbour tokens change the sequence the prefix sits beside, so a prefix trained
+        # with them would continue against a shorter context it never saw — fluent, no error.
+        was_ntokens = ckpt.get("neighbour_tokens", 0)   # nothing before stage 9 had them
+        assert was_ntokens == (args.neighbour_tokens if not args.oracle else 0), (
+            f"{args.resume} was trained with {was_ntokens} neighbour tokens but this run "
+            f"uses {args.neighbour_tokens}; use a separate --out-dir")
         # Resuming a LoRA run without --lora would continue a prefix against a different set
         # of LLM weights than it was trained against — no error, just a wrong continuation.
         was_lora = ckpt.get("lora") is not None
@@ -364,6 +485,8 @@ def main():
             f"abstract and the other does not, so this would not be a continuation")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
+        if ntoken is not None:
+            ntoken.load_state_dict(ckpt["ntoken"])
         if args.lora:
             load_lora_state(llm, ckpt["lora"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -388,6 +511,8 @@ def main():
     # --- train ------------------------------------------------------------
     encoder.train()
     adapter.train()
+    if ntoken is not None:
+        ntoken.train()
     running, running_n, tokens, clock = 0.0, 0, 0, time.time()
 
     for epoch in range(start_epoch, args.epochs):
@@ -395,7 +520,7 @@ def main():
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
 
-            loss, prefix = step_loss(llm, encoder, adapter, batch.to(device),
+            loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
                                      input_ids, labels, mask, dtype, args.oracle)
             (loss / GRAD_ACCUM).backward()
 
@@ -429,26 +554,24 @@ def main():
                         "gate/mean_abs": gate.abs().mean().item(),
                         "gate/max_abs": gate.abs().max().item(),
                         "gate/per_layer": wandb.Histogram(gate.numpy()),
+                        **({"gate/neighbour": float(ntoken.gate)}
+                           if ntoken is not None else {}),
                         # snapshot from the last micro-batch, not an average over the window
                         "prefix/graph_fraction": graph_fraction(adapter, prefix),
                     }, step=opt_step)
                 running, running_n, tokens, clock = 0.0, 0, 0, time.time()
 
             if opt_step % EVAL_EVERY == 0:
-                losses = validate(llm, encoder, adapter, valid_loader, tokenizer,
+                losses = validate(llm, encoder, adapter, ntoken, valid_loader, tokenizer,
                                   example, device, dtype, args.oracle)
-                print(f"  valid @ step {opt_step}: graph {losses['graph']:.4f}  "
-                      f"gate=0 {losses['gate=0']:.4f}  "
-                      f"delta {losses['gate=0'] - losses['graph']:+.4f}", flush=True)
+                print(f"  valid @ step {opt_step}: {report(losses)}", flush=True)
                 if run is not None:
-                    run.log({"valid/graph": losses["graph"],
-                             "valid/gate0": losses["gate=0"],
-                             "valid/delta": losses["gate=0"] - losses["graph"]}, step=opt_step)
+                    run.log(logged(losses), step=opt_step)
                 clock = time.time()
 
         # End-of-epoch validation is what early stopping reads. The periodic --eval-every
         # checks above exist for the curve; this one decides whether the run continues.
-        losses = validate(llm, encoder, adapter, valid_loader, tokenizer, example,
+        losses = validate(llm, encoder, adapter, ntoken, valid_loader, tokenizer, example,
                           device, dtype, args.oracle)
         improved = losses["graph"] < best_loss
         if improved:
@@ -456,21 +579,22 @@ def main():
         else:
             bad_epochs += 1
 
-        print(f"epoch {epoch + 1} valid: graph {losses['graph']:.4f}  "
-              f"gate=0 {losses['gate=0']:.4f}  delta {losses['gate=0'] - losses['graph']:+.4f}"
+        print(f"epoch {epoch + 1} valid: {report(losses)}"
               f"  {'best' if improved else f'no improvement {bad_epochs}/{PATIENCE}'}",
               flush=True)
         if run is not None:
-            run.log({"valid/graph": losses["graph"], "valid/gate0": losses["gate=0"],
-                     "valid/delta": losses["gate=0"] - losses["graph"],
-                     "valid/best": best_loss, "valid/bad_epochs": bad_epochs}, step=opt_step)
+            run.log({**logged(losses), "valid/best": best_loss,
+                     "valid/bad_epochs": bad_epochs}, step=opt_step)
 
         path = os.path.join(args.out_dir, f"epoch{epoch + 1}.pt")
         torch.save({"encoder": encoder.state_dict(), "adapter": adapter.state_dict(),
+                    "ntoken": ntoken.state_dict() if ntoken is not None else None,
                     "lora": lora_state_dict(llm) if args.lora else None,
                     "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
                     "epoch": epoch + 1, "step": opt_step, "sets": args.sets, "prompt": PROMPT,
-                    "gnn_layers": args.gnn_layers, "oracle": args.oracle,
+                    "gnn_layers": args.gnn_layers, "gnn_conv": args.gnn_conv,
+                    "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
+                    "oracle": args.oracle,
                     "valid_loss": losses["graph"], "best_loss": best_loss,
                     "bad_epochs": bad_epochs}, path)
         print(f"saved {path}")
@@ -492,9 +616,8 @@ def main():
     print(f"\nbest valid graph loss: {best_loss:.4f}  ->  {best_path}")
 
     if run is not None:
-        run.summary.update({"final/graph": losses["graph"],
-                            "final/gate0": losses["gate=0"],
-                            "final/delta": losses["gate=0"] - losses["graph"],
+        run.summary.update({**{k.replace("valid/", "final/"): v
+                               for k, v in logged(losses).items()},
                             "best/graph": best_loss,
                             "best/epoch": epoch + 1 - bad_epochs})
         run.finish()

@@ -635,3 +635,165 @@ step 2's frozen graph arm (1.7%, 1.74), which is the same encoder on the broken 
   walltime fits and the control has been lost once already.
 - **Walltime is untested with the encoder training.** Step 4 bypassed the encoder under
   `--oracle`; this run adds 2-hop neighbourhood sampling and an encoder backward pass per step.
+
+---
+
+## Step 6 — one token per neighbour, GATv2, and r=64
+
+### What step 5 actually returned
+
+The graph+LoRA rerun finished (job 14437531) and it is a **negative result**, not the
+improvement the step was designed to produce.
+
+| arm | LLM | judge acc | ROUGE-1 | distinct | top-1 ID | med rank |
+|---|---|---|---|---|---|---|
+| graph, kv192 (step 2) | frozen | 1.737 | 0.2881 | 809 | 1.69% | 152 |
+| **graph + LoRA (step 5)** | LoRA r=16 | **1.490** | 0.2829 | **453** | **0.95%** | 314 |
+| oracle + LoRA (step 4) | LoRA r=16 | 2.712 | 0.3090 | 944 | 11.96% | 17 |
+| text baseline (era 1) | frozen | 3.592 | 0.3364 | 945 | 39.4% | 2 |
+
+LoRA made the graph arm worse on every metric. The failure mode identifies itself:
+
+| | step 2 (frozen) | step 5 (LoRA) |
+|---|---|---|
+| distinct abstracts | 809 / 945 | 453 / 945 |
+| singletons | 742 | 324 |
+| largest identical cluster | 11 rows | 61 rows |
+| rows scoring 3+ | 136 | 47 |
+
+That is **conditioning collapse**. Given a prefix that carries little about the paper, a
+decoder with the capacity to adapt minimises loss by ignoring it and emitting a good generic
+abstract. LoRA did not fail to open the channel — it opened it, found little coming through,
+and learned a template.
+
+The `gate=0` arm confirmed the floor: one identical abstract ×945, judge accuracy at the
+minimum. So within the LoRA arm the graph is worth about **+0.5 judge points over nothing**,
+while LoRA itself cost about −0.25 against the frozen run. Both are true at once.
+
+### What this rules in and out
+
+Against step 4, the partition is now measured rather than argued. Same 32 tokens, same 40
+layers, same LoRA, same everything except what the adapter is fed:
+
+- fed the **true** target embedding → 11.96% top-1
+- fed the **GraphSAGE pooled** embedding → 0.95% top-1
+
+**The channel works. The single pooled 1024-d vector is what does not carry the paper.** So
+the fix has to add *information*, not capacity — which is why a bigger LoRA alone would have
+been the wrong next move, and why it is not run alone here.
+
+### What was built
+
+Three changes at once, against `checkpoints/qwen14b-graphonly-kv192-lora`.
+
+**1. One input token per 1-hop neighbour** — the change that matters. Every run up to step 5
+compressed the whole reference list into one vector before the LLM saw any of it. Now each
+reference arrives as its own token.
+
+They enter as **input embeddings**, not as KV prefix. The distinction is the point: a
+KV-prefix token is something attention can look at, an input-embedding token is something the
+40 layers *compute on* — and comparing references against each other is the operation the
+whole idea rests on. It is also 16× cheaper per token (hidden 5,120 against a KV token's
+40 × 2 × 8 × 128 = 81,920 values), so the new path is one 5.3M-parameter projection rather
+than a second 17M adapter.
+
+The sequence the model sees:
+
+```
+positions 0 .. P-1          KV prefix        (pooled seed vector, all 40 layers)
+positions P .. P+k-1        neighbour tokens (one per reference, input embeddings)
+positions P+k .. P+k+L-1    prompt and target
+```
+
+- `NUM_NEIGHBOUR_TOKENS = 64`, a ceiling not a target: a node contributes `min(out_degree, 64)`.
+  Out-degree is 5–100 (median 52), so 64 covers 64% of eval nodes whole.
+- Which 64 is decided by `neighbour_cap`'s centroid ranking — the **same score the text prompt
+  trims by**, so the graph arm and the text arm select the same references and the comparison
+  between them is about the encoding, not the sample.
+- Ordered closest-first, so RoPE position encodes relevance. This is a choice, not a neutral
+  default: a set is being given an order it does not have. Recorded as a limitation.
+- `NeighbourTokenAdapter` mirrors `PrefixAdapter`: `token = scale · LayerNorm(base + gate · proj(h))`,
+  weights shared across neighbours, `gate` initialised to zero. So training begins as ordinary
+  soft-prompt tuning, and `gate=0` at eval keeps the k slots while removing their content.
+- `scale` is set from the mean row norm of Qwen3's own embedding matrix before training. An
+  unscaled projection of GNN outputs is out of distribution for the embedding layer, and that
+  degrades quietly rather than raising.
+
+**2. GATv2 replaces GraphSAGE.** `GATv2Conv(1024, 256, heads=4)`, concatenated back to 1024, so
+swapping the aggregation does not also change the width. `--gnn-conv sage` reproduces every
+earlier run. Encoder parameters 4,203,520.
+
+**3. LoRA r 16 → 64, and `k_proj` added.** The rank is raised only now because rank is worth
+paying for once the prefix carries something to read. `k_proj` reverses the rule the earlier
+runs followed, for a specific reason: the KV prefix supplies its keys directly, so `k_proj`
+never touches it — but a neighbour token is an ordinary input embedding whose key is
+*computed* by `k_proj` at every layer. With it frozen, the model has no way to make the new
+tokens attendable. `o_proj` and the MLP stay frozen, for the original reason.
+
+### Why three at once
+
+A deliberate trade against the single-change discipline of steps 1–5, taken because GPU time
+is short. It costs attribution: a gain cannot be split between the three from this run alone.
+What buys most of it back is cheap, generation-only, and already in the eval job:
+
+| arm | what it isolates |
+|---|---|
+| `adapter` | the result |
+| `ngate0` | k slots kept, content removed — **the step-5 architecture on step-6 weights** |
+| `gate0` | the graph disconnected from *both* channels — the floor |
+
+`ngate0` is the important one: it is the pooled-only arm measured on the same weights, so
+`adapter − ngate0` is what the neighbour tokens added.
+
+### Correctness
+
+The thing that could break silently is the two-pass prefill. Training feeds
+`[neighbour tokens ++ prompt]` in one forward as `inputs_embeds`; generation cannot, because
+`generate()` in transformers 4.51.3 only forwards `inputs_embeds` when `cache_position[0] == 0`,
+and with a prefix in the cache it never is — the embeddings would be dropped for an empty
+`input_ids`. So generation prefills the neighbour tokens into the cache first
+(`prefix_generation.prefill_neighbours`) and decodes on the `input_ids` path.
+
+Splitting there is exact, because attention is causal: a neighbour token's keys and values
+cannot depend on a prompt token that follows it. `verify_neighbour_tokens.py` holds that
+numerically rather than by argument — **max drift 9.5e-07** over the prompt positions, with two
+negative controls (dropping the prefill moves the output by 1.7; changing the tokens' content
+moves it) so the check cannot pass vacuously. It also checks that the 1-hop rows are exactly
+the seed's references and not its citers, and that the torch centroid score matches
+`neighbour_cap`'s numpy one to 6e-08.
+
+All five verify scripts pass, and the job scripts run `verify_neighbour_tokens.py` before
+spending GPU hours.
+
+### How to read the result
+
+Against step 5's 1.490 / 0.95% and step 4's ceiling of 2.712 / 11.96%:
+
+- **Near the oracle** — per-neighbour tokens were the whole bottleneck; the references do
+  determine the abstract, and pooling was throwing it away.
+- **Clearly above step 5 but well short** — the compression was part of the problem and the
+  remaining gap is the encoder or the task itself. `ngate0` says which of the three changes paid.
+- **Still near 1.5, with `adapter ≈ ngate0`** — the neighbour tokens added nothing the pooled
+  vector did not already carry, which would be strong evidence that a paper's references do not
+  determine its own abstract. That is a real finding for the thesis, not a failed run.
+
+### Known limitations
+
+- **Three changes at once**, so this run alone cannot attribute a gain. `ngate0` recovers the
+  neighbour-token split; separating GATv2 from r=64 needs another run.
+- **Voyage is an input representation, not ground truth.** Everything here encodes neighbours
+  through embeddings we inherited; a limit of that encoding is indistinguishable from a limit
+  of the graph. This is why the ridge-regression probe was dropped — it would have measured
+  predictability of *Voyage*, not of the abstract.
+- **RoPE imposes an order on an unordered set.** Mitigated by ordering on relevance, not fixed.
+- **No era-4 945-node text baseline**, so the absolute comparison is still against a prompt
+  known to be ~1.46 points weak on the 48-node stratified sample.
+- **The text baseline gets the paper's own title; the graph arms get nothing.**
+  `build_graph_only_prompt` takes no node argument. So part of the 12% → 39% gap is the title,
+  not the channel, and a fair soft-prompt-vs-text comparison needs a no-title text arm.
+- **Degree confounds judge accuracy.** The oracle arm, which sees no graph at all, still rises
+  2.00 → 2.88 with degree. Any "more neighbours helps" claim from this run must be stratified
+  by degree or it is measuring gold length.
+- **Walltime is not measured.** The forward is ~25% longer and the eval job now has three arms.
+  Expect ~21 h+ against the 24 h limit; a resubmit is free, since each arm appends only the
+  node_ids missing from its own CSV.

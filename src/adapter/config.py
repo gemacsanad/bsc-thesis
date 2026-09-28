@@ -52,12 +52,22 @@ PROMPT_MAX_REFS = 15        # ceiling on references shown in the prompt; the GNN
 # means the centroid cap shows *fewer* references, not more.
 GENERATION_RESERVE = 320
 
-# --- Stage 3a: GraphSAGE encoder ---------------------------------------------
+# --- Stage 3a: graph encoder -------------------------------------------------
 IN_CHANNELS = 1024          # voyage-4-large embedding dim
 HIDDEN_CHANNELS = 1024
 OUT_CHANNELS = 1024
 DROPOUT = 0.2
 GNN_LAYERS = 2              # default depth; --gnn-layers overrides it per run
+
+# Stage 9 (2026-09-25): was GraphSAGE's mean aggregation, in every run up to step 5.
+# GATv2 weights each reference instead of averaging them, which is the point: a paper's
+# 52 median references are not equally informative about its own abstract, and mean
+# aggregation cannot say so. "sage" reproduces every earlier run and is what --gnn-conv
+# takes to do it. Recorded in the checkpoint; train.py refuses to resume across a change,
+# because the two build different parameter names and a mismatch would half-load.
+GNN_CONV = "gatv2"
+GNN_HEADS = 4               # per-layer attention heads; each emits width // heads and they
+                            # are concatenated, so the layer width is unchanged at 1024
 
 
 def num_neighbors(gnn_layers=GNN_LAYERS):
@@ -94,6 +104,27 @@ TRUNK_DIM = 1024
 CODE_DIM = 192
 BASE_INIT_STD = 0.02        # the base model's own initializer_range; 0.02 for both Llama-2
                             # and Qwen3, so this value is unchanged by the swap
+
+# --- Stage 3c: one input token per 1-hop neighbour ---------------------------
+# Stage 9 (2026-09-25). Every run up to step 5 compressed the whole neighbourhood into ONE
+# 1024-d vector before the LLM saw any of it. Step 5 measured what that costs: with the
+# channel demonstrably open (the oracle reached 11.96% top-1 identifiability through the
+# very same 32 tokens), the graph arm reached 0.95% and collapsed to 453 distinct abstracts
+# out of 945 — the LLM learned to ignore an uninformative prefix and emit a template.
+# These tokens remove the compression: each reference arrives as its own token.
+#
+# They enter as **input embeddings**, not as KV prefix. A KV-prefix token is something
+# attention can look at; an input-embedding token is something the 40 layers compute on,
+# and comparing references against each other is exactly the operation this run is testing.
+# It is also 16x cheaper per token — hidden_size 5,120 against a KV token's
+# 40 x 2 x 8 x 128 = 81,920 values.
+NUM_NEIGHBOUR_TOKENS = 64   # ceiling, not a target: a node contributes min(out_degree, 64).
+                            # Out-degree is 5-100 (median 52), so 64 covers 64% of eval nodes
+                            # whole. Which 64 is decided by neighbour_cap's centroid ranking,
+                            # the same score the text prompt trims by.
+HIDDEN_SIZE = 5120          # Qwen3-14B's hidden_size = 40 query heads x 128. NOT 4096, which
+                            # was Vicuna's, and not the k/v width (1024) — these are ordinary
+                            # input embeddings, so they are as wide as the residual stream.
 
 # --- Stage 4: training -------------------------------------------------------
 # Held at Vicuna's context on purpose. Qwen3-14B natively supports 40,960, but raising it would
@@ -132,10 +163,24 @@ WANDB_PROJECT = "dytag-adapter"
 # Was 8.4M on Vicuna: 64 modules of a uniform 4096 x 4096.
 # The prefix reaches the model as extra keys and values, so the query and value projections
 # are what decide how much of it is read — see lora.py for why the targets stop there.
-LORA_R = 16
-LORA_ALPHA = 32             # 2 x rank; peft scales the adapter by alpha / r
+# Stage 9 (2026-09-25): r was 16, alpha 32, targets q/v only.
+#
+# r 16 -> 64 quadruples the adapter. It is raised here and not earlier because rank is only
+# worth paying for once the prefix carries something to read: step 5 showed that LoRA given
+# an uninformative prefix spends its capacity learning a template instead (judge accuracy
+# 1.737 frozen -> 1.490 with r=16). The neighbour tokens are what make the rank useful.
+#
+# k_proj is added, and that reverses the rule stated below for the KV prefix. The reasoning
+# there is sound and still holds for the *prefix*: it supplies its keys and values directly,
+# so k_proj and v_proj never touch it and only q_proj decides how much is read. A neighbour
+# token is the opposite kind of object — an ordinary input embedding whose key is *computed*
+# by k_proj at every layer. With k_proj frozen the model has no way to make the new tokens
+# attendable, whatever else it learns. This is the projection the new token type depends on,
+# not general capacity; o_proj and the MLP stay frozen for exactly the reason given below.
+LORA_R = 64
+LORA_ALPHA = 128            # 2 x rank; peft scales the adapter by alpha / r
 LORA_DROPOUT = 0.05
-LORA_TARGETS = ["q_proj", "v_proj"]
+LORA_TARGETS = ["q_proj", "k_proj", "v_proj"]
 
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen

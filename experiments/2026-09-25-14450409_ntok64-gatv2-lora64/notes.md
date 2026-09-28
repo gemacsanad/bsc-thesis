@@ -1,0 +1,1 @@
+experiment with rank 64 lora, GATv2, 1 hop neighborhood prefix tokens

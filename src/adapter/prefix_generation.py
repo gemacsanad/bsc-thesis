@@ -82,8 +82,8 @@ def prefix_to_cache(prefix):
     return cache
 
 
-def patch_for_prefix(llm, num_prefix_tokens):
-    """Make `generate()` treat all of `input_ids` as new, starting at position P.
+def patch_for_prefix(llm, num_prefix_tokens, max_extra=0):
+    """Make `generate()` treat all of `input_ids` as new, starting after the cache.
 
     Call once, before any `generate()` with a prefix. It replaces `_get_initial_cache_position`
     outright rather than correcting its result, because the value that function returns has
@@ -96,14 +96,21 @@ def patch_for_prefix(llm, num_prefix_tokens):
     arm always runs an unpatched model.
 
     The assertion also catches the prefix width drifting from `NUM_PREFIX_TOKENS` — which is a
-    live risk, since that constant moves from 10 to 32 for Qwen3's grouped-query attention.
+    live risk, since that constant moved from 10 to 32 for Qwen3's grouped-query attention.
+
+    `max_extra` is the stage-9 neighbour-token allowance. Those tokens are prefilled into the
+    cache before `generate()` is called (see `prefill_neighbours`), so the cache is P+k long
+    rather than P, and k varies per node with its out-degree. The check therefore becomes a
+    range rather than an equality — but a *bounded* one, so a cache of the wrong length still
+    fails loudly instead of decoding at a silent offset.
     """
     def get_initial_cache_position(input_ids, model_kwargs):
         cache = model_kwargs.get("past_key_values")
         past = cache.get_seq_length() if cache is not None else 0
-        assert past == num_prefix_tokens, (
+        assert num_prefix_tokens <= past <= num_prefix_tokens + max_extra, (
             f"cache holds {past} positions but the patch was installed for "
-            f"{num_prefix_tokens}; the prefix and NUM_PREFIX_TOKENS disagree")
+            f"{num_prefix_tokens}..{num_prefix_tokens + max_extra}; the prefix width and "
+            f"NUM_PREFIX_TOKENS (or the neighbour-token count) disagree")
         model_kwargs["cache_position"] = (
             torch.arange(input_ids.shape[1], device=input_ids.device) + past)
         return model_kwargs
@@ -112,19 +119,62 @@ def patch_for_prefix(llm, num_prefix_tokens):
 
 
 @torch.no_grad()
-def generate_with_prefix(llm, input_ids, prefix, **generate_kwargs):
-    """Greedy/sampled continuation of `input_ids` with `prefix` prepended as a KV cache.
+def prefill_neighbours(llm, cache, neighbour_tokens):
+    """Run the neighbour tokens through the model and append their real KV to `cache`.
+
+    Training feeds `[neighbour tokens ++ prompt]` to the model in ONE pass as `inputs_embeds`
+    (train.step_loss). Generation cannot do the same, because `generate()` in transformers
+    4.51.3 only forwards `inputs_embeds` when `cache_position[0] == 0` — and with a prefix in
+    the cache it never is, so the embeddings would be silently dropped for an empty
+    `input_ids`. Prefilling them here instead keeps `generate()` on the `input_ids` path it
+    already works on, and leaves `patch_for_prefix` as the only override needed.
+
+    Splitting the pass at this boundary is exact, not an approximation: attention is causal,
+    so a neighbour token's keys and values depend only on the KV prefix and the neighbour
+    tokens at or before it — never on the prompt that follows. The two-pass cache is therefore
+    the one-pass cache. verify_neighbour_tokens.py holds that claim numerically.
+
+    -> the number of positions appended.
+    """
+    if neighbour_tokens is None or neighbour_tokens.size(1) == 0:
+        return 0
+
+    past, k = cache.get_seq_length(), neighbour_tokens.size(1)
+    llm.model(
+        inputs_embeds=neighbour_tokens,
+        past_key_values=cache,
+        attention_mask=torch.ones(1, past + k, dtype=torch.long,
+                                  device=neighbour_tokens.device),
+        cache_position=torch.arange(past, past + k, device=neighbour_tokens.device),
+        use_cache=True,
+    )
+    return k
+
+
+@torch.no_grad()
+def generate_with_prefix(llm, input_ids, prefix, neighbour_tokens=None, **generate_kwargs):
+    """Greedy/sampled continuation of `input_ids` behind the graph's two channels.
+
+    `prefix` is the pooled KV prefix; `neighbour_tokens` is (1, k, hidden) of input embeddings,
+    or None. The sequence the model sees is the one train.step_loss documents:
+
+        positions 0 .. P-1        the KV prefix
+        positions P .. P+k-1      the neighbour tokens
+        positions P+k ..          `input_ids`
 
     `input_ids` is (1, L) — batch size 1, so no padding is involved and the mask is all ones.
     Returns only the newly generated token ids.
     """
     length = input_ids.size(1)
-    mask = torch.ones(1, prefix.size(4) + length, dtype=torch.long, device=input_ids.device)
+    cache = prefix_to_cache(prefix)
+    k = prefill_neighbours(llm, cache, neighbour_tokens)
+    mask = torch.ones(1, prefix.size(4) + k + length, dtype=torch.long,
+                      device=input_ids.device)
 
     out = llm.generate(
         input_ids=input_ids,
         attention_mask=mask,
-        past_key_values=prefix_to_cache(prefix),
+        past_key_values=cache,
         **generate_kwargs,
     )
     return out[0, length:]

@@ -10,9 +10,9 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# GRAPH + LoRA. A result arm — scores the checkpoint from run_train_adapter.sh's step-5 run,
-# the first graph arm measured with the LLM able to read the prefix. See
-# docs/soft_prompt_only.md, step 5.
+# STAGE 9 — scores the checkpoint from run_train_adapter.sh's step-6 run: per-neighbour input
+# tokens, a GATv2 encoder and LoRA r=64, all three changed at once.
+# See docs/soft_prompt_only.md, step 6.
 #
 # Stage 5 — generates the evaluation CSV over the frozen 945-node capped eval set:
 #
@@ -58,9 +58,16 @@
 # Prerequisites:
 #   - adapter-qwen-gpu.sif built (hpc/komondor/containers/adapter-qwen-gpu.def) — the same image
 #     train.py used, with no extra packages: generate.py imports nothing train.py did not
-#   - a checkpoint in checkpoints/qwen14b-graphonly-kv192-lora/ (produced by run_train_adapter.sh)
+#   - a checkpoint in checkpoints/qwen14b-ntok64-gatv2-lora64/ (produced by run_train_adapter.sh)
 #   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
+# Walltime is 24 h against an estimated ~7 h per condition, now THREE conditions (adapter,
+# gate0, ngate0) plus up to 64 extra input tokens per node. That no longer fits with margin:
+# expect ~21 h+ and plan on one resubmit, which is free — every arm appends only the node_ids
+# missing from its own CSV. If the queue is tight, drop RUN_GATE0 first: gate0 spends ~7 h to
+# produce one distinct string (see above), while ngate0 is the arm that carries information.
+#
+# The original estimate follows.
 # Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
 # estimate of ~2.9 h (945 nodes, batch size 1) by 2x for Qwen3-14B's parameter count and 1.25x
 # for MAX_NEW_TOKENS going 256 -> 320. Both factors are arithmetic, and the 2.9 h it scales was
@@ -82,16 +89,20 @@ mkdir -p $BASE_DIR/logs
 # the unqualified directory would silently select the wrong model's weights. The load fails on
 # a shape mismatch rather than scoring the wrong thing — the adapter output moved from
 # 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
-# This run reads checkpoints/qwen14b-graphonly-kv192-lora/ — NOT step 4's oracle directory.
-# An oracle checkpoint has exactly the shapes of a graph one, so the directory alone would not
-# catch a mix-up; generate.py refuses it on the checkpoint's recorded `oracle` flag, which is
-# why --oracle is absent from both invocations below and must stay absent. The LoRA tensors
-# ride in the checkpoint and generate.py injects them automatically, so there is no LoRA flag
-# to keep in sync here.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-graphonly-kv192-lora
-ARM=graphonly-qwen14b-kv192-lora        # experiments/<date>-<job>_$ARM/
+# This run reads checkpoints/qwen14b-ntok64-gatv2-lora64/ — NOT the oracle directory, and not
+# step 5's. An oracle checkpoint has exactly the shapes of a graph one, so the directory alone
+# would not catch a mix-up; generate.py refuses it on the checkpoint's recorded `oracle` flag,
+# which is why --oracle is absent from every invocation below and must stay absent.
+# Nothing here names an architecture either: the encoder kind, the encoder depth, the
+# neighbour-token width and the LoRA tensors are all read back out of the checkpoint, so a
+# wrong directory scores another run's weights but can never build the wrong model for them.
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-ntok64-gatv2-lora64
+ARM=ntok64-gatv2-lora64                 # experiments/<date>-<job>_$ARM/
 RUN_BASELINE=0                          # 0 to generate the adapter arm only
-RUN_GATE0=1                             # the control that isolates the graph from LoRA (above)
+RUN_GATE0=1                             # graph off in BOTH channels — the floor
+RUN_NGATE0=1                            # the k neighbour slots kept, their content removed.
+                                        # The one ablation that separates the three changes
+                                        # this run makes; see below
 
 # best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
 # early stopping the *last* epoch is by definition worse than the best one, so picking the
@@ -116,6 +127,7 @@ export SINGULARITYENV_RUN_TAG="$(date +%F)-${SLURM_JOB_ID:-manual}"
 export SINGULARITYENV_ARM="$ARM"
 export SINGULARITYENV_RUN_BASELINE="$RUN_BASELINE"
 export SINGULARITYENV_RUN_GATE0="$RUN_GATE0"
+export SINGULARITYENV_RUN_NGATE0="$RUN_NGATE0"
 
 module load singularity
 
@@ -137,6 +149,10 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # with no reference text in it. Seconds on CPU.
     python verify_graph_only_prompt.py || exit 1
 
+    # And that the two-pass prefill these arms decode through is the one-pass forward that
+    # training used. A mismatch here is fluent text at a silent offset, not an error.
+    python verify_neighbour_tokens.py || exit 1
+
     if [ "$RUN_BASELINE" = 1 ]; then
         echo "=== baseline: frozen Qwen3-14B, no prefix ==="
         python generate.py --mode baseline \
@@ -147,12 +163,20 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
 
     if [ "$RUN_GATE0" = 1 ]; then
         echo "=== gate=0: the same weights and LoRA with the graph disconnected ==="
-        echo "    node-independent prompt AND prefix — expect one identical abstract x945"
+        echo "    node-independent prompt AND prefix AND neighbour tokens —"
+        echo "    expect one identical abstract x945"
         python generate.py --mode gate0 --checkpoint "$CKPT" \
             --output "/app/experiments/${RUN_TAG}_${ARM}-gate0/generations.csv"
     fi
 
-    echo "=== graph + LoRA: GraphSAGE prefix + LoRA-tuned Qwen3-14B ($ARM) ==="
+    if [ "$RUN_NGATE0" = 1 ]; then
+        echo "=== ngate=0: the k neighbour slots kept, emptied; pooled prefix still on ==="
+        echo "    this is the step-5 architecture measured on step-6 weights"
+        python generate.py --mode ngate0 --checkpoint "$CKPT" \
+            --output "/app/experiments/${RUN_TAG}_${ARM}-ngate0/generations.csv"
+    fi
+
+    echo "=== stage 9: GATv2 prefix + per-neighbour tokens + LoRA r=64 ($ARM) ==="
     python generate.py --mode adapter --checkpoint "$CKPT" \
         --output "/app/experiments/${RUN_TAG}_${ARM}/generations.csv"
 '
