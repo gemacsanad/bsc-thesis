@@ -10,43 +10,74 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# STAGE 9 — per-neighbour tokens, GATv2 and r=64, all three at once.
+# STAGE 10b — the contrastive ranking loss, a pretrained encoder, and the gates opened.
 #
-# Trains the graph encoder, prefix adapter and neighbour-token adapter against Qwen3-14B,
-# soft-prompt-only: the prompt is one fixed system message and user turn with no references,
-# so the graph is the only channel to the paper (src/adapter/text.py).
-# See docs/soft_prompt_only.md, step 6.
+# Trains the graph encoder and prefix adapter against Qwen3-14B, soft-prompt-only: the prompt
+# is one fixed system message and user turn with no references, so the graph is the only
+# channel to the paper (src/adapter/text.py).
+# See docs/soft_prompt_only.md, step 7, and docs/step6_failure_analysis.md.
 #
-# What step 5 found, and why this is the answer to it. Step 5 added LoRA to the graph arm and
-# it got WORSE: judge accuracy 1.737 -> 1.490, distinct abstracts 809 -> 453 of 945, top-1
-# identifiability 1.69% -> 0.95%. That is not noise, it is conditioning collapse — given a
-# prefix carrying little about the paper, a decoder with the capacity to adapt learns to
-# ignore it and emit a good generic abstract instead. The oracle arm rules out the channel as
-# the cause: a *perfect* target vector through the identical 32-token, 40-layer prefix reaches
-# 11.96% top-1. The channel works; the single pooled 1024-d vector is what does not carry the
-# paper. So the fix has to add information, not capacity.
+# What step 6 found. It changed three things at once (per-neighbour tokens, GATv2, LoRA r=64)
+# and produced the worst graph run of the project alongside the LOWEST TRAINING LOSS EVER
+# RECORDED here — 1.83, below the oracle and below the text runs. Judge accuracy 1.490 ->
+# 1.314, distinct abstracts 453 -> 342 of 945, largest identical cluster 61 -> 165 rows,
+# top-1 identifiability 1.16% -> 0.32% against a chance of 0.106%.
 #
-# Three changes against step 5 (checkpoints/qwen14b-graphonly-kv192-lora):
+# Those two facts are not in tension. Cross-entropy over ~230 abstract tokens is dominated by
+# generic scientific English, so a model that writes fluent boilerplate scores better than one
+# that gets the paper right on a handful of content words. Nothing in that objective ever asked
+# the prefix to be about THIS paper. Meanwhile a plain untrained mean of a node references
+# already retrieves that node at 64.34% top-1, so information was never the bottleneck.
 #
-#   neighbour tokens   each 1-hop reference becomes its own input embedding, prepended to the
-#                      prompt (config.NUM_NEIGHBOUR_TOKENS = 64, chosen by centroid distance).
-#                      This is the one that removes the compression; the other two are cheap
-#                      riders on the same run.
-#   --gnn-conv gatv2   learned attention over the references instead of an unweighted mean.
-#   LoRA r=64          four times the rank, plus k_proj, which the neighbour tokens need —
-#                      their keys are computed rather than supplied (src/adapter/lora.py).
+# Four changes against step 6, and every one of them targets that:
 #
-# Three at once is a deliberate trade against the single-change discipline the earlier steps
-# kept, and it costs attribution: a gain cannot be split between them from this run alone.
-# It was taken because GPU time is short. The ablations that recover the attribution are all
-# cheap and generation-only, and run_generate_eval.sh already carries two of them (gate0 and
-# ngate0) against these same weights.
+#   ranking loss       L = L_LM + lambda * L_rank, where L_rank asks whether the right abstract
+#                      outscores M wrong ones under this node own prefix (src/adapter/rank.py).
+#                      It is the identifiability metric turned into a loss. No voyage embedding
+#                      appears in it, so the only ceiling is the LLM own. Half the negatives
+#                      come from the node OWN references: a prefix carrying only the topic
+#                      would rank those as highly as the target, so they are what force the
+#                      topic-to-identity distinction every run so far has failed.
+#   pretrained encoder stage 10a runs INSIDE THIS JOB, before training. The encoder arrives
+#                      already able to identify the target instead of having to discover that
+#                      through forty layers and a loss that never asked for it.
+#   gates opened       --gate-init 0.2. gate=0 made ignoring the graph both the default and the
+#                      starting point; the ablation is preserved by zeroing at EVAL time.
+#   LoRA r=16          decoder capacity is anti-correlated with graph use whenever the signal
+#                      is weak: frozen 2.86% top-1, r=16 1.16%, r=64 0.32%, monotonic over
+#                      three runs. Rank returns only once the channel carries something.
+#
+# And model selection changed, which is not a hyperparameter but a correction. best.pt used to
+# be the epoch with the lowest LM validation loss — the metric step 6 proved is anti-correlated
+# with quality. It is now the epoch with the highest validation RANKING ACCURACY.
+#
+# TWO STAGES, ONE JOB. Stage 10a (pretrain_encoder.py) is InfoNCE on the graph encoder with no
+# LLM loaded: it takes minutes, not hours. It runs here rather than as its own submission so
+# that one queue wait covers both — a separate job would spend longer waiting for a GPU than
+# using one. It is skipped when checkpoints/encoder-gatv2.pt already exists, so a resubmit
+# after a timeout goes straight to training and never overwrites the encoder that the
+# partially-trained checkpoint was initialised from.
+#
+# Both convolutions are pretrained, which finally settles a question step 6 could not: that run
+# changed GATv2 alongside two other things and could attribute nothing to it. Here it costs
+# minutes and each has its own metric. Only the gatv2 encoder is used for training below.
+#
+# THE NUMBER TO BEAT IN STAGE 10a IS 64.34%, the top-1 retrieval of a plain untrained mean of a
+# node references (src/analysis/refsignal.py). An encoder below 40% is destroying signal rather
+# than extracting it; pretrain_encoder.py prints a warning and that is the finding.
+#
+# NEIGHBOUR TOKENS ARE OFF in this run (--neighbour-tokens 0). They are not abandoned: the
+# ceiling is raised to 128 in config.py so that when they return, every reference gets a token
+# rather than the 64 nearest the centroid, which were the ones most redundant with the pooled
+# prefix. They are held back because this run already changes four things and step 6 is the
+# standing lesson about that, and because in step 6 the two channels co-adapted into mutual
+# noise cancellation: emptying the neighbour slots while keeping the pooled prefix scored
+# WORSE than disconnecting the graph entirely. The pooled mean carries 64.34% on its own, so
+# this is the cleanest test of whether fixing the objective fixes the collapse. Run 2 adds them.
 #
 # Qwen3-14B's own weights are never written; only checkpoints/epoch*.pt are written. They are
-# larger than step 5's ~560 MB: LoRA goes from 10.5M parameters to ~42M at r=64 with k_proj
-# added, and the neighbour-token adapter adds 5.3M, each carrying AdamW's two moment buffers
-# on top. Budget ~1 GB per epoch and watch the quota — 10 epochs is ~10 GB if every epoch
-# improves.
+# smaller than step 6's: LoRA drops back from ~42M parameters at r=64 to ~10.5M at r=16, and
+# the neighbour-token adapter is absent. Budget ~600 MB per epoch.
 #
 # Metrics go live to Weights & Biases. WANDB_KEY is read from the repo-root .env by train.py itself
 # (not passed on the command line), the same way train_graphsage_full.py does it.
@@ -71,11 +102,19 @@
 # on top of the three changes already being made. Early stopping (PATIENCE = 2) ends it sooner
 # if it is going to.
 #
-# Walltime: step 5 ran this budget end to end with the encoder training, so 48 h is measured
-# rather than guessed for the *old* sequence length. This run adds up to 64 input tokens per
-# node on top of a ~250-token prompt, so the forward is roughly 25% longer, and r=64 on three
-# projections costs more in the backward. Expect it to be slower than step 5. The resume
-# below covers a timeout.
+# Walltime: the ranking loss costs (M+1) x T = 9 x 32 = 288 tokens of forward and backward on
+# top of a ~471-token LM step, so roughly +60%. Against that, the neighbour tokens are gone
+# (-52 tokens per node on average) and LoRA is a quarter of the size in the backward. Net
+# expectation is modestly slower than step 5 and faster than step 6, but this is arithmetic
+# and has never been timed on an A100 — 48 h absorbs a miss and the resume below covers a
+# timeout. Lower it once one epoch has been timed.
+#
+# Candidates are scored directly behind the KV prefix rather than behind the 241-token prompt.
+# Scoring behind the prompt would mean replaying those 241 tokens once per candidate, which is
+# +460% rather than +60%, and the obvious fix — cache the prompt keys and values once — is not
+# available: gradient checkpointing forces use_cache=False, which is the same constraint
+# PrefixCache exists to work around. --rank-context prompt runs the expensive variant for
+# anyone who wants to check the cheap one ranks the same way. See src/adapter/rank.py.
 #
 # Encoder depth: edit --gnn-layers and CKPT_DIR below, submit, then edit them again for the
 # next depth. That is safe, and only because it is *this* file: sbatch copies the batch script
@@ -97,19 +136,21 @@ SIF=$BASE_DIR/adapter-qwen-gpu.sif
 # best.pt is a fixed name, so sharing a directory with the Vicuna checkpoints would resume from
 # and overwrite the wrong run. train.py refuses a resume across a change of --sets or
 # --gnn-layers, but it has no way to know the base model changed underneath it.
-# ntok64-gatv2-lora64: its own directory, and NOT step 5's
+# rank-gatv2-lora16: its own directory, and NOT step 5's or step 6's
 # checkpoints/qwen14b-graphonly-kv192-lora. train.py refuses to resume across a change of
 # --gnn-conv or --neighbour-tokens, so the mistake aborts rather than trains — but best.pt is
 # a fixed name in every one of these directories, so pointing this at step 5's would overwrite
-# the arm this run is measured against. Step 5's directory is the comparison; leave it intact.
+# the arm this run is measured against. STEP 2's frozen-LLM run is the bar this one has to
+# clear, and step 5's and step 6's are what it has to explain; leave all three intact.
 # Same argument against checkpoints/qwen14b-oracle-kv192-lora, which holds the ceiling run.
 # graphonly: separate from checkpoints/qwen14b/, which holds the text-path run. train.py refuses
 # to resume across a prompt change, but the fixed best.pt name would still be overwritten.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-ntok64-gatv2-lora64
-LORA=1                                  # rank 64 on q/k/v, per config.py. ON here and not
-                                        # optional: the neighbour tokens are input embeddings,
-                                        # so without k_proj the model cannot learn to attend
-                                        # to them at all
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-rank-gatv2-lora16
+LORA=1                                  # rank 16 on q/k/v, per config.py. k_proj stays in the
+                                        # target list although this run has no neighbour
+                                        # tokens: it is harmless with none, and leaving it
+                                        # means run 2 changes only --neighbour-tokens
+ENCODER=$BASE_DIR/checkpoints/encoder-gatv2.pt   # written by stage 10a in this same job
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
@@ -117,6 +158,10 @@ mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 # so a LoRA run needs its own CKPT_DIR — the resume below picks up whatever epoch file is
 # newest, which would otherwise be another run's.
 [ "$LORA" = 1 ] && export SINGULARITYENV_LORA="--lora"
+
+# Built by stage 10a inside the job below when it is missing. Exported as the /app path,
+# which is what both the existence check and train.py see inside the container.
+export SINGULARITYENV_ENCODER="/app${ENCODER#$BASE_DIR}"
 
 # Pick up where a timed-out or crashed run left off. train.py restores the encoder, adapter,
 # optimizer and scheduler, and restarts at the next *epoch* — progress within an epoch is lost.
@@ -152,19 +197,49 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     [ -n "${LORA:-}" ] && { python verify_lora_prefix.py || exit 1; }
 
     # Cheap and CPU-only (~15 s): proves the neighbour tokens mean the same thing in the
-    # one-pass forward training uses and the two-pass prefill generation uses, and that
-    # the 1-hop selection picks the seed own references in neighbour_cap order. Every way
-    # this can be wrong yields fluent text rather than an error.
+    # one-pass forward training uses and the two-pass prefill generation uses. Kept although
+    # this run sets --neighbour-tokens 0, because run 2 turns them back on and a break would
+    # otherwise surface there instead of here.
     # NOTE: no apostrophes inside this block — it is one single-quoted argument to
     # bash -lc, and an apostrophe silently ends the quote and splits the script.
     python verify_neighbour_tokens.py || exit 1
 
+    # And the new loss. A ranking loss that scores the wrong rows, averages over padding or
+    # never reaches the encoder produces a falling number and a plausible curve — it would
+    # look exactly like the run working. Seconds on CPU.
+    python verify_rank.py || exit 1
+
+    # --- stage 10a: pretrain the encoder, on the GPU this job already holds ----------------
+    # Minutes, no LLM. Skipped when the encoder exists so a resubmit after a timeout does not
+    # redo it — and, more importantly, does not overwrite the encoder that a partially trained
+    # checkpoint was initialised from.
+    if [ -f "$ENCODER" ]; then
+        echo "=== stage 10a skipped: $ENCODER already exists ==="
+    else
+        for CONV in gatv2 sage; do
+            echo "=== stage 10a: pretraining the $CONV encoder (InfoNCE, no LLM) ==="
+            python pretrain_encoder.py \
+                --gnn-layers 2 \
+                --gnn-conv "$CONV" \
+                --out "/app/checkpoints/encoder-$CONV.pt" \
+                --wandb \
+                --wandb-run "pretrain-$CONV-$SLURM_JOB_ID" || exit 1
+        done
+    fi
+
+    echo "=== stage 10b: training the adapter against Qwen3-14B ==="
     python train.py \
         --gnn-layers 2 \
         --gnn-conv gatv2 \
-        --neighbour-tokens 64 \
+        --neighbour-tokens 0 \
+        --pretrained-encoder "$ENCODER" \
+        --gate-init 0.2 \
+        --lambda-rank 1.0 \
+        --rank-negatives 8 \
+        --rank-tokens 32 \
+        --rank-context prefix \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "ntok64-gatv2-lora64-$SLURM_JOB_ID" \
+        --wandb-run "rank-gatv2-lora16-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '

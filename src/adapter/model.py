@@ -71,10 +71,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATv2Conv, SAGEConv
 
-from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GNN_CONV, GNN_HEADS, GNN_LAYERS,
-                    HEAD_DIM, HIDDEN_CHANNELS, HIDDEN_SIZE, IN_CHANNELS, NUM_KV_HEADS,
-                    NUM_LAYERS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, OUT_CHANNELS,
-                    TRUNK_DIM)
+from config import (BASE_INIT_STD, CODE_DIM, DROPOUT, GATE_INIT_FRACTION, GNN_CONV, GNN_HEADS,
+                    GNN_LAYERS, HEAD_DIM, HIDDEN_CHANNELS, HIDDEN_SIZE, IN_CHANNELS,
+                    NUM_KV_HEADS, NUM_LAYERS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS,
+                    OUT_CHANNELS, TRUNK_DIM)
 
 
 def _conv(kind, in_dim, out_dim, heads):
@@ -173,6 +173,20 @@ class NeighbourTokenAdapter(nn.Module):
         mean_norm = embed_weight.detach().float().norm(dim=1).mean()
         self.scale.fill_(float(mean_norm / self.hidden_size ** 0.5))
 
+    @torch.no_grad()
+    def calibrate_gate(self, neighbour_vectors, fraction=GATE_INIT_FRACTION):
+        """The neighbour-token twin of PrefixAdapter.calibrate_gate — same reasoning.
+
+        Measured against `base` rather than against the post-LayerNorm output, so the number
+        means the same thing in both modules: what share of the pre-norm token the graph
+        supplies.
+        """
+        self.gate.zero_()
+        delta = self.proj(self.in_norm(neighbour_vectors))
+        mean_norm = delta.float().norm(dim=1).mean()
+        self.gate.fill_(float(fraction * self.base.norm() / mean_norm))
+        return float(self.gate)
+
     def forward(self, h):
         """(k, in_channels) -> (k, hidden_size). k may be zero."""
         delta = self.proj(self.in_norm(h))
@@ -242,6 +256,32 @@ class PrefixAdapter(nn.Module):
             torch.randn(num_layers, 2, num_kv_heads, num_prefix_tokens, head_dim) * BASE_INIT_STD
         )
         self.gate = nn.Parameter(torch.zeros(num_layers, 2))
+
+    @torch.no_grad()
+    def calibrate_gate(self, graph_vectors, fraction=GATE_INIT_FRACTION):
+        """Open the gate so the graph supplies `fraction` of the prefix norm at step 0.
+
+        Stage 10. `gate = 0` is a free ablation but a bad initialisation: it makes ignoring the
+        graph both the default and the starting point, and step 6 measured what that costs —
+        the model learns the generic register while the gate is still shut, after which the
+        gradient pushing it open is small. The ablation is kept by zeroing at *evaluation*
+        time, which never required training from zero.
+
+        Calibrated rather than set to a constant because the right value is not knowable in
+        advance: `delta`'s scale depends on the encoder's output distribution, and step 6
+        reached graph_fraction 0.70 at a gate of only 0.0076. A fixed literal would silently
+        mean something different for a different encoder.
+        """
+        self.gate.zero_()
+        base_norm = self.base.norm()
+        # gate=0, so this is the pure node-dependent part: forward() returns base + gate*delta
+        # and we need ||delta|| alone. Re-deriving it here keeps the two definitions in sync.
+        z = self.trunk(graph_vectors)
+        c = self.codes(z).view(graph_vectors.size(0), self.num_layers, 2, self.code_dim)
+        delta = torch.stack([self.decoders[role](c[:, :, role]) for role in range(2)], dim=2)
+        mean_norm = delta.float().flatten(1).norm(dim=1).mean()
+        self.gate.fill_(float(fraction * base_norm / mean_norm))
+        return float(self.gate.flatten()[0])
 
     def forward(self, g):
         b = g.size(0)

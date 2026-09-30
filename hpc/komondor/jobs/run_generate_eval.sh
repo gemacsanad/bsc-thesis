@@ -10,9 +10,15 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# STAGE 9 — scores the checkpoint from run_train_adapter.sh's step-6 run: per-neighbour input
-# tokens, a GATv2 encoder and LoRA r=64, all three changed at once.
-# See docs/soft_prompt_only.md, step 6.
+# STAGE 10 — scores the checkpoint from run_train_adapter.sh's step-7 run: a pretrained
+# encoder, the contrastive ranking loss, opened gates and LoRA back to r=16. Pooled prefix
+# only — this run has no per-neighbour tokens.
+# See docs/soft_prompt_only.md, step 7, and docs/step6_failure_analysis.md.
+#
+# THE BAR IS STEP 2, not step 5 or step 6. Beating the runs that collapsed proves nothing.
+# The frozen-LLM graph run (experiments/2026-09-17-14395431_...) is the best the graph has
+# ever done and every LoRA run since has been worse than it:
+#   judge accuracy 1.737, distinct abstracts 809/945, rows scoring 3+ 137, top-1 ID 2.86%.
 #
 # Stage 5 — generates the evaluation CSV over the frozen 945-node capped eval set:
 #
@@ -61,11 +67,14 @@
 #   - a checkpoint in checkpoints/qwen14b-ntok64-gatv2-lora64/ (produced by run_train_adapter.sh)
 #   - Qwen/Qwen3-14B already in $BASE_DIR/.hf_cache — compute nodes do not re-download it
 #
-# Walltime is 24 h against an estimated ~7 h per condition, now THREE conditions (adapter,
-# gate0, ngate0) plus up to 64 extra input tokens per node. That no longer fits with margin:
-# expect ~21 h+ and plan on one resubmit, which is free — every arm appends only the node_ids
-# missing from its own CSV. If the queue is tight, drop RUN_GATE0 first: gate0 spends ~7 h to
-# produce one distinct string (see above), while ngate0 is the arm that carries information.
+# Walltime is 24 h against an estimated ~7 h per condition, TWO conditions here (adapter and
+# gate0) and no extra input tokens, since this run is pooled-prefix only. That fits with
+# margin. ngate0 is off because it is meaningless without neighbour tokens — generate.py
+# asserts on it rather than quietly scoring the adapter arm under an ablation's name.
+#
+# If the queue is tight, drop RUN_GATE0: with no neighbour tokens, k no longer varies, so the
+# arm really does spend ~7 h producing one distinct string, and the cheap equivalent is to
+# generate a handful of nodes, verify the output is constant and replicate it for scoring.
 #
 # The original estimate follows.
 # Walltime is 24 h against an estimated ~7 h per condition, twice. That scales the old Vicuna
@@ -89,31 +98,30 @@ mkdir -p $BASE_DIR/logs
 # the unqualified directory would silently select the wrong model's weights. The load fails on
 # a shape mismatch rather than scoring the wrong thing — the adapter output moved from
 # 32x2x32x10x128 to 40x2x8x32x128 — but only after the 29.6 GB model is on the card.
-# This run reads checkpoints/qwen14b-ntok64-gatv2-lora64/ — NOT the oracle directory, and not
-# step 5's. An oracle checkpoint has exactly the shapes of a graph one, so the directory alone
+# This run reads checkpoints/qwen14b-rank-gatv2-lora16/ — NOT the oracle directory, and not
+# step 5's or step 6's. An oracle checkpoint has exactly the shapes of a graph one, so the directory alone
 # would not catch a mix-up; generate.py refuses it on the checkpoint's recorded `oracle` flag,
 # which is why --oracle is absent from every invocation below and must stay absent.
 # Nothing here names an architecture either: the encoder kind, the encoder depth, the
 # neighbour-token width and the LoRA tensors are all read back out of the checkpoint, so a
 # wrong directory scores another run's weights but can never build the wrong model for them.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-ntok64-gatv2-lora64
-ARM=ntok64-gatv2-lora64                 # experiments/<date>-<job>_$ARM/
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-rank-gatv2-lora16
+ARM=rank-gatv2-lora16                   # experiments/<date>-<job>_$ARM/
 RUN_BASELINE=0                          # 0 to generate the adapter arm only
 RUN_GATE0=1                             # graph off in BOTH channels — the floor
-RUN_NGATE0=1                            # the k neighbour slots kept, their content removed.
-                                        # The one ablation that separates the three changes
-                                        # this run makes; see below
+RUN_NGATE0=0                            # OFF: there are no neighbour tokens in this run, so
+                                        # the arm has nothing to ablate. generate.py asserts
+                                        # rather than scoring the adapter arm under its name
 
-# best.pt is the epoch with the lowest validation loss, written by train.py. Prefer it: with
-# early stopping the *last* epoch is by definition worse than the best one, so picking the
-# highest-numbered file would score a model the run had already decided to abandon.
-# Fall back to the newest epoch file (same `sort -V` idiom, so epoch10 beats epoch2) for runs
-# that predate best.pt.
-LATEST="$CKPT_DIR/best.pt"
-if [ ! -f "$LATEST" ]; then
-    LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
-    echo "no best.pt — falling back to the newest epoch checkpoint"
-fi
+# The LAST epoch, not best.pt. best.pt is chosen by train.py's selection_score, which is meant
+# to read validation ranking accuracy — but NegativePool is indexed over the *training* nodes,
+# so no validation node is ever in it, rank_acc is never computed, and selection silently falls
+# back to LM validation loss: the criterion step 6 proved is anti-correlated with conditioning.
+# It picked epoch 4 here, and the ranking loss did not leave chance until step ~2.1k (epoch 5),
+# where rank_hit went 0.11 -> 0.35 and the gates opened while the LM validation loss rose. So
+# best.pt is the checkpoint from immediately before the effect this run exists to measure.
+# `sort -V` so epoch10 would beat epoch2. Restore best.pt once that selection bug is fixed.
+LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
 if [ -z "$LATEST" ]; then
     echo "no checkpoint in $CKPT_DIR — run run_train_adapter.sh first" >&2
     exit 1
@@ -163,7 +171,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
 
     if [ "$RUN_GATE0" = 1 ]; then
         echo "=== gate=0: the same weights and LoRA with the graph disconnected ==="
-        echo "    node-independent prompt AND prefix AND neighbour tokens —"
+        echo "    node-independent prompt AND prefix, and no neighbour tokens in this run —"
         echo "    expect one identical abstract x945"
         python generate.py --mode gate0 --checkpoint "$CKPT" \
             --output "/app/experiments/${RUN_TAG}_${ARM}-gate0/generations.csv"
@@ -176,7 +184,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
             --output "/app/experiments/${RUN_TAG}_${ARM}-ngate0/generations.csv"
     fi
 
-    echo "=== stage 9: GATv2 prefix + per-neighbour tokens + LoRA r=64 ($ARM) ==="
+    echo "=== stage 10: pretrained GATv2 prefix + ranking loss + LoRA r=16 ($ARM) ==="
     python generate.py --mode adapter --checkpoint "$CKPT" \
         --output "/app/experiments/${RUN_TAG}_${ARM}/generations.csv"
 '

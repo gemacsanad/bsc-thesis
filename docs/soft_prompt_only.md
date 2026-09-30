@@ -797,3 +797,264 @@ Against step 5's 1.490 / 0.95% and step 4's ceiling of 2.712 / 11.96%:
 - **Walltime is not measured.** The forward is ~25% longer and the eval job now has three arms.
   Expect ~21 h+ against the 24 h limit; a resubmit is free, since each arm appends only the
   node_ids missing from its own CSV.
+
+---
+
+## Step 7 — a contrastive ranking loss, a pretrained encoder, and the gates opened
+
+Implemented 2026-09-28. Not yet run. Full diagnosis of what it responds to is in
+[`step6_failure_analysis.md`](step6_failure_analysis.md); the design discussion is in
+[`infonce_plan.md`](infonce_plan.md).
+
+### The problem this step exists to fix
+
+Step 6 posted the **lowest training loss of any run in this project** — 1.83, below the oracle
+and below the text runs — together with its **worst conditioning**. Those two facts are not in
+tension, and understanding why is the whole of this step.
+
+The objective is cross-entropy over ~230 abstract tokens, and that quantity is dominated by
+generic scientific English. "We propose a novel approach to the problem of…" is high-probability
+under *any* conditioning. Getting the specific paper right buys a few nats on a handful of
+content words; writing fluent boilerplate buys more, on every token. The model learned the
+register and the loss fell the whole time. It is not memorisation — against all 7,750 training
+abstracts the maximum TF-IDF cosine is 0.495 and **no** generation exceeds 0.6.
+
+**Nothing in that objective ever asked the prefix to be about *this* paper.** Everything else
+measured in step 6 follows from it:
+
+| | measured |
+|---|---|
+| collapse scales with decoder capacity | frozen 2.86% top-1 → r=16 1.16% → r=64 0.32% |
+| the gates never opened | final `gate/neighbour` 0.0083 |
+| the graph was worth nothing | disconnecting **both** channels cost ~0.001 nats |
+| the channels cancelled | emptying only the neighbour tokens cost ~0.023 — the pooled prefix *without* them was worse than no graph |
+| topic was lost too | agreement 0.568 → 0.324, below the 0.414 majority-class baseline |
+
+And the claim that motivated step 6 was false. `soft_prompt_only.md` said "the single pooled
+1024-d vector is what does not carry the paper". **A plain untrained mean of a node's reference
+embeddings retrieves that node's own embedding at 64.34% top-1 out of 945.** Information was
+never the bottleneck, so step 6 added capacity where none was needed.
+
+### What was built
+
+**1. `rank.py` — the contrastive ranking loss.** `L = L_LM + λ·L_rank`, where `L_rank` asks:
+under this node's own prefix, does the right abstract outscore M wrong ones? It is the
+identifiability metric the evaluation reports, turned into a differentiable loss.
+
+No voyage embedding appears in it — the candidates are gold abstracts from the training set —
+so the only ceiling is the LLM's own and no third-party model enters the objective.
+
+**Half the negatives come from the node's own references** (`RANK_HARD_FRACTION`). This is the
+part that attacks the topic-vs-identity failure directly: a prefix carrying only its
+neighbourhood's *topic* would rank the references as highly as the target, because they **are**
+the topic. Random arXiv negatives separate on topic alone, which is the exact shortcut every run
+so far has taken.
+
+**2. `pretrain_encoder.py` — Stage A, InfoNCE with no LLM.** The encoder's only learning signal
+had always travelled through the adapter, forty layers and that token loss. Here it is
+encoder → head → loss. Without the 14B model on the card, batches go from 1 to 256 and the
+stage can use every eligible node rather than the 7,750 sampled for LM training.
+
+It is trained against voyage embeddings and is therefore voyage-capped — deliberately, and only
+as an initialisation. Justified by measurement, not assumption: the ceiling is ~50× above where
+the pipeline currently sits (64.34% against 0.32%). **It is a diagnostic, never a result.**
+Reporting its retrieval score as an outcome of the method would report how well voyage predicts
+itself.
+
+**3. Gates opened at initialisation.** `PrefixAdapter.calibrate_gate` sets the gate on a real
+batch so the graph supplies ~20% of the prefix norm at step 0. `gate = 0` made ignoring the
+graph both the default *and* the starting point. The free gate=0 ablation is preserved by
+zeroing at **evaluation** time — it never required training from zero. Calibrated rather than
+hard-coded because `delta`'s scale depends on the encoder: step 6 reached `graph_fraction` 0.70
+at a gate of 0.0076, so a literal would mean something different for a pretrained encoder.
+
+**4. LoRA back to r=16.** Capacity is anti-correlated with graph use while the signal is weak,
+measured three times. Rank returns once the channel carries something.
+
+**5. Model selection corrected.** `best.pt` was the epoch with the lowest LM validation loss —
+the metric step 6 proved is anti-correlated with quality. It is now the epoch with the highest
+validation **ranking accuracy** (`train.selection_score`). This is a correction, not a tuning
+choice: the old criterion actively prefers the generic-template solution.
+
+### What is deliberately *not* in run 1
+
+**Per-neighbour tokens are off** (`--neighbour-tokens 0`). Not abandoned — `NUM_NEIGHBOUR_TOKENS`
+is raised 64 → 128 so that when they return, every reference gets a token instead of the 64
+nearest the centroid. That cap was inherited from the text arm, where a reference costs ~230
+prompt tokens rather than one, and it kept the references most redundant with the pooled prefix:
+
+| selection of 64, on the 345 eval nodes where the cap bit | top-1 |
+|---|---|
+| all references (no cap) | 70.43% |
+| **64 nearest centroid (what step 6 used)** | **66.38%** |
+| 64 random | 69.57% |
+| 64 farthest from centroid | 71.88% |
+
+They are held back because this run already changes four things, because step 6 is the standing
+lesson about changing several at once, and because the two channels co-adapted into mutual noise
+cancellation. The pooled mean carries 64.34% alone, so this is the cleanest test of whether
+fixing the *objective* fixes the collapse. Run 2 adds them.
+
+### Where candidates are scored, and what that trades
+
+Candidates are scored directly behind the KV prefix, **not** behind the 241-token prompt that
+`step_loss` uses. This is a compute decision with a real cost.
+
+Scoring behind the prompt means replaying those 241 tokens once per candidate: 9 × 273 = 2,457
+tokens against a 471-token baseline, **+460%**. The obvious fix — cache the prompt's keys and
+values once — is not available. Gradient checkpointing forces `use_cache=False`, which is the
+same constraint `PrefixCache` exists to work around. Scoring behind the prefix alone costs
+(M+1) × T = 288 tokens, **+61%**, and reuses `PrefixCache` unchanged at batch M+1.
+
+What it gives up: every candidate sits at a different absolute distance from the prefix than in
+LM training, and the model is not in its "assistant is answering" mode. Both are *shared by all
+candidates*, so the softmax is still a valid relative ranking driven by the prefix — which is
+the thing being trained. `--rank-context prompt` runs the expensive variant to check that claim
+rather than accept it.
+
+### Why T = 32
+
+Measured, not guessed. Identity is concentrated in an abstract's opening — TF-IDF retrieval of
+the gold out of 945 using only the first N words as the query, against the *remainder* of every
+abstract so there is no lexical overlap:
+
+| first N words | ≈ tokens | top-1 |
+|---|---|---|
+| 16 | 21 | 47.83% |
+| 24 | 32 | 57.35% |
+| 32 | 43 | 63.17% |
+| 48 | 64 | 72.28% |
+
+Chance is 0.106%. Even 21 tokens carries 450× chance. This is *lexical* matching, so it is a
+floor for what the LLM can read from the same tokens. T=32 buys more negatives rather than
+longer ones, which is the better trade for a contrastive objective.
+
+### How to run it
+
+```bash
+sbatch hpc/komondor/jobs/run_train_adapter.sh   # stages 10a and 10b, one queue wait
+sbatch hpc/komondor/jobs/run_generate_eval.sh   # adapter + gate0; ngate0 is off
+```
+
+**Stage 10a runs inside the training job**, before training, on the GPU that job already holds.
+It takes minutes with no LLM loaded, so a separate submission would spend longer waiting for a
+GPU than using one. Both convolutions are pretrained — which settles the GATv2-vs-GraphSAGE
+question step 6 could not attribute — and only `encoder-gatv2.pt` is used for training.
+
+It is skipped when `checkpoints/encoder-gatv2.pt` already exists, so a resubmit after a timeout
+goes straight to training and never overwrites the encoder that the partially-trained
+checkpoint was initialised from.
+
+### Success criteria
+
+**Stage A**, intrinsic, no LLM, against the 64.34% untrained mean-pool baseline:
+
+| result | reading |
+|---|---|
+| ≥ 60% top-1 | the encoder preserves what a plain mean preserves. Proceed. |
+| 40–60% | works, but loses signal a mean does not. Proceed, investigate. |
+| < 40% | **the GNN is destroying signal.** The script warns. Stop and understand it first. |
+
+**Stage B** — the bar is **step 2**, the frozen-LLM run, because it is the best the graph has
+ever done and every LoRA run since has been worse. Beating steps 5 and 6 proves nothing.
+
+| gate | threshold |
+|---|---|
+| top-1 identifiability | > 2.86% |
+| `valid/delta` (gate0 − graph) | materially > 0.001 nats |
+| distinct abstracts | > 809 |
+| judge accuracy | > 1.737 |
+
+### Verification
+
+`verify_rank.py` (tiny random Qwen3, CPU, seconds) — a ranking loss that scores the wrong rows,
+averages over padding, or never reaches the encoder produces a falling number and a plausible
+curve. It would look exactly like the run working.
+
+| check | result |
+|---|---|
+| random model sits near chance | loss 1.8146 vs log(M+1) = 1.7918 |
+| identical candidates tie exactly | 1.79176 = log(M+1) to 1e-4 |
+| padding does not move the loss | 1.81457 → 1.81457 |
+| the gold's identity matters | 1.81457 vs 1.72600 swapped |
+| gradient reaches the prefix | \|grad\| 2.7e+00 |
+| gradient reaches the graph vector through `PrefixAdapter` | \|grad\| 1.0e-03 |
+| `calibrate_gate(0.25)` hits its target | gate 0.01281 → measured fraction 0.250 |
+
+`verify_generation.py`, `verify_sliced_loss.py` and `verify_neighbour_tokens.py` all still pass
+unchanged (2.7e-07, 4.8e-07, and the two-pass/one-pass match respectively).
+
+### Known limitations
+
+- **Four changes at once**, so this run alone cannot attribute a gain among the ranking loss,
+  the pretrained encoder, the opened gates and the LoRA rank. Each is behind its own flag
+  (`--lambda-rank 0`, omitting `--pretrained-encoder`, `--gate-init 0`) so the ablations are
+  cheap, but they are follow-up runs and should be planned for rather than hoped away.
+- **`L_LM` and `L_rank` genuinely conflict** — one rewards likely text, the other discriminative
+  text. That tension is intended, but λ is doing real work and both terms are logged separately
+  rather than only their sum. λ = 1.0 is untuned.
+- **The inverse failure is possible.** Step 6's signature was high coherence with dead accuracy;
+  a ranking loss can produce the opposite — ranks well, writes badly. `L_LM` stays primary and
+  coherence is tracked alongside identifiability.
+- **Stage A is voyage-capped**, by construction. Accepted as an initialisation only.
+- **Scoring context differs from training context** (above). Mitigated by `--rank-context
+  prompt`, not removed.
+- **Walltime is arithmetic, not a measurement.** ~+60% from the ranking loss, against −52 tokens
+  per node from dropping the neighbour tokens and a quarter-size LoRA backward. Never timed on
+  an A100.
+- **Untouched from step 6:** no era-4 945-node text baseline; the text baseline still gets the
+  paper's own title while the graph arms get nothing; degree still confounds judge accuracy
+  (oracle rises 2.00 → 2.88 with degree seeing no graph at all).
+
+### Run 1 result (job 14459686) and the checkpoint the evaluation scores
+
+**Stage 10a — encoder pretraining.** Finished, 30 epochs. Eval top-1 **~67%**, top-5 ~95%,
+median rank 1 from epoch 3, mean cosine ~0.51. Plateaued by epoch ~15, so the last half of the
+schedule bought nothing. Well clear of the 40% gate, but the reference is the **64.34%** an
+*untrained* mean of the same references scores (`src/analysis/refsignal.py`): thirty epochs of
+InfoNCE on a 2-layer GATv2 buys about **+2.7 points over averaging**. That is a result in its
+own right — on this graph the structure a GNN adds over mean-pooling is small — and it says the
+encoder was never the bottleneck.
+
+**Stage 10b — the ranking loss broke away from chance, once.** `rank_loss` sat at 2.15–2.20 for
+**2,100 optimizer steps**, which is exactly chance (`log 9 = 2.1972`), with `rank_hit` at 0.10
+against a chance of 1/9 = 0.111. At step ~2,100 it went through:
+
+| | before | after |
+|---|---|---|
+| `train/rank_loss` | 2.20 | **~1.50** |
+| `train/rank_hit` | 0.11 | **0.30–0.40** |
+| `gate/max_abs` | 0.040 | **0.080** |
+| `gate/mean_abs` | 0.020 | 0.0225 |
+
+The gates opening and the ranking working are the same event, and `rank_hit ≈ 0.35` is **3.2×
+chance** — the first evidence in this project that the prefix carries paper identity. It was
+still climbing steeply when the run ended at ~2,900 steps (epoch 6 of 10).
+
+**`valid/delta` stayed ≈ 0 throughout**, including after the breakthrough: disconnecting the
+prefix costs almost nothing in LM loss. That is not a contradiction — a 1-of-9 separation is
+worth hundredths of a nat spread over ~230 mostly-generic tokens — but it says the prefix now
+*discriminates* while the generation path still barely *uses* it. Ranking and generation are not
+yet the same channel.
+
+**Model selection silently fell back to the metric this step exists to abandon.** `valid/best`
+is plotted on the −2.22…−2.195 scale, i.e. `-losses["graph"]`, and `valid/rank_acc` was never
+logged at all. Cause: `NegativePool` is built over `sets["train"]` (`train.py:525`), and
+`validate()` skips any node not in `pool.index` — so *every* validation node is skipped, `seen`
+stays 0, `rank_acc` is never set, and `selection_score` takes its LM-loss fallback. The comment
+at the construction site reasons correctly about negatives but forgets that `ranked()` also
+looks the **gold** up in the same index.
+
+Consequence: `valid/graph` bottomed at step ~1,900 and rose afterwards — correct behaviour, since
+`L_LM` and `L_rank` conflict by design — but selection read that rise as degradation, `bad_epochs`
+hit `PATIENCE = 2`, and the run stopped at epoch 6. **`best.pt` is epoch 4**, from before the
+breakthrough, with `rank_hit` still at chance.
+
+`run_generate_eval.sh` therefore scores the **last** epoch (`sort -V | tail -1`) rather than
+`best.pt`. Scoring both is worth the GPU time: they are the same run ~1,000 steps apart,
+differing in essentially one thing — whether the phase transition had happened — which makes the
+pair a controlled ablation on the ranking loss that costs no extra training.
+
+**Fix before the next run:** index the pool over `train + valid` (or build a second pool for
+validation) so `rank_acc` exists and selection reads it. Until then every run early-stops on LM
+validation loss.

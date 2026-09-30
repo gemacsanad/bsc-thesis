@@ -118,10 +118,20 @@ BASE_INIT_STD = 0.02        # the base model's own initializer_range; 0.02 for b
 # and comparing references against each other is exactly the operation this run is testing.
 # It is also 16x cheaper per token — hidden_size 5,120 against a KV token's
 # 40 x 2 x 8 x 128 = 81,920 values.
-NUM_NEIGHBOUR_TOKENS = 64   # ceiling, not a target: a node contributes min(out_degree, 64).
-                            # Out-degree is 5-100 (median 52), so 64 covers 64% of eval nodes
-                            # whole. Which 64 is decided by neighbour_cap's centroid ranking,
-                            # the same score the text prompt trims by.
+# Stage 10 (2026-09-28): was 64, chosen to match the text prompt's centroid cap. That cap was
+# inherited from an arm where a reference costs ~230 prompt tokens; here it costs ONE, so the
+# constraint never applied. Worse, the centroid ranking kept the references *closest* to the
+# mean — the ones already carried by the pooled prefix — and dropped the distinctive tail the
+# token channel exists to deliver. Measured on the 345 eval nodes where the cap bit: nearest-64
+# 66.38% top-1, random-64 69.57%, farthest-64 71.88%, all references 70.43%.
+#
+# 128 is a non-binding safety bound, not a filter: CAPPED_MAX_OUT_DEGREE caps seed out-degree at
+# 100, so every node now contributes all of its references. It cannot simply be deleted —
+# generate.py charges it against the token budget and prefix_generation.patch_for_prefix
+# range-checks the cache with it — so a ceiling above the data's maximum is the way to say
+# "no cap". Consequence to report, not to prevent: k now equals out-degree exactly, so sequence
+# length is a perfect readout of degree, on top of the known degree confound.
+NUM_NEIGHBOUR_TOKENS = 128  # ceiling only; a node contributes min(out_degree, 128) = its degree
 HIDDEN_SIZE = 5120          # Qwen3-14B's hidden_size = 40 query heads x 128. NOT 4096, which
                             # was Vicuna's, and not the k/v width (1024) — these are ordinary
                             # input embeddings, so they are as wide as the residual stream.
@@ -177,10 +187,57 @@ WANDB_PROJECT = "dytag-adapter"
 # by k_proj at every layer. With k_proj frozen the model has no way to make the new tokens
 # attendable, whatever else it learns. This is the projection the new token type depends on,
 # not general capacity; o_proj and the MLP stay frozen for exactly the reason given below.
-LORA_R = 64
-LORA_ALPHA = 128            # 2 x rank; peft scales the adapter by alpha / r
+#
+# Stage 10 (2026-09-28): r back to 16. Step 6 measured that decoder capacity is anti-correlated
+# with graph use whenever the conditioning signal is weak — same encoder, same prefix, same
+# prompt: frozen LLM 2.86% top-1 identifiability, LoRA r=16 1.16%, LoRA r=64 0.32%. Monotonic
+# over three runs. Rank is not worth paying for until the channel demonstrably carries
+# something, and that is what the ranking loss below is for. r=64 returns only after it does.
+LORA_R = 16
+LORA_ALPHA = 32             # 2 x rank; peft scales the adapter by alpha / r
 LORA_DROPOUT = 0.05
 LORA_TARGETS = ["q_proj", "k_proj", "v_proj"]
+
+# --- Stage 10: contrastive supervision ---------------------------------------
+# Step 6 posted the lowest training loss of any run in the project (1.83, below the oracle and
+# below the text runs) together with its worst conditioning. That is not a contradiction: the
+# LM objective is cross-entropy over ~230 abstract tokens, which is dominated by generic
+# scientific English. Getting the paper right buys a few nats on a handful of content words;
+# fluent boilerplate buys more on every token. Nothing in the loss ever asked the prefix to be
+# about *this* paper. These constants add an objective that asks for nothing else.
+
+# Stage A — encoder pretraining against the node's own voyage embedding (pretrain_encoder.py).
+# Deliberately Voyage-capped and deliberately temporary: it is an initialisation, never a
+# result. Justified by measurement rather than assumption — a plain untrained mean of a node's
+# reference embeddings already retrieves that node's own embedding at 64.34% top-1 out of 945,
+# and the pipeline currently delivers 0.32%, so the ceiling is ~50x above where we are.
+PRETRAIN_TAU = 0.05         # InfoNCE temperature
+PRETRAIN_LR = 1e-3          # no LLM in the loop, so this can be far above LEARNING_RATE
+PRETRAIN_EPOCHS = 30
+PRETRAIN_BATCH = 256        # anchors per step; the 14B model is absent, so batches are free
+PRETRAIN_NEGATIVES = 4096   # sampled candidates on top of the in-batch positives
+
+# Stage B — the ranking loss carried into LM training (rank.py). No Voyage anywhere: the
+# candidates are gold abstracts from the training set, so the ceiling is the LLM's own.
+RANK_NEGATIVES = 8          # M wrong abstracts scored against each node's own prefix
+RANK_TOKENS = 32            # T. Identity is concentrated in the opening: measured by TF-IDF,
+                            # the first ~21 tokens of an abstract already retrieve it at 47.8%
+                            # top-1 out of 945, ~32 tokens at 57.4%, ~43 at 63.2%. That is a
+                            # lexical floor for what the LLM can read from the same tokens.
+                            # T=32 buys more negatives rather than longer ones, which is the
+                            # better trade for a contrastive objective.
+LAMBDA_RANK = 1.0           # weight on L_rank; L_LM stays primary and unweighted
+RANK_HARD_FRACTION = 0.5    # share of negatives drawn from the node's OWN references rather
+                            # than at random. Random arXiv negatives separate on topic alone,
+                            # which is the exact shortcut every run so far has taken; a paper's
+                            # own references are the negatives that force topic -> identity.
+
+# gate=0 made ignoring the graph both the default and the starting point: at step 0 the model
+# saw no graph at all while LoRA was already training, and the fastest descent was to learn the
+# generic register. The gate=0 ablation is preserved by zeroing at *evaluation* time, which
+# costs nothing — it never required training from zero.
+GATE_INIT_FRACTION = 0.2    # target ||gate*delta|| / ||base|| at initialisation, calibrated on
+                            # a real batch by PrefixAdapter.calibrate_gate rather than guessed
 
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen

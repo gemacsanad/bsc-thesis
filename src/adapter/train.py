@@ -7,6 +7,12 @@ Usage:
     python adapter/train.py --gnn-layers 3 --out-dir checkpoints/gnn3
     python adapter/train.py --oracle --epochs 2                 # ceiling run, see --oracle
     python adapter/train.py --gnn-conv sage --neighbour-tokens 0  # the step-5 architecture
+
+    # stage 10 — a pretrained encoder, the ranking loss and the gates opened:
+    python adapter/train.py --lora --neighbour-tokens 0 \
+        --pretrained-encoder ../../checkpoints/encoder-gatv2.pt \
+        --gate-init 0.2 --lambda-rank 1.0
+    python adapter/train.py --lambda-rank 0 --gate-init 0   # the step-6 objective, for ablation
 """
 
 import argparse
@@ -22,12 +28,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
 
 from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE,
-                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GNN_CONV, GNN_LAYERS, GRAD_ACCUM,
-                    GRAD_CLIP, HIDDEN_SIZE, LEARNING_RATE, LOG_EVERY, LORA_R,
-                    LORA_TARGETS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE, SEED,
-                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
+                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS,
+                    GRAD_ACCUM, GRAD_CLIP, HIDDEN_SIZE, LAMBDA_RANK, LEARNING_RATE, LOG_EVERY,
+                    LORA_R, LORA_TARGETS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
+                    RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, SEED, WANDB_PROJECT,
+                    WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader, select_neighbour_rows
 from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
+from rank import NegativePool, rank_loss
 from text import PROMPT, Corpus, encode, graph_only_example
 
 # Which frozen node sets to train on. Since the soft-prompt-only change the prompt no longer
@@ -184,6 +192,17 @@ def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dty
     return sliced_loss(llm, hidden, labels), prefix
 
 
+def ranked(llm, prefix, node_id, pool, negatives, tokens, dtype, pad_id, prompt_ids=None):
+    """The contrastive term for one node. -> (loss, whether the gold won)
+
+    Thin wrapper over rank.rank_loss that owns the sampling, so the training loop and
+    validate() draw negatives the same way and neither has to know how.
+    """
+    gold = pool.ids[pool.index[node_id]][:tokens].to(prefix.device)
+    negs = pool.sample(node_id, negatives)[:, :tokens].to(prefix.device)
+    return rank_loss(llm, prefix, gold, negs, PrefixCache, dtype, pad_id, prompt_ids)
+
+
 def graph_fraction(adapter, prefix):
     """Mean ‖gate·delta‖ / ‖base‖ over the batch — how much of the prefix the graph supplies.
 
@@ -197,7 +216,8 @@ def graph_fraction(adapter, prefix):
 
 @torch.no_grad()
 def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, dtype,
-             oracle=False):
+             oracle=False, pool=None, negatives=RANK_NEGATIVES, tokens=RANK_TOKENS,
+             pad_id=None, prompt_ids=None):
     """Token-weighted mean loss with the graph on, and with each gate forced to zero.
 
     Three numbers rather than two since stage 9, because there are now two channels and
@@ -209,6 +229,13 @@ def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, 
 
     These are the ablations the design turns on, so they are measured every epoch rather
     than left to a separate run — step 5 is what happens when the control is missing.
+
+    Since stage 10 it also returns `rank_acc`: how often the node's own abstract outscores M
+    wrong ones under its own prefix. **That is what model selection reads, not the loss.**
+    Selecting on LM validation loss is what step 6 did, and step 6 had the lowest LM loss ever
+    recorded in this project together with its worst conditioning — so that criterion actively
+    prefers the generic-template failure. It is computed for the `graph` arm only; under the
+    ablations the prefix is node-independent by construction and the answer is chance.
     """
     encoder.eval()
     adapter.eval()
@@ -226,18 +253,31 @@ def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, 
             g.zero_()
 
         loss_sum = token_sum = 0
+        won = seen = 0
         for batch in loader:
+            batch = batch.to(device)
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
             n_tokens = int((labels != -100).sum())
-            loss, _ = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
-                                input_ids, labels, mask, dtype, oracle)
+            loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch,
+                                     input_ids, labels, mask, dtype, oracle)
             loss_sum += loss.item() * n_tokens
             token_sum += n_tokens
+
+            if name == "graph" and pool is not None:
+                for row, node_id in enumerate(node_ids):
+                    if node_id not in pool.index:
+                        continue
+                    _, correct = ranked(llm, prefix[row:row + 1], node_id, pool, negatives,
+                                        tokens, dtype, pad_id, prompt_ids)
+                    won += correct
+                    seen += 1
 
         for g, was in zip(zeroed, saved):
             g.copy_(was)
         totals[name] = loss_sum / token_sum
+        if name == "graph" and seen:
+            totals["rank_acc"] = won / seen
 
     encoder.train()
     adapter.train()
@@ -252,6 +292,8 @@ def report(losses):
     for name in ("gate=0", "ngate=0"):
         if name in losses:
             parts.append(f"{name} {losses[name]:.4f} ({losses[name] - losses['graph']:+.4f})")
+    if "rank_acc" in losses:
+        parts.append(f"rank {losses['rank_acc']:.3f}")
     return "  ".join(parts)
 
 
@@ -262,7 +304,23 @@ def logged(losses):
     if "ngate=0" in losses:
         out["valid/ngate0"] = losses["ngate=0"]
         out["valid/ndelta"] = losses["ngate=0"] - losses["graph"]
+    if "rank_acc" in losses:
+        out["valid/rank_acc"] = losses["rank_acc"]
     return out
+
+
+def selection_score(losses):
+    """What early stopping and best.pt read. Higher is better.
+
+    Ranking accuracy when it is available, negated LM loss otherwise. The fallback exists only
+    for --lambda-rank 0 runs that reproduce the old objective; it is the criterion step 6 used,
+    and step 6 posted the project's lowest LM validation loss while its graph channel was worth
+    about 0.001 nats. Optimising a metric that is anti-correlated with the goal is how the
+    wrong epoch gets shipped.
+    """
+    if "rank_acc" in losses:
+        return losses["rank_acc"]
+    return -losses["graph"]
 
 
 def main():
@@ -305,6 +363,29 @@ def main():
                          "(config.LORA_TARGETS, lora.py). Without it the LLM is frozen. "
                          "Not optional alongside --neighbour-tokens: those are input "
                          "embeddings, and k_proj is what makes them attendable")
+    ap.add_argument("--pretrained-encoder", default=None,
+                    help="encoder weights from pretrain_encoder.py (stage 10a). The encoder "
+                         "arrives already able to identify the target from its neighbourhood "
+                         "instead of having to discover that through forty layers and a token "
+                         "loss that never asked for it. The head is not loaded: it existed to "
+                         "put the anchor in voyage space, and nothing downstream is in it")
+    ap.add_argument("--lambda-rank", type=float, default=LAMBDA_RANK,
+                    help="weight on the contrastive ranking loss (rank.py). 0 disables it and "
+                         "reproduces the step-6 objective. L_LM stays primary and unweighted")
+    ap.add_argument("--rank-negatives", type=int, default=RANK_NEGATIVES,
+                    help="M wrong abstracts ranked against the gold under each node's prefix")
+    ap.add_argument("--rank-tokens", type=int, default=RANK_TOKENS,
+                    help="T tokens of each candidate that are scored")
+    ap.add_argument("--rank-context", choices=["prefix", "prompt"], default="prefix",
+                    help="where candidates are scored. 'prefix' puts them directly behind the "
+                         "KV prefix: ~+60%% on top of the LM forward. 'prompt' reproduces the "
+                         "training context exactly by replaying the 241-token prompt for every "
+                         "candidate, which is ~+460%% — it exists to check that the cheap "
+                         "variant ranks the same way, not to train with. See rank.py")
+    ap.add_argument("--gate-init", type=float, default=GATE_INIT_FRACTION,
+                    help="share of the prefix norm the graph supplies at step 0, calibrated "
+                         "on a real batch. 0 reproduces the step-6 initialisation, where "
+                         "ignoring the graph was both the default and the starting point")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
@@ -375,6 +456,21 @@ def main():
     encoder = GraphEncoder(num_layers=args.gnn_layers, conv=args.gnn_conv).to(device)
     adapter = PrefixAdapter().to(device)
 
+    if args.pretrained_encoder:
+        pre = torch.load(args.pretrained_encoder, map_location=device)
+        # The same two mismatches --resume guards, for the same reason: the parameter names
+        # differ between convs and between depths, so a wrong file half-loads rather than
+        # failing, and the run would train a partly random encoder as if it were pretrained.
+        assert pre.get("gnn_conv", "sage") == args.gnn_conv, (
+            f"{args.pretrained_encoder} pretrained a '{pre.get('gnn_conv')}' encoder but "
+            f"--gnn-conv is '{args.gnn_conv}'")
+        assert pre.get("gnn_layers", 2) == args.gnn_layers, (
+            f"{args.pretrained_encoder} pretrained {pre.get('gnn_layers')} layers but "
+            f"--gnn-layers is {args.gnn_layers}")
+        encoder.load_state_dict(pre["encoder"])
+        print(f"encoder initialised from {args.pretrained_encoder} "
+              f"(stage 10a, eval top-1 {pre.get('eval_top1', float('nan')):.2%})")
+
     # None disables the channel entirely rather than running it with k=0: the module would
     # otherwise sit in the optimizer collecting no gradient, and its (untrained) weights
     # would ride into the checkpoint as if the arm had used them. Under --oracle there is
@@ -389,6 +485,26 @@ def main():
               f"{sum(p.numel() for p in ntoken.parameters()):,} parameters, "
               f"scaled to embedding norm {float(ntoken.scale) * HIDDEN_SIZE ** 0.5:.3f}")
 
+    # --- open the gates -----------------------------------------------------
+    # Calibrated on a real batch rather than set to a literal: `delta`'s scale depends on the
+    # encoder's output distribution, and a pretrained encoder's differs from a random one's.
+    # Step 6 reached graph_fraction 0.70 at a gate of 0.0076, so a hard-coded value would mean
+    # something different for every run.
+    if args.gate_init > 0 and not args.resume:
+        probe = next(iter(make_loader(data, sets["train"][:64], 64, shuffle=False,
+                                      gnn_layers=args.gnn_layers))).to(device)
+        with torch.no_grad():
+            h_probe = (oracle_vector(probe) if args.oracle
+                       else encoder(probe.x, probe.edge_index, probe.batch_size))
+            g = adapter.calibrate_gate(h_probe[:probe.batch_size], args.gate_init)
+            print(f"prefix gate opened to {g:.5f} "
+                  f"(graph supplies ~{args.gate_init:.0%} of the prefix norm at step 0)")
+            if ntoken is not None:
+                # rows batch_size.. are the sampled neighbours of this same batch, which is
+                # exactly the distribution the token adapter will be fed.
+                gn = ntoken.calibrate_gate(h_probe[probe.batch_size:], args.gate_init)
+                print(f"neighbour gate opened to {gn:.5f}")
+
     # In oracle mode the encoder is bypassed, so its parameters would sit in the optimizer
     # collecting no gradient. Excluding them keeps the reported count honest.
     encoder_params = [] if args.oracle else list(encoder.parameters())
@@ -399,6 +515,25 @@ def main():
              f"{args.gnn_layers}-layer {args.gnn_conv} encoder over "
              f"{args.gnn_layers} sampled hops")
     print(f"{which}; trainable parameters: {n_trainable:,}")
+
+    # --- the ranking loss's candidates --------------------------------------
+    # Built over the *training* nodes only, for both training and validation. A validation
+    # node's own abstract is never in the pool, so it cannot be drawn as its own negative, and
+    # the negatives a valid node is ranked against are the same population throughout.
+    pool = prompt_ids = None
+    if args.lambda_rank > 0 and not args.oracle:
+        pool = NegativePool(tokenizer, corpus, sets["train"], args.rank_tokens, seed=SEED)
+        if args.rank_context == "prompt":
+            prompt_ids = torch.tensor(tokenizer(example(sets["train"][0])[0]).input_ids,
+                                      device=device)
+        print(f"ranking loss: lambda {args.lambda_rank}, M={args.rank_negatives} negatives "
+              f"(~{RANK_HARD_FRACTION:.0%} from each node's own references), "
+              f"T={args.rank_tokens} tokens, scored behind the {args.rank_context}")
+    elif args.oracle:
+        # The oracle is fed the target's own embedding, so ranking its own abstract first is
+        # not a measurement of anything. Silently training on it would make the ceiling look
+        # like a method.
+        print("ranking loss disabled under --oracle (the arm already sees the answer)")
 
     optimizer = AdamW(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -432,7 +567,9 @@ def main():
     # it has to survive the resubmit that the walltime forces. Without this the patience
     # counter would reset on every restart and the run could never stop early.
     start_epoch, opt_step = 0, 0
-    best_loss, bad_epochs = float("inf"), 0
+    # Higher is better since stage 10: this is ranking accuracy, not a loss. Initialised to
+    # -inf so the first epoch always improves on it, whichever criterion is in use.
+    best_score, bad_epochs = float("-inf"), 0
     best_path = os.path.join(args.out_dir, "best.pt")
 
     if args.resume:
@@ -492,10 +629,14 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch, opt_step = ckpt["epoch"], ckpt["step"]
-        best_loss = ckpt.get("best_loss", float("inf"))
+        # Checkpoints predating stage 10 stored best_loss (lower better); their value is not
+        # comparable to a ranking accuracy, so a resume across the change restarts selection
+        # rather than inheriting a number that means something else.
+        best_score = ckpt.get("best_score", float("-inf"))
         bad_epochs = ckpt.get("bad_epochs", 0)
         print(f"resumed from {args.resume} at epoch {start_epoch}, step {opt_step} "
-              f"(best valid {best_loss:.4f}, {bad_epochs} epoch(s) without improvement)")
+              f"(best selection score {best_score:.4f}, {bad_epochs} epoch(s) without "
+              f"improvement)")
 
     # The job script resubmits blindly after a timeout, so it will eventually resubmit a run
     # that has nothing left to do. Say so and exit, rather than entering an empty epoch loop
@@ -514,19 +655,35 @@ def main():
     if ntoken is not None:
         ntoken.train()
     running, running_n, tokens, clock = 0.0, 0, 0, time.time()
+    rank_running, rank_hits, rank_n = 0.0, 0, 0
 
     for epoch in range(start_epoch, args.epochs):
         for i, batch in enumerate(train_loader):
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
 
-            loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
-                                     input_ids, labels, mask, dtype, args.oracle)
+            lm_loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
+                                        input_ids, labels, mask, dtype, args.oracle)
+
+            # L_LM stays primary and unweighted; the ranking term is what makes the objective
+            # ask about *this* paper at all. They genuinely conflict — one rewards likely text,
+            # the other discriminative text — so both are logged separately rather than only
+            # their sum, and lambda is doing real work.
+            rank_term, rank_hit = None, None
+            if pool is not None and node_ids[0] in pool.index:
+                rank_term, rank_hit = ranked(llm, prefix[:1], node_ids[0], pool,
+                                             args.rank_negatives, args.rank_tokens, dtype,
+                                             tokenizer.pad_token_id, prompt_ids)
+            loss = lm_loss if rank_term is None else lm_loss + args.lambda_rank * rank_term
             (loss / GRAD_ACCUM).backward()
 
-            running += loss.item()
+            running += lm_loss.item()
             running_n += 1
             tokens += int(mask.sum())
+            if rank_term is not None:
+                rank_running += rank_term.item()
+                rank_hits += rank_hit
+                rank_n += 1
 
             if (i + 1) % GRAD_ACCUM:
                 continue
@@ -539,8 +696,10 @@ def main():
 
             if opt_step % LOG_EVERY == 0:
                 elapsed = time.time() - clock
-                print(f"epoch {epoch} step {opt_step:>5}  loss {running / running_n:.4f}  "
-                      f"lr {scheduler.get_last_lr()[0]:.2e}  {tokens / elapsed:,.0f} tok/s",
+                extra = (f"  rank {rank_running / rank_n:.4f} (hit {rank_hits / rank_n:.2f})"
+                         if rank_n else "")
+                print(f"epoch {epoch} step {opt_step:>5}  loss {running / running_n:.4f}{extra}"
+                      f"  lr {scheduler.get_last_lr()[0]:.2e}  {tokens / elapsed:,.0f} tok/s",
                       flush=True)
                 if run is not None:
                     gate = adapter.gate.detach().float().cpu()
@@ -558,12 +717,17 @@ def main():
                            if ntoken is not None else {}),
                         # snapshot from the last micro-batch, not an average over the window
                         "prefix/graph_fraction": graph_fraction(adapter, prefix),
+                        **({"train/rank_loss": rank_running / rank_n,
+                            "train/rank_hit": rank_hits / rank_n} if rank_n else {}),
                     }, step=opt_step)
                 running, running_n, tokens, clock = 0.0, 0, 0, time.time()
+                rank_running, rank_hits, rank_n = 0.0, 0, 0
 
             if opt_step % EVAL_EVERY == 0:
                 losses = validate(llm, encoder, adapter, ntoken, valid_loader, tokenizer,
-                                  example, device, dtype, args.oracle)
+                                  example, device, dtype, args.oracle, pool,
+                                  args.rank_negatives, args.rank_tokens,
+                                  tokenizer.pad_token_id, prompt_ids)
                 print(f"  valid @ step {opt_step}: {report(losses)}", flush=True)
                 if run is not None:
                     run.log(logged(losses), step=opt_step)
@@ -572,10 +736,12 @@ def main():
         # End-of-epoch validation is what early stopping reads. The periodic --eval-every
         # checks above exist for the curve; this one decides whether the run continues.
         losses = validate(llm, encoder, adapter, ntoken, valid_loader, tokenizer, example,
-                          device, dtype, args.oracle)
-        improved = losses["graph"] < best_loss
+                          device, dtype, args.oracle, pool, args.rank_negatives,
+                          args.rank_tokens, tokenizer.pad_token_id, prompt_ids)
+        score = selection_score(losses)
+        improved = score > best_score
         if improved:
-            best_loss, bad_epochs = losses["graph"], 0
+            best_score, bad_epochs = score, 0
         else:
             bad_epochs += 1
 
@@ -583,7 +749,7 @@ def main():
               f"  {'best' if improved else f'no improvement {bad_epochs}/{PATIENCE}'}",
               flush=True)
         if run is not None:
-            run.log({**logged(losses), "valid/best": best_loss,
+            run.log({**logged(losses), "valid/best": best_score,
                      "valid/bad_epochs": bad_epochs}, step=opt_step)
 
         path = os.path.join(args.out_dir, f"epoch{epoch + 1}.pt")
@@ -595,7 +761,8 @@ def main():
                     "gnn_layers": args.gnn_layers, "gnn_conv": args.gnn_conv,
                     "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
                     "oracle": args.oracle,
-                    "valid_loss": losses["graph"], "best_loss": best_loss,
+                    "valid_loss": losses["graph"], "best_score": best_score,
+                    "rank_acc": losses.get("rank_acc"),
                     "bad_epochs": bad_epochs}, path)
         print(f"saved {path}")
 
@@ -604,21 +771,22 @@ def main():
         # name rather than left to be identified from the W&B curve months later.
         if improved:
             shutil.copyfile(path, best_path)
-            print(f"saved {best_path} (epoch {epoch + 1}, valid {best_loss:.4f})")
+            print(f"saved {best_path} (epoch {epoch + 1}, selection score {best_score:.4f})")
 
         if PATIENCE and bad_epochs >= PATIENCE:
             print(f"\nearly stop: {bad_epochs} epochs without improvement on the validation "
-                  f"loss (best {best_loss:.4f}); {args.epochs - epoch - 1} epoch(s) skipped")
+                  f"selection score (best {best_score:.4f}); "
+                  f"{args.epochs - epoch - 1} epoch(s) skipped")
             break
 
         clock = time.time()
 
-    print(f"\nbest valid graph loss: {best_loss:.4f}  ->  {best_path}")
+    print(f"\nbest selection score: {best_score:.4f}  ->  {best_path}")
 
     if run is not None:
         run.summary.update({**{k.replace("valid/", "final/"): v
                                for k, v in logged(losses).items()},
-                            "best/graph": best_loss,
+                            "best/score": best_score,
                             "best/epoch": epoch + 1 - bad_epochs})
         run.finish()
 

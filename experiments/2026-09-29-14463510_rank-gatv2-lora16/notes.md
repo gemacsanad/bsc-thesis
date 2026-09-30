@@ -1,0 +1,1 @@
+experiment with lora 16, GATv2, without 1 hop neighborhood prefix tokens, only the aggregated token, contrastive learning after loss drops (last.pt)
