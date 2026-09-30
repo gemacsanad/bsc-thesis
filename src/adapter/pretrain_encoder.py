@@ -50,9 +50,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-from config import (CHECKPOINT_DIR, FROZEN_DIR, GNN_CONV, GNN_LAYERS, OUT_CHANNELS,
-                    PRETRAIN_BATCH, PRETRAIN_EPOCHS, PRETRAIN_LR, PRETRAIN_NEGATIVES,
-                    PRETRAIN_TAU, SEED, WANDB_PROJECT)
+from config import (CHECKPOINT_DIR, ENCODER_COSINE_GATE, FROZEN_DIR, GNN_CONV, GNN_LAYERS,
+                    OUT_CHANNELS, PRETRAIN_BATCH, PRETRAIN_EPOCHS, PRETRAIN_LR,
+                    PRETRAIN_NEGATIVES, PRETRAIN_TAU, SEED, VICREG_COV, VICREG_GAMMA,
+                    VICREG_VAR, WANDB_PROJECT)
 from graph import load_graph, make_loader
 from model import GraphEncoder, oracle_vector
 
@@ -84,6 +85,35 @@ def info_nce(z, positives, negatives, positive_ids, negative_ids, tau):
     return F.cross_entropy(logits, target), (logits.argmax(dim=1) == target).float().mean()
 
 
+def vicreg(z, gamma=VICREG_GAMMA):
+    """-> (variance hinge, off-diagonal covariance) over the batch. Bardes, Ponce & LeCun 2021.
+
+    Why InfoNCE alone is not enough, measured rather than argued: stage 10a scored 67% top-1
+    on a representation the adapter reads as a constant. `info_nce` normalises z and divides by
+    tau = 0.05, which is a 20x amplification of cosine differences — so the objective is
+    *invariant* to the anisotropy that made the downstream channel useless. It can rank
+    perfectly on a representation squeezed into a handful of directions.
+
+    These are the two terms that cannot be satisfied that way:
+
+      * variance — a hinge on each dimension's standard deviation across the batch. A collapsed
+        dimension carries no information about which node it came from, and the hinge says so;
+      * covariance — off-diagonal covariance driven to zero, which spreads the information out
+        across dimensions instead of letting a few of them carry everything.
+
+    Computed on the head output BEFORE normalisation. After F.normalize every row is on the
+    unit sphere and the per-dimension standard deviation no longer means what the hinge
+    assumes. Batch 256 is large enough for both estimates; at batch 1 neither would exist,
+    which is why this belongs in Stage A and not in Stage B.
+    """
+    z = z - z.mean(dim=0)
+    std = torch.sqrt(z.var(dim=0) + 1e-4)
+    variance = F.relu(gamma - std).mean()
+    cov = (z.T @ z) / (z.size(0) - 1)
+    off_diagonal = cov.pow(2).sum() - cov.pow(2).diagonal().sum()
+    return variance, off_diagonal / z.size(1)
+
+
 @torch.no_grad()
 def retrieval(encoder, head, data, node_ids, device, gnn_layers, batch_size):
     """Top-1/top-5/median rank of each node's own embedding among the held-out set.
@@ -106,10 +136,17 @@ def retrieval(encoder, head, data, node_ids, device, gnn_layers, batch_size):
     scores = a @ t.T
     order = scores.argsort(dim=1, descending=True)
     ranks = (order == torch.arange(len(a)).unsqueeze(1)).float().argmax(dim=1) + 1
+    # The gate top-1 cannot see. Two nodes can be ranked perfectly against each other and still
+    # sit at cosine 0.99, and a downstream LayerNorm normalises per sample across features —
+    # it cannot remove a component shared BETWEEN nodes. That is what step 7 shipped.
+    pairwise = a @ a.T
+    n = len(a)
     return {"top1": (ranks == 1).float().mean().item(),
             "top5": (ranks <= 5).float().mean().item(),
             "median_rank": ranks.median().item(),
-            "mean_cosine": scores.diag().mean().item()}
+            "mean_cosine": scores.diag().mean().item(),
+            "output_cosine": ((pairwise.sum() - pairwise.diagonal().sum())
+                              / (n * (n - 1))).item()}
 
 
 def main():
@@ -124,6 +161,15 @@ def main():
     ap.add_argument("--batch-size", type=int, default=PRETRAIN_BATCH)
     ap.add_argument("--negatives", type=int, default=PRETRAIN_NEGATIVES)
     ap.add_argument("--tau", type=float, default=PRETRAIN_TAU)
+    ap.add_argument("--vicreg-var", type=float, default=VICREG_VAR,
+                    help="weight on the per-dimension variance hinge; 0 disables it and "
+                         "reproduces the step-7 objective")
+    ap.add_argument("--vicreg-cov", type=float, default=VICREG_COV,
+                    help="weight on off-diagonal covariance")
+    ap.add_argument("--cosine-gate", type=float, default=ENCODER_COSINE_GATE,
+                    help="an epoch whose output pairwise cosine exceeds this cannot be "
+                         "selected, whatever its top-1. The oracle, which generates 944 "
+                         "distinct abstracts, is fed vectors at 0.378")
     ap.add_argument("--lr", type=float, default=PRETRAIN_LR)
     ap.add_argument("--out", default=os.path.join(CHECKPOINT_DIR, "encoder_pretrained.pt"))
     ap.add_argument("--wandb", action="store_true")
@@ -167,11 +213,13 @@ def main():
     baseline = retrieval(encoder, head, data, eval_nodes, device, args.gnn_layers,
                          args.batch_size)
     print(f"before training: top1 {baseline['top1']:.2%}  median rank "
-          f"{baseline['median_rank']:.0f}   (untrained mean-pool reference: 64.34%)")
+          f"{baseline['median_rank']:.0f}  output cosine {baseline['output_cosine']:.3f}"
+          f"   (untrained mean-pool reference: 64.34%)")
 
     best = -1.0
     for epoch in range(args.epochs):
         total, correct, seen = 0.0, 0.0, 0
+        var_total, cov_total = 0.0, 0.0
         for batch in loader:
             batch = batch.to(device)
             b = batch.batch_size
@@ -186,31 +234,58 @@ def main():
             negative_ids = torch.randint(data.num_nodes, (args.negatives,))
             negatives = data.x[negative_ids].to(device)
 
-            loss, acc = info_nce(z, positives, negatives, positive_ids,
-                                 negative_ids.to(device), args.tau)
+            nce, acc = info_nce(z, positives, negatives, positive_ids,
+                                negative_ids.to(device), args.tau)
+            variance, covariance = vicreg(z)
+            loss = nce + args.vicreg_var * variance + args.vicreg_cov * covariance
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
 
-            total += loss.item() * b
+            total += nce.item() * b
+            var_total += variance.item() * b
+            cov_total += covariance.item() * b
             correct += acc.item() * b
             seen += b
 
         stats = retrieval(encoder, head, data, eval_nodes, device, args.gnn_layers,
                           args.batch_size)
-        print(f"epoch {epoch + 1:>3}  loss {total / seen:.4f}  batch-acc {correct / seen:.3f}  "
+        print(f"epoch {epoch + 1:>3}  nce {total / seen:.4f}  var {var_total / seen:.4f}  "
+              f"cov {cov_total / seen:.4f}  batch-acc {correct / seen:.3f}  "
               f"eval top1 {stats['top1']:.2%}  top5 {stats['top5']:.2%}  "
+              f"cos {stats['output_cosine']:.3f}  "
               f"median rank {stats['median_rank']:.0f}", flush=True)
         if run is not None:
             run.log({"pretrain/loss": total / seen, "pretrain/batch_accuracy": correct / seen,
+                     "pretrain/variance": var_total / seen,
+                     "pretrain/covariance": cov_total / seen,
                      **{f"pretrain/{k}": v for k, v in stats.items()}, "pretrain/epoch": epoch})
 
+        # Selection is on top-1 AND contrast, not top-1 alone. An encoder that ranks well and
+        # emits near-identical vectors is exactly what stage 10a shipped last time, and the
+        # adapter cannot recover from it.
+        if stats["output_cosine"] > args.cosine_gate:
+            continue
         if stats["top1"] > best:
             best = stats["top1"]
             torch.save({"encoder": encoder.state_dict(), "head": head.state_dict(),
                         "gnn_layers": args.gnn_layers, "gnn_conv": args.gnn_conv,
-                        "sets": args.sets, "epoch": epoch + 1, "eval_top1": stats["top1"]},
+                        "sets": args.sets, "epoch": epoch + 1, "eval_top1": stats["top1"],
+                        "output_cosine": stats["output_cosine"]},
                        args.out)
+
+    if run is not None:
+        run.finish()
+
+    if best < 0:
+        # Nothing was saved, so Stage B would either crash on a missing file or silently train
+        # a random encoder. Both are worse than stopping here.
+        raise SystemExit(
+            f"FAILED: no epoch produced an output pairwise cosine below {args.cosine_gate}. "
+            f"The encoder ranks but does not spread, which is what step 7 shipped — a "
+            f"near-constant input the adapter reads as a constant. Check that "
+            f"config.NODE_EMBEDDINGS points at the whitened features, then the VICReg "
+            f"weights.")
 
     print(f"\nbest eval top-1: {best:.2%}  ->  {args.out}")
     print("reference: an untrained mean of the same references scores 64.34% "
@@ -219,8 +294,6 @@ def main():
         print("\nWARNING: below the 40% gate. A plain mean scores 64.34% with no training at "
               "all, so an encoder under 40% is destroying signal rather than extracting it. "
               "That is the finding — investigate before spending GPU hours on Stage B.")
-    if run is not None:
-        run.finish()
 
 
 if __name__ == "__main__":

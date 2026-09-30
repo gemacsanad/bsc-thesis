@@ -239,6 +239,78 @@ RANK_HARD_FRACTION = 0.5    # share of negatives drawn from the node's OWN refer
 GATE_INIT_FRACTION = 0.2    # target ||gate*delta|| / ||base|| at initialisation, calibrated on
                             # a real batch by PrefixAdapter.calibrate_gate rather than guessed
 
+# --- Stage 11 (run 8): whitened node features --------------------------------
+# The voyage features are anisotropic before the GNN ever touches them: over the 25,539 nodes
+# reachable from the eval set, participation ratio 92.6 of 1024, and the mean of 25k unit
+# vectors has norm 0.5975 where isotropy would give ~0.006. Two thirds of the pooled reference
+# vector is one direction shared by every node, PrefixAdapter.trunk's LayerNorm normalises per
+# sample and cannot remove a between-node component, so the adapter received a near-constant
+# and greedy decoding emitted a near-constant. See docs/step8_representation_plan.md.
+#
+# ZCA whitening of the *inputs* is the correction, measured on the 945 eval nodes by
+# pooled-reference retrieval: 64.34% raw -> 78.52% whitened. It is placed here, in the
+# features, rather than as a matrix bolted onto the adapter, because the anisotropy belongs to
+# the features — so the GNN, the neighbour tokens and the oracle are all treated identically
+# and the arms stay comparable.
+#
+# whiten_features.py writes the file and refuses to if it does not clear the retrieval gate.
+# Point NODE_EMBEDDINGS back at node_embeddings.npy to reproduce every run up to step 7.
+RAW_NODE_EMBEDDINGS = os.path.join(JOINT_DIR, "node_embeddings.npy")
+NODE_EMBEDDINGS = os.path.join(JOINT_DIR, "node_embeddings_whitened.npy")
+WHITEN_EPS = 1e-3           # eigenvalue floor as a fraction of the largest eigenvalue. Without
+                            # it the smallest directions — which are noise — are amplified by
+                            # 1/sqrt(lambda) and the transform inflates exactly what carries
+                            # least signal.
+# The gate, and it is NOT the retrieval number. Measured with an honest train-only fit:
+#
+#   eval retrieval      64.34% -> 72.59%      (+8.3, not the +14.2 of the leaky fit)
+#   pooled cosine       0.6602 -> 0.0547      (12x less shared direction)
+#   participation ratio    122 -> 948 of 1024
+#   ||mean direction||  0.5458 -> 0.0078      (isotropic would be ~0.006)
+#
+# Retrieval was never the diagnosis. Step 7 had 64.34% of retrievable information available and
+# delivered 0.11%; what it did not have was a prefix that VARIED between nodes. So the gate is
+# that the whitened features must not lose retrievable information, and must decisively fix the
+# contrast. The oracle, which generates 944 distinct abstracts out of 945, is fed vectors at
+# pairwise cosine 0.378; 0.10 clears it with room.
+#
+# eps hardly matters: swept over 945 held-out TRAINING nodes (never the eval set) it moves dev
+# retrieval between 69.3% and 70.6% across 1e-4..1e-1, which is inside the noise on 945 nodes.
+# 1e-3 is kept as the standard choice rather than chasing a 1.3-point difference.
+WHITEN_COSINE_GATE = 0.10   # pooled-reference pairwise cosine after whitening
+
+# Stage A gains VICReg's two missing terms (Bardes, Ponce & LeCun 2021). InfoNCE is *invariant*
+# to anisotropy — F.normalize followed by tau=0.05 is a 20x amplification of cosine differences
+# — which is how stage 10a scored 67% top-1 on a representation the adapter reads as a
+# constant. The variance hinge prevents collapse outright; the covariance term decorrelates the
+# dimensions. Ratio 25:1 as in the paper, scaled so the InfoNCE term stays primary.
+VICREG_VAR = 1.0            # weight on the per-dimension standard-deviation hinge
+VICREG_COV = 0.04           # weight on off-diagonal covariance
+VICREG_GAMMA = 1.0          # target standard deviation per dimension
+ENCODER_COSINE_GATE = 0.40  # Stage A also has to leave the output *spread*, not just ranked.
+                            # The oracle, which generates 944 distinct abstracts, is fed
+                            # vectors at pairwise cosine 0.378; step 7's graph arm got 0.660.
+
+# L_LM and L_rank genuinely conflict — one rewards likely text, the other discriminative text.
+# Step 7 ran at lambda 1.0 from step 0 and took a -0.39 coherence regression at exactly the
+# point the rank term started winning. Warming in over the first epoch (7,750 nodes / 16 =
+# ~484 optimizer steps) lets the LM term settle first.
+RANK_WARMUP_STEPS = 484
+
+# The ranking window is sampled from a random offset during training rather than always being
+# the abstract's opening. This is objective alignment, NOT a bug fix: the gold abstracts are
+# 98.6% distinct by word 8 (7,645 of 7,750), so the opening was never formulaic. The opening
+# states the problem and the middle states the method, and methodology is the stated goal.
+# Validation keeps offset 0 so rank_acc stays comparable with step 7's numbers.
+RANK_STORED_TOKENS = 256    # tokens kept per candidate so a window can be sliced out of them
+
+# The canary. Steps 5, 6 and 7 each shipped a collapsed model that no logged number flagged
+# until an evaluation job had already spent seven GPU hours. This one is not a proxy: it
+# generates, greedily, and counts how many distinct strings come back.
+CANARY_NODES = 16
+CANARY_TOKENS = 48          # past the 8-word opening the collapse is measured on, and ~18 s
+                            # per validation on an A100
+
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen
                                       # under would need references the freeze dropped

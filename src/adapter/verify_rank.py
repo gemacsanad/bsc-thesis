@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from transformers import Qwen3Config, Qwen3ForCausalLM
 
 from model import PrefixAdapter
-from rank import rank_loss
+from rank import MIN_CANDIDATE_WORDS, NegativePool, rank_loss
 from train import PrefixCache
 
 PAD = 0
@@ -40,6 +40,74 @@ def make_prefix(config, tokens=8, batch=1, requires_grad=False):
     prefix = torch.randn(batch, config.num_hidden_layers, 2, config.num_key_value_heads,
                          tokens, config.head_dim) * 0.02
     return prefix.requires_grad_(requires_grad)
+
+
+class FakeCorpus:
+    """The two attributes NegativePool reads, over a handful of synthetic abstracts.
+
+    `refs` is a pandas Series because that is what Corpus builds and what `_hard` indexes.
+    """
+
+    def __init__(self, abstracts, refs):
+        import pandas as pd
+        self.abstract = abstracts
+        self.refs = pd.Series(refs, dtype=object)
+
+
+class FakeTokenizer:
+    """Whitespace tokenisation with ids 1..N. Ids are irrelevant to every claim below —
+    each one is about which SLICE of a candidate is returned, not about what it means."""
+
+    pad_token_id = 0
+
+    def __call__(self, text, add_special_tokens=True):
+        return type("Encoding", (), {
+            "input_ids": [1 + (hash(w) % 200) for w in str(text).split()]})()
+
+
+def check_pool():
+    """The windowing added in run 8, and the stub filter beside it.
+
+    What would go wrong without this: a window that is always the opening reproduces step 7
+    while the config says otherwise, and a window that runs off the end of a short abstract
+    returns padding — which every candidate predicts equally well, dragging the whole
+    comparison toward chance. Both produce a plausible falling curve.
+    """
+    words = {n: " ".join(f"w{n}x{i}" for i in range(120)) for n in range(6)}
+    words[6] = "far too short to rank against"          # under MIN_CANDIDATE_WORDS
+    corpus = FakeCorpus(words, {n: [] for n in range(7)})
+    pool = NegativePool(FakeTokenizer(), corpus, list(range(7)), length=64, seed=0)
+
+    assert 6 not in pool.index and pool.dropped == 1, (
+        f"the {MIN_CANDIDATE_WORDS}-word floor did not drop the stub: {pool.dropped} dropped")
+    print(f"stubs dropped from the pool: {pool.dropped}")
+
+    opening = pool.window(0, 16, random_offset=False)
+    assert torch.equal(opening, pool.ids[0, :16]), \
+        "the deterministic window is not the abstract opening — validation would move per call"
+    again = pool.window(0, 16, random_offset=False)
+    assert torch.equal(opening, again), "the deterministic window is not deterministic"
+    print("validation window is the opening, and is stable across calls")
+
+    seen = {tuple(pool.window(0, 16, random_offset=True).tolist()) for _ in range(40)}
+    assert len(seen) > 1, \
+        "the random window never moved — training would reproduce step 7's objective"
+    print(f"random window takes {len(seen)} distinct positions out of 40 draws")
+
+    # A window sliced past the end would be pad, and pad is a free win for every candidate.
+    for _ in range(100):
+        w = pool.window(0, 16, random_offset=True)
+        assert (w != FakeTokenizer.pad_token_id).all(), \
+            "a random window ran off the end of the abstract and returned padding"
+    print("no random window runs into padding")
+
+    negs = pool.sample(0, 4, tokens=16, random_offset=False)
+    assert negs.shape == (4, 16), f"sample returned {tuple(negs.shape)}, expected (4, 16)"
+    # Deterministic windows on both sides, so this compares candidates and not offsets.
+    own = pool.window(0, 16, random_offset=False)
+    assert not any(torch.equal(negs[i], own) for i in range(4)), \
+        "a node was sampled as its own negative"
+    print(f"sample returns {tuple(negs.shape)} and never the node itself")
 
 
 def main():
@@ -136,6 +204,7 @@ def main():
         f"asked for a graph fraction of 0.25 and got {moved:.3f}"
     print(f"calibrate_gate(0.25) -> gate {value:.5f}, measured graph fraction {moved:.3f}")
 
+    check_pool()
     print("\nall ranking-loss checks passed")
 
 

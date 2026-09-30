@@ -53,23 +53,37 @@ T-1 tokens of signal.
 import torch
 import torch.nn.functional as F
 
-from config import RANK_HARD_FRACTION, RANK_TOKENS
+from config import RANK_HARD_FRACTION, RANK_STORED_TOKENS, RANK_TOKENS
+
+MIN_CANDIDATE_WORDS = 30    # below this an "abstract" is a stub, and a stub is a free win for
+                            # whichever candidate it is: it says almost nothing to be wrong
+                            # about. Run 8 drops them from the pool rather than ranking against
+                            # them. One node in 384,756 has an empty abstract.
 
 
-def candidate_ids(tokenizer, corpus, node_ids, length=RANK_TOKENS):
-    """-> (len(node_ids), length) of each node's abstract opening, right-padded.
+def candidate_ids(tokenizer, corpus, node_ids, length=RANK_STORED_TOKENS):
+    """-> ((len(node_ids), length) of tokens, right-padded; the real length of each row)
 
-    Only the first ~600 characters are tokenised. Identity is concentrated in the opening —
-    measured by TF-IDF, the first ~21 tokens of an abstract retrieve it at 47.8% top-1 out of
-    945 — and tokenising whole abstracts to keep 32 tokens would cost ~20x more at startup for
-    nothing.
+    Enough of each abstract is kept that a *window* can be sliced out of it later, rather than
+    only the opening. Run 8 samples the window from a random offset during training: the
+    opening states the problem and the middle states the method, and methodology is the stated
+    goal. See NegativePool.window.
+
+    This is not a correction of the old behaviour. The gold abstracts are 98.6% distinct by
+    word 8 (7,645 of 7,750), so the opening was never formulaic and the old window was sound —
+    it was aimed at the wrong part of the abstract, not at nothing.
+
+    Only the first ~2,000 characters are tokenised, which covers 256 tokens with room to spare
+    and keeps startup at seconds for 8,245 nodes.
     """
     out = torch.full((len(node_ids), length), tokenizer.pad_token_id, dtype=torch.long)
+    lengths = torch.zeros(len(node_ids), dtype=torch.long)
     for i, node_id in enumerate(node_ids):
-        text = str(corpus.abstract[node_id])[:600]
+        text = str(corpus.abstract[node_id])[:2000]
         ids = tokenizer(text, add_special_tokens=False).input_ids[:length]
         out[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-    return out
+        lengths[i] = len(ids)
+    return out, lengths
 
 
 class NegativePool:
@@ -80,12 +94,28 @@ class NegativePool:
     pure waste.
     """
 
-    def __init__(self, tokenizer, corpus, node_ids, length=RANK_TOKENS, seed=0):
-        self.node_ids = list(node_ids)
+    def __init__(self, tokenizer, corpus, node_ids, length=RANK_STORED_TOKENS, seed=0):
+        # Stubs are dropped rather than ranked against: an abstract of a dozen words is a free
+        # win for whichever candidate it is, because there is almost nothing in it to be wrong
+        # about, and it teaches the prefix that shortness beats correctness.
+        self.node_ids = [n for n in node_ids
+                         if len(str(corpus.abstract[n]).split()) >= MIN_CANDIDATE_WORDS]
         self.index = {n: i for i, n in enumerate(self.node_ids)}
-        self.ids = candidate_ids(tokenizer, corpus, self.node_ids, length)
+        self.ids, self.lengths = candidate_ids(tokenizer, corpus, self.node_ids, length)
         self.refs = corpus.refs
         self.generator = torch.Generator().manual_seed(seed)
+        self.dropped = len(list(node_ids)) - len(self.node_ids)
+
+    def window(self, row, tokens, random_offset):
+        """-> (tokens,) sliced out of candidate `row`.
+
+        `random_offset=False` returns the opening and is what validation uses, so `rank_acc`
+        stays comparable across epochs and with step 7's numbers. Training uses True.
+        """
+        span = max(1, int(self.lengths[row]) - tokens)
+        start = (int(torch.randint(span, (1,), generator=self.generator))
+                 if random_offset and span > 1 else 0)
+        return self.ids[row, start:start + tokens]
 
     def _hard(self, node_id, want):
         """The node's OWN references, which are the negatives that matter.
@@ -103,19 +133,24 @@ class NegativePool:
         picked = torch.randperm(len(rows), generator=self.generator)[:want]
         return [rows[i] for i in picked.tolist()]
 
-    def sample(self, node_id, count, hard_fraction=RANK_HARD_FRACTION):
-        """-> (count, length) of wrong abstracts: hard ones first, random filling the rest."""
+    def sample(self, node_id, count, tokens=RANK_TOKENS, random_offset=True,
+               hard_fraction=RANK_HARD_FRACTION):
+        """-> (count, tokens) of wrong abstracts: hard ones first, random filling the rest.
+
+        Each negative gets its own window offset, so the gold is not the only candidate whose
+        window moves — a shared offset would make position itself a cue.
+        """
         rows = self._hard(node_id, int(round(count * hard_fraction)))
         taken = set(rows)
         self_row = self.index.get(node_id)
         while len(rows) < count:
-            # Rejection rather than exclusion-by-construction: the pool is 7,750 wide and at
+            # Rejection rather than exclusion-by-construction: the pool is ~8,200 wide and at
             # most ~100 rows are ineligible, so a redraw is cheaper than building a mask.
             row = int(torch.randint(len(self.node_ids), (1,), generator=self.generator))
             if row != self_row and row not in taken:
                 rows.append(row)
                 taken.add(row)
-        return self.ids[rows]
+        return torch.stack([self.window(r, tokens, random_offset) for r in rows])
 
 
 def rank_loss(llm, prefix, gold, negatives, cache_cls, dtype, pad_id, prompt_ids=None):

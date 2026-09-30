@@ -1058,3 +1058,159 @@ pair a controlled ablation on the ranking loss that costs no extra training.
 **Fix before the next run:** index the pool over `train + valid` (or build a second pool for
 validation) so `rank_acc` exists and selection reads it. Until then every run early-stops on LM
 validation loss.
+
+---
+
+## Step 8 — whitened features, VICReg, and the instrumentation that was missing
+
+Built 2026-09-30. The change spec is [`run8_plan.md`](run8_plan.md) and the evidence behind it is
+[`step8_representation_plan.md`](step8_representation_plan.md); this section records what was
+actually implemented, what it measured, and what to run.
+
+### Why
+
+Step 7 produced the most collapsed generations in the project — 34 distinct abstracts out of 945,
+890 of them opening with the same eight words, top-1 identifiability **0.11%** against a chance of
+0.106% — while `prefix/graph_fraction` ran at 1.8 rising to 7.0. The `gate=0` control emitted one
+string for all 945 nodes, scored the same 0.11%, and the adapter arm was word-identical to it for a
+median of 93 words.
+
+The cause is the **input representation**. The pooled reference vectors sit at pairwise cosine
+0.6602 with 0.8127 cosine to the global mean, and `PrefixAdapter.trunk` ends in a LayerNorm, which
+normalises per sample across features and cannot remove a component shared *between* nodes. A
+near-constant input gives a near-constant prefix, and greedy decoding gives one string.
+
+### What was built
+
+**1. `whiten_features.py` (new).** ZCA-whitens `node_embeddings.npy` into
+`node_embeddings_whitened.npy`, fitted on the 383,005 nodes that are not eval or validation seeds,
+with an eigenvalue floor of `1e-3·λmax`, re-normalised to unit length. The fit is streamed in 32k
+blocks, so it runs on a laptop in 15 s at ~1.1 GB peak. `config.NODE_EMBEDDINGS` is what
+`load_graph` now defaults to, so **every** arm — GNN, neighbour tokens, oracle — gets the same
+treatment and the comparisons stay honest. Measured, train-only fit:
+
+| | raw | whitened |
+|---|---|---|
+| eval top-1 out of 945 | 64.34% | **72.59%** |
+| pooled pairwise cosine | 0.6602 | **0.0547** |
+| participation ratio | 122 / 1024 | **948 / 1024** |
+| ‖mean of unit features‖ | 0.5458 | **0.0078** (isotropic ≈ 0.006) |
+
+The script refuses to write unless pooled cosine lands below 0.10 *and* retrieval does not fall.
+That gate is deliberately **not** a retrieval threshold — the first draft set it at 75% from a
+transform fitted on nodes including the eval set, and the honest fit reaches 72.59%, so the gate as
+written would have blocked the transform. Step 7 had 64.34% of the information retrievable and
+delivered 0.11%; what it lacked was contrast, and contrast moved by a factor of twelve. `eps` was
+swept 1e-4…1e-1 on 945 held-out **training** nodes and moves dev retrieval only 69.3%→70.6%, inside
+the noise, so the standard 1e-3 is kept.
+
+**2. VICReg in Stage A** (`pretrain_encoder.py`). `info_nce` normalises `z` and divides by
+τ = 0.05, a ×20 amplification of cosine differences — the objective is *invariant* to anisotropy,
+which is how Stage 10a scored 67% top-1 on a vector the adapter reads as a constant. The variance
+hinge (per-dimension σ ≥ 1) and the off-diagonal covariance term are what it was missing, computed
+on the head output **before** normalisation and at batch 256 where both are estimable. `retrieval`
+now also returns `output_cosine`, and an epoch whose output cosine exceeds 0.40 cannot be selected
+whatever its top-1. If no epoch clears it, the stage exits non-zero rather than handing Stage B a
+collapsed encoder.
+
+**3. Cleaned training targets** (`text.clean_abstract`). The system prompt instructs *"no markup,
+mathematical notation or headings"* while 13.5% of the targets contained exactly that — the
+instruction and the supervision were disagreeing on a fifth of the training data. The cleaner
+unwraps `\textit{…}` and the old `{\em …}` switch form, strips unescaped `$ \( \) \[ \]`
+delimiters, resolves escapes and accents, un-backslashes remaining control words **keeping their
+names**, and drops grouping braces. Residual markup across 40,000 abstracts falls from ~18% to
+**1.0%**, at 21 s of startup cost.
+
+Two rules were changed by measurement rather than by taste, and both were wrong in the first draft:
+
+- deleting control words turns `$\Omega(N \log\log N)$` into `(N N)`; keeping the name gives
+  `Omega (N log log N)`, so the name is kept and the stray space before the bracket is accepted;
+- a rule mapping literal `\n`/`\t` to whitespace was removed outright. Across 60,000 abstracts this
+  corpus has **10** bare `\n`/`\r` escapes and **5,172** LaTeX commands beginning with those
+  letters, so the rule fired almost entirely on `\times`, `\tilde` and `\rho` — turning
+  `a Z \times Z` into `a Z imes Z`.
+
+`generate.py` builds its `Corpus` with `clean=False`, so `original_abstract` in `generations.csv`
+stays byte-identical to all eight earlier runs and the scores remain comparable. Declared
+limitation: the voyage embeddings were computed on the **raw** text and re-embedding 384,756
+documents is not on the table, so cleaning the targets introduces a mild feature/target mismatch.
+
+**4. The `rank_acc` selection bug, fixed.** `NegativePool` was indexed over `sets["train"]` only,
+and `validate()` skips any node not in `pool.index` — so no validation node was ever scored,
+`rank_acc` was never computed, and `selection_score` silently fell back to LM validation loss, the
+criterion step 6 proved is anti-correlated with conditioning. The pool now covers `train + valid`
+(8,245 candidates, less any under 30 words). `run_generate_eval.sh` goes back to `best.pt`.
+
+**5. λ warmed in over epoch 1** (`--rank-warmup 484`). `L_LM` and `L_rank` genuinely conflict and
+step 7 ran at 1.0 from step 0, taking a −0.39 coherence regression exactly when the rank term
+started winning. `train/lambda_rank` is logged.
+
+**6. A random ranking window** (`--rank-offset random`). `NegativePool` now stores 256 tokens per
+candidate and slices a window out of them, with a separate offset per candidate so position itself
+is not a cue. Validation always uses the opening, so `rank_acc` stays comparable with step 7. This
+is **not** a bug fix — the golds are 98.6% distinct by word 8, so the opening was never formulaic —
+it is objective alignment: the opening states the problem, the middle states the method.
+
+**7–9. The instrumentation.** A **generation canary** (`canary()`): 16 fixed validation nodes,
+greedy, 48 new tokens, count distinct strings, at every validation. Not a proxy for collapse but
+collapse itself, measured the way the evaluation measures it — one integer that would have caught
+steps 5, 6 and 7 at epoch 1 instead of after a seven-hour evaluation job. Gradient checkpointing
+forbids the KV cache, so both are toggled around the call and restored; ~18 s per validation.
+Beside it, **`prefix/graph_contrast`** — mean pairwise cosine between the `delta_i` of a fixed
+64-node probe batch — and **`encoder/output_cosine`**. Amplitude is not contrast: `graph_fraction`
+read 7.0 through the whole of step 7 while every node received the same prefix, and no logged
+number was asking whether the prefix varied.
+
+Checkpoints now record `node_embeddings`, and both `train.py --resume` and `generate.py` refuse a
+mismatch. Whitened and raw features have identical shapes, so without it a trained encoder would run
+on a distribution it has never seen and produce fluent text rather than an error.
+
+### How to run
+
+```bash
+python whiten_features.py --dry-run     # gate A, locally, ~15 s; writes nothing
+sbatch hpc/komondor/jobs/run_train_adapter.sh    # whitening -> stage A -> stage B
+sbatch hpc/komondor/jobs/run_generate_eval.sh    # best.pt + gate0, ~14 h of a 24 h walltime
+```
+
+The training job runs the whitening itself when the file is absent, so a failed gate costs minutes
+rather than a day of A100 time. Both stages skip their work when their output already exists, so a
+resubmit after a timeout cannot change the features or the encoder underneath a partially trained
+checkpoint. `verify_rank.py` gained checks for the windowing and the stub filter and runs in the
+job before the GPU work, as the other verifiers do.
+
+Checkpoints go to `checkpoints/qwen14b-run8-whitened/`, the encoder to
+`checkpoints/encoder-gatv2-vicreg.pt` — new names on purpose, since the step-7 files have identical
+shapes and would load silently.
+
+### What has to be true for this to have worked
+
+| | step 7 | run 8 target |
+|---|---|---|
+| top-1 identifiability | 0.32% | 5–15% |
+| distinct abstracts | 195 / 945 | 700–900 |
+| 8-word distinct openings | 6 | > 300 |
+| median words identical to `gate=0` | 93 | < 15 |
+
+Three stop-gates, each cheap enough to act on: **A** pooled cosine < 0.10 before any GPU time
+(passed, 0.0547); **B** Stage A output cosine < 0.40; **C** at epoch 1 of Stage B, canary > 8
+distinct of 16 and `rank_hit` off chance well before step 2,100 — **still flat at chance by step 800
+means the diagnosis is wrong**, and the job should be killed rather than finished.
+
+At or below step 2's frozen-LLM **2.86%** the conclusion is that the representation was not the
+binding constraint, and the next question is the channel — per-neighbour tokens, run 9 — rather than
+the features.
+
+### Open questions and limitations
+
+- **Does whitening survive the GNN?** The +8.3 points is measured through a *mean*. A trained GATv2
+  is not a mean and nothing guarantees its output stays decorrelated — which is why VICReg matters
+  more than the transform, and why `encoder/output_cosine` is logged during Stage B too.
+- **Six changes in one run.** The split is argued in `run8_plan.md` §5: items 4 and 3 are bug fixes,
+  7–9 are instrumentation, 1 and 4 are one hypothesis measured two ways, and **5 and 6 are the two
+  to ablate in 8b** if the result lands between the gates.
+- **Freeze the encoder after Stage A?** Still unsettled, since `infonce_plan.md` §6.
+- **The feature/target mismatch** from cleaning text that was embedded raw is accepted, unquantified.
+- **Why the model writes 105 words against an instructed 150–180** is unexplained and deliberately
+  out of scope — length does not track information across arms (§4.3 of the plan), so it is not a
+  conditioning symptom.

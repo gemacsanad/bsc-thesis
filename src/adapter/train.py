@@ -27,14 +27,16 @@ from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
 
-from config import (BASE_MODEL, BATCH_SIZE, CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE,
-                    EPOCHS, EVAL_EVERY, FROZEN_DIR, GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS,
-                    GRAD_ACCUM, GRAD_CLIP, HIDDEN_SIZE, LAMBDA_RANK, LEARNING_RATE, LOG_EVERY,
-                    LORA_R, LORA_TARGETS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
-                    RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, SEED, WANDB_PROJECT,
-                    WARMUP_STEPS, WEIGHT_DECAY)
+from config import (BASE_MODEL, BATCH_SIZE, CANARY_NODES, CANARY_TOKENS, CHECKPOINT_DIR,
+                    DEFAULT_SETS, ENV_FILE, EPOCHS, EVAL_EVERY, FROZEN_DIR,
+                    GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
+                    HIDDEN_SIZE, LAMBDA_RANK, LEARNING_RATE, LOG_EVERY, LORA_R, LORA_TARGETS,
+                    NODE_EMBEDDINGS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
+                    RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, RANK_WARMUP_STEPS, SEED,
+                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
 from graph import load_graph, make_loader, select_neighbour_rows
 from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
+from prefix_generation import generate_with_prefix, patch_for_prefix
 from rank import NegativePool, rank_loss
 from text import PROMPT, Corpus, encode, graph_only_example
 
@@ -192,14 +194,20 @@ def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dty
     return sliced_loss(llm, hidden, labels), prefix
 
 
-def ranked(llm, prefix, node_id, pool, negatives, tokens, dtype, pad_id, prompt_ids=None):
+def ranked(llm, prefix, node_id, pool, negatives, tokens, dtype, pad_id, prompt_ids=None,
+           random_offset=True):
     """The contrastive term for one node. -> (loss, whether the gold won)
 
     Thin wrapper over rank.rank_loss that owns the sampling, so the training loop and
     validate() draw negatives the same way and neither has to know how.
+
+    `random_offset` slides the scored window along the abstract instead of always taking its
+    opening. Training passes True — the opening states the problem, the middle states the
+    method, and methodology is what the run is trying to recover. Validation passes False, so
+    `rank_acc` measures one fixed thing across epochs and stays comparable with step 7.
     """
-    gold = pool.ids[pool.index[node_id]][:tokens].to(prefix.device)
-    negs = pool.sample(node_id, negatives)[:, :tokens].to(prefix.device)
+    gold = pool.window(pool.index[node_id], tokens, random_offset).to(prefix.device)
+    negs = pool.sample(node_id, negatives, tokens, random_offset).to(prefix.device)
     return rank_loss(llm, prefix, gold, negs, PrefixCache, dtype, pad_id, prompt_ids)
 
 
@@ -212,6 +220,90 @@ def graph_fraction(adapter, prefix):
     with torch.no_grad():
         delta = (prefix.float() - adapter.base).flatten(1).norm(dim=1)
         return (delta / adapter.base.norm()).mean().item()
+
+
+def mean_cosine(v):
+    """Mean pairwise cosine between the rows of `v`, excluding the diagonal."""
+    u = F.normalize(v, dim=1)
+    s = u @ u.T
+    n = u.size(0)
+    return float((s.sum() - s.diagonal().sum()) / (n * (n - 1)))
+
+
+@torch.no_grad()
+def contrast(encoder, adapter, probe, oracle=False):
+    """-> (pairwise cosine between the graph deltas, pairwise cosine of the encoder output)
+
+    `graph_fraction` measures the graph channel's AMPLITUDE. It read 1.8 rising to 7.0 through
+    the whole of step 7 while every node received the same prefix, because amplitude is not
+    contrast and no logged number was measuring contrast. This is that number: 1.0 means every
+    node gets an identical delta, which is exactly the failure step 7 shipped.
+
+    Cheap enough to log at LOG_EVERY — the probe batch is sampled once and kept, so this is a
+    64-node GNN forward with the 14B model untouched.
+
+    For scale: the oracle, which generates 944 distinct abstracts out of 945, is fed vectors at
+    pairwise cosine 0.378; step 7's graph arm was fed 0.660.
+    """
+    encoder.eval()
+    adapter.eval()
+    h = (oracle_vector(probe) if oracle
+         else encoder(probe.x, probe.edge_index, probe.batch_size))
+    g = h[:probe.batch_size].float()
+    delta = (adapter(g).float() - adapter.base).flatten(1)
+    encoder.train()
+    adapter.train()
+    return mean_cosine(delta), mean_cosine(g)
+
+
+@torch.no_grad()
+def canary(llm, encoder, adapter, ntoken, data, node_ids, tokenizer, example, device, dtype,
+           gnn_layers, oracle=False):
+    """Generate greedily for a handful of validation nodes. -> (distinct strings, first one)
+
+    Not a proxy for collapse — collapse itself, measured the way the evaluation measures it.
+    Steps 5, 6 and 7 each shipped a model that wrote one abstract for every paper, and each
+    time the training curves looked reasonable: step 7 posted a falling ranking loss and a
+    rising rank_hit while emitting 2 distinct openings across 945 nodes. This is one integer,
+    logged every EVAL_EVERY steps, that would have said so at epoch 1.
+
+    Generation needs the KV cache and gradient checkpointing forbids it, so both are toggled
+    around the call and restored afterwards. ~18 s per call for 16 nodes x 48 tokens.
+    """
+    llm.gradient_checkpointing_disable()
+    llm.config.use_cache = True
+    llm.eval()
+    encoder.eval()
+    adapter.eval()
+    if ntoken is not None:
+        ntoken.eval()
+
+    outputs = []
+    for batch in make_loader(data, node_ids, 1, shuffle=False, gnn_layers=gnn_layers):
+        batch = batch.to(device)
+        node_id = int(batch.n_id[0])
+        h = encoder(batch.x, batch.edge_index, batch.batch_size)
+        g = oracle_vector(batch) if oracle else h[:batch.batch_size]
+        tokens = None
+        if ntoken is not None:
+            tokens = ntoken(h[select_neighbour_rows(batch, ntoken.max_tokens)]).unsqueeze(0)
+        prompt, _ = example(node_id)
+        input_ids = torch.tensor([tokenizer(prompt).input_ids], device=device)
+        new = generate_with_prefix(
+            llm, input_ids, adapter(g).to(dtype),
+            neighbour_tokens=None if tokens is None else tokens.to(dtype),
+            max_new_tokens=CANARY_TOKENS, do_sample=False,
+            pad_token_id=tokenizer.pad_token_id)
+        outputs.append(tokenizer.decode(new, skip_special_tokens=True).strip())
+
+    llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    llm.config.use_cache = False
+    llm.train()
+    encoder.train()
+    adapter.train()
+    if ntoken is not None:
+        ntoken.train()
+    return len(set(outputs)), outputs[0]
 
 
 @torch.no_grad()
@@ -269,7 +361,8 @@ def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, 
                     if node_id not in pool.index:
                         continue
                     _, correct = ranked(llm, prefix[row:row + 1], node_id, pool, negatives,
-                                        tokens, dtype, pad_id, prompt_ids)
+                                        tokens, dtype, pad_id, prompt_ids,
+                                        random_offset=False)
                     won += correct
                     seen += 1
 
@@ -376,6 +469,17 @@ def main():
                     help="M wrong abstracts ranked against the gold under each node's prefix")
     ap.add_argument("--rank-tokens", type=int, default=RANK_TOKENS,
                     help="T tokens of each candidate that are scored")
+    ap.add_argument("--rank-warmup", type=int, default=RANK_WARMUP_STEPS,
+                    help="optimizer steps over which lambda ramps linearly from 0 to its "
+                         "full value. L_LM and L_rank genuinely conflict — one rewards likely "
+                         "text, the other discriminative text — and step 7 ran at 1.0 from "
+                         "step 0 and took a -0.39 coherence regression at exactly the point "
+                         "the rank term started winning. 0 restores step 7's behaviour")
+    ap.add_argument("--rank-offset", choices=["random", "opening"], default="random",
+                    help="where the scored window is cut from. 'opening' reproduces step 7. "
+                         "'random' slides it along the abstract, so the objective asks about "
+                         "the method and not only the problem statement. Validation always "
+                         "uses the opening, whichever this is, so rank_acc stays comparable")
     ap.add_argument("--rank-context", choices=["prefix", "prompt"], default="prefix",
                     help="where candidates are scored. 'prefix' puts them directly behind the "
                          "KV prefix: ~+60%% on top of the LM forward. 'prompt' reproduces the "
@@ -490,9 +594,20 @@ def main():
     # encoder's output distribution, and a pretrained encoder's differs from a random one's.
     # Step 6 reached graph_fraction 0.70 at a gate of 0.0076, so a hard-coded value would mean
     # something different for every run.
+    # Sampled once and kept: `contrast` runs on it at every logging step, and a NeighborLoader
+    # call per log would cost more than the GNN forward it feeds.
+    probe = next(iter(make_loader(data, sets["train"][:64], 64, shuffle=False,
+                                  gnn_layers=args.gnn_layers))).to(device)
+    # 16 validation nodes, fixed for the run, so the canary's distinct count means the same
+    # thing at every step. Validation nodes rather than training ones: a collapse the model has
+    # memorised its way out of on the training set is still a collapse.
+    canary_nodes = sets["valid"][:CANARY_NODES]
+    # generate() has to be told the cache starts non-empty. Installed once here; it only
+    # affects llm.generate, never the forward passes training runs.
+    patch_for_prefix(llm, NUM_PREFIX_TOKENS,
+                     max_extra=0 if ntoken is None else ntoken.max_tokens)
+
     if args.gate_init > 0 and not args.resume:
-        probe = next(iter(make_loader(data, sets["train"][:64], 64, shuffle=False,
-                                      gnn_layers=args.gnn_layers))).to(device)
         with torch.no_grad():
             h_probe = (oracle_vector(probe) if args.oracle
                        else encoder(probe.x, probe.edge_index, probe.batch_size))
@@ -517,18 +632,26 @@ def main():
     print(f"{which}; trainable parameters: {n_trainable:,}")
 
     # --- the ranking loss's candidates --------------------------------------
-    # Built over the *training* nodes only, for both training and validation. A validation
-    # node's own abstract is never in the pool, so it cannot be drawn as its own negative, and
-    # the negatives a valid node is ranked against are the same population throughout.
+    # Over the training AND validation nodes. It was training-only through step 7, and that was
+    # a bug with a silent consequence: validate() skips any node not in `pool.index`, so no
+    # validation node was ever scored, `rank_acc` was never computed, and `selection_score`
+    # fell back to LM validation loss — the criterion step 6 proved is anti-correlated with
+    # conditioning. best.pt was chosen by exactly the wrong number. A validation node can now
+    # be drawn as some training node's random negative, which is harmless: it is a wrong
+    # abstract like any other, and `sample` still cannot draw a node against itself.
     pool = prompt_ids = None
     if args.lambda_rank > 0 and not args.oracle:
-        pool = NegativePool(tokenizer, corpus, sets["train"], args.rank_tokens, seed=SEED)
+        pool = NegativePool(tokenizer, corpus, sets["train"] + sets["valid"], seed=SEED)
         if args.rank_context == "prompt":
             prompt_ids = torch.tensor(tokenizer(example(sets["train"][0])[0]).input_ids,
                                       device=device)
-        print(f"ranking loss: lambda {args.lambda_rank}, M={args.rank_negatives} negatives "
+        print(f"ranking loss: lambda {args.lambda_rank} over {args.rank_warmup} warmup steps, "
+              f"M={args.rank_negatives} negatives "
               f"(~{RANK_HARD_FRACTION:.0%} from each node's own references), "
-              f"T={args.rank_tokens} tokens, scored behind the {args.rank_context}")
+              f"T={args.rank_tokens} tokens from a {args.rank_offset} window, scored behind "
+              f"the {args.rank_context}")
+        print(f"negative pool: {len(pool.node_ids):,} candidates "
+              f"({pool.dropped} dropped as under 30 words)")
     elif args.oracle:
         # The oracle is fed the target's own embedding, so ranking its own abstract first is
         # not a measurement of anything. Silently training on it would make the ceiling look
@@ -620,6 +743,13 @@ def main():
             f"{args.resume} was trained {'with' if was_oracle else 'without'} --oracle but "
             f"--oracle is {'set' if args.oracle else 'not set'}; one arm sees the target "
             f"abstract and the other does not, so this would not be a continuation")
+        # Whitened and raw features have identical shapes, so this loads cleanly and
+        # continues a trained encoder on a distribution it has never seen.
+        was_features = ckpt.get("node_embeddings", "node_embeddings.npy")
+        assert was_features == os.path.basename(NODE_EMBEDDINGS), (
+            f"{args.resume} was trained on {was_features} but config.NODE_EMBEDDINGS is "
+            f"{os.path.basename(NODE_EMBEDDINGS)}; the feature distributions differ, so this "
+            f"would not be a continuation")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
         if ntoken is not None:
@@ -673,8 +803,14 @@ def main():
             if pool is not None and node_ids[0] in pool.index:
                 rank_term, rank_hit = ranked(llm, prefix[:1], node_ids[0], pool,
                                              args.rank_negatives, args.rank_tokens, dtype,
-                                             tokenizer.pad_token_id, prompt_ids)
-            loss = lm_loss if rank_term is None else lm_loss + args.lambda_rank * rank_term
+                                             tokenizer.pad_token_id, prompt_ids,
+                                             random_offset=args.rank_offset == "random")
+            # Ramped rather than constant: the two terms conflict, and giving L_LM the first
+            # epoch alone lets the register settle before the ranking term starts pulling
+            # against it. It reaches full weight at the end of epoch 1 by construction.
+            lam = args.lambda_rank * (min(1.0, opt_step / args.rank_warmup)
+                                      if args.rank_warmup else 1.0)
+            loss = lm_loss if rank_term is None else lm_loss + lam * rank_term
             (loss / GRAD_ACCUM).backward()
 
             running += lm_loss.item()
@@ -696,9 +832,11 @@ def main():
 
             if opt_step % LOG_EVERY == 0:
                 elapsed = time.time() - clock
+                delta_cos, encoder_cos = contrast(encoder, adapter, probe, args.oracle)
                 extra = (f"  rank {rank_running / rank_n:.4f} (hit {rank_hits / rank_n:.2f})"
                          if rank_n else "")
                 print(f"epoch {epoch} step {opt_step:>5}  loss {running / running_n:.4f}{extra}"
+                      f"  contrast {delta_cos:.3f}"
                       f"  lr {scheduler.get_last_lr()[0]:.2e}  {tokens / elapsed:,.0f} tok/s",
                       flush=True)
                 if run is not None:
@@ -717,8 +855,14 @@ def main():
                            if ntoken is not None else {}),
                         # snapshot from the last micro-batch, not an average over the window
                         "prefix/graph_fraction": graph_fraction(adapter, prefix),
+                        # and the number graph_fraction is NOT: amplitude said 7.0 through the
+                        # whole of step 7 while every node got the same prefix. 1.0 here means
+                        # the channel is constant, whatever its loudness.
+                        "prefix/graph_contrast": delta_cos,
+                        "encoder/output_cosine": encoder_cos,
                         **({"train/rank_loss": rank_running / rank_n,
-                            "train/rank_hit": rank_hits / rank_n} if rank_n else {}),
+                            "train/rank_hit": rank_hits / rank_n,
+                            "train/lambda_rank": lam} if rank_n else {}),
                     }, step=opt_step)
                 running, running_n, tokens, clock = 0.0, 0, 0, time.time()
                 rank_running, rank_hits, rank_n = 0.0, 0, 0
@@ -728,9 +872,14 @@ def main():
                                   example, device, dtype, args.oracle, pool,
                                   args.rank_negatives, args.rank_tokens,
                                   tokenizer.pad_token_id, prompt_ids)
-                print(f"  valid @ step {opt_step}: {report(losses)}", flush=True)
+                distinct, first = canary(llm, encoder, adapter, ntoken, data, canary_nodes,
+                                         tokenizer, example, device, dtype, args.gnn_layers,
+                                         args.oracle)
+                print(f"  valid @ step {opt_step}: {report(losses)}  "
+                      f"canary {distinct}/{len(canary_nodes)} distinct", flush=True)
+                print(f"    >> {first[:160]}", flush=True)
                 if run is not None:
-                    run.log(logged(losses), step=opt_step)
+                    run.log({**logged(losses), "canary/distinct": distinct}, step=opt_step)
                 clock = time.time()
 
         # End-of-epoch validation is what early stopping reads. The periodic --eval-every
@@ -738,6 +887,8 @@ def main():
         losses = validate(llm, encoder, adapter, ntoken, valid_loader, tokenizer, example,
                           device, dtype, args.oracle, pool, args.rank_negatives,
                           args.rank_tokens, tokenizer.pad_token_id, prompt_ids)
+        distinct, _ = canary(llm, encoder, adapter, ntoken, data, canary_nodes, tokenizer,
+                             example, device, dtype, args.gnn_layers, args.oracle)
         score = selection_score(losses)
         improved = score > best_score
         if improved:
@@ -746,10 +897,12 @@ def main():
             bad_epochs += 1
 
         print(f"epoch {epoch + 1} valid: {report(losses)}"
+              f"  canary {distinct}/{len(canary_nodes)} distinct"
               f"  {'best' if improved else f'no improvement {bad_epochs}/{PATIENCE}'}",
               flush=True)
         if run is not None:
             run.log({**logged(losses), "valid/best": best_score,
+                     "canary/distinct": distinct,
                      "valid/bad_epochs": bad_epochs}, step=opt_step)
 
         path = os.path.join(args.out_dir, f"epoch{epoch + 1}.pt")
@@ -761,6 +914,11 @@ def main():
                     "gnn_layers": args.gnn_layers, "gnn_conv": args.gnn_conv,
                     "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
                     "oracle": args.oracle,
+                    # Which node features the encoder was trained on. Whitened and raw features
+                    # have identical shapes, so a checkpoint loaded against the wrong ones
+                    # would run a trained encoder on a distribution it has never seen and
+                    # produce fluent text rather than an error. generate.py refuses a mismatch.
+                    "node_embeddings": os.path.basename(NODE_EMBEDDINGS),
                     "valid_loss": losses["graph"], "best_score": best_score,
                     "rank_acc": losses.get("rank_acc"),
                     "bad_epochs": bad_epochs}, path)

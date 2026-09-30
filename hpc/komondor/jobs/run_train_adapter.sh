@@ -10,6 +10,62 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/train_adapter_%j.err
 #SBATCH --mail-type=END,FAIL
 
+# RUN 8 — whitened features, VICReg in stage A, and the instrumentation that would have
+# caught the last three failures at epoch 1. Full change spec in docs/run8_plan.md.
+#
+# What step 7 found, and why the architecture is not what changed here. Step 7 ran this same
+# job with the ranking loss and a pretrained encoder and produced the most collapsed
+# generations in the project: 34 distinct abstracts out of 945, 890 of them opening with the
+# same eight words, top-1 identifiability 0.11% against a chance of 0.106%. The gate=0 control
+# emitted ONE string for all 945 nodes and scored the same 0.11%, and the adapter arm was
+# word-identical to it for a median of 93 words. Meanwhile prefix/graph_fraction ran at 1.8
+# rising to 7.0 — the graph supplying several times the base prefix norm. The channel was
+# loud and carried nothing.
+#
+# The cause is the input representation, not the encoder, the loss or the adapter. The pooled
+# reference vectors sit at pairwise cosine 0.6602 with 0.8127 cosine to the global mean, so two
+# thirds of their energy is one direction shared by every node; PrefixAdapter.trunk ends in a
+# LayerNorm, which normalises per sample across features and cannot remove a component shared
+# BETWEEN nodes. A near-constant input gives a near-constant prefix, and greedy decoding emits
+# one string. This is anisotropy plus dimensional collapse, both named and both with published
+# remedies — see docs/step8_representation_plan.md for the four converging measurements.
+#
+# Six changes, in three groups. The first two are the hypothesis:
+#
+#   whitened features  whiten_features.py ZCA-whitens node_embeddings.npy before anything reads
+#                      it, and refuses to write if pooled-reference retrieval on the eval set
+#                      does not clear 75%. Measured 64.34% -> 78.52%. It runs in THIS job,
+#                      before the GPU work, so a failed gate costs minutes instead of a day.
+#   VICReg in stage A  InfoNCE is invariant to anisotropy — normalise then divide by tau=0.05
+#                      and it can rank perfectly on a collapsed representation, which is how
+#                      stage 10a scored 67% on a vector the adapter reads as a constant. The
+#                      variance hinge and the covariance term are what it was missing, and
+#                      stage A now also refuses an epoch whose output cosine exceeds 0.40.
+#
+# Two are objective shaping, and they are the two to ablate if the result is ambiguous:
+#
+#   lambda warmup      --rank-warmup 484, one epoch. L_LM and L_rank genuinely conflict and
+#                      step 7 ran at 1.0 from step 0.
+#   random window      --rank-offset random. NOT a bug fix: the golds are 98.6% distinct by
+#                      word 8, so the opening was never formulaic. The opening states the
+#                      problem and the middle states the method, and methodology is the goal.
+#
+# Two are corrections that cannot produce a false positive:
+#
+#   rank_acc fixed     NegativePool now covers train + valid. It was training-only, so no
+#                      validation node was ever scored, rank_acc was never computed, and
+#                      selection silently fell back to LM validation loss — the criterion
+#                      step 6 proved is anti-correlated with conditioning. best.pt was being
+#                      chosen by exactly the wrong number.
+#   cleaned targets    text.clean_abstract strips LaTeX and maths delimiters from the training
+#                      targets. The system prompt instructs "no markup, mathematical notation
+#                      or headings" while 13.5% of the targets contained exactly that.
+#
+# And the instrumentation, which is not optional after three silent collapses: a generation
+# canary (16 validation nodes, greedy, count distinct) at every validation, and
+# prefix/graph_contrast beside graph_fraction — amplitude is not contrast, and no logged number
+# was measuring contrast.
+#
 # STAGE 10b — the contrastive ranking loss, a pretrained encoder, and the gates opened.
 #
 # Trains the graph encoder and prefix adapter against Qwen3-14B, soft-prompt-only: the prompt
@@ -145,12 +201,15 @@ SIF=$BASE_DIR/adapter-qwen-gpu.sif
 # Same argument against checkpoints/qwen14b-oracle-kv192-lora, which holds the ceiling run.
 # graphonly: separate from checkpoints/qwen14b/, which holds the text-path run. train.py refuses
 # to resume across a prompt change, but the fixed best.pt name would still be overwritten.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-rank-gatv2-lora16
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-run8-whitened
 LORA=1                                  # rank 16 on q/k/v, per config.py. k_proj stays in the
                                         # target list although this run has no neighbour
                                         # tokens: it is harmless with none, and leaving it
                                         # means run 2 changes only --neighbour-tokens
-ENCODER=$BASE_DIR/checkpoints/encoder-gatv2.pt   # written by stage 10a in this same job
+# A new name, not a reuse: checkpoints/encoder-gatv2.pt was pretrained on the RAW features and
+# without the VICReg terms, and loading it here would silently start run 8 from step 7's
+# collapsed encoder. The two files have identical shapes, so nothing else would catch it.
+ENCODER=$BASE_DIR/checkpoints/encoder-gatv2-vicreg.pt   # written by stage 10a in this same job
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
 
@@ -209,6 +268,20 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     # look exactly like the run working. Seconds on CPU.
     python verify_rank.py || exit 1
 
+    # --- run 8 gate A: whiten the node features ------------------------------------------
+    # CPU only, a few minutes, and it exits non-zero if pooled-reference retrieval on the eval
+    # set does not clear config.WHITEN_GATE. That check is the cheap half of the run 8
+    # hypothesis: failing it here costs minutes, discovering it after stage B costs a day of
+    # A100 time and another evaluation job. Skipped when the file already exists so a resubmit
+    # after a timeout does not rebuild 1.5 GB — and, more importantly, cannot change the
+    # features underneath a partially trained checkpoint.
+    if [ -f /app/data/processed/joint/node_embeddings_whitened.npy ]; then
+        echo "=== whitening skipped: node_embeddings_whitened.npy already exists ==="
+    else
+        echo "=== run 8 gate A: ZCA-whitening the node features ==="
+        python whiten_features.py || exit 1
+    fi
+
     # --- stage 10a: pretrain the encoder, on the GPU this job already holds ----------------
     # Minutes, no LLM. Skipped when the encoder exists so a resubmit after a timeout does not
     # redo it — and, more importantly, does not overwrite the encoder that a partially trained
@@ -238,8 +311,10 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
         --rank-negatives 8 \
         --rank-tokens 32 \
         --rank-context prefix \
+        --rank-warmup 484 \
+        --rank-offset random \
         --out-dir "$CKPT_DIR" \
         --wandb \
-        --wandb-run "rank-gatv2-lora16-$SLURM_JOB_ID" \
+        --wandb-run "run8-whitened-$SLURM_JOB_ID" \
         ${LORA:-} ${RESUME:-}
 '

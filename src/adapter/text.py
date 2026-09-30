@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import random
+import re
 
 import pandas as pd
 from transformers import AutoTokenizer
@@ -176,16 +177,96 @@ def fits(input_ids):
     return len(input_ids) + NUM_PREFIX_TOKENS <= MAX_LENGTH
 
 
+# --- Run 8: target cleaning ------------------------------------------------------------------
+# Audited over the 7,750 capped training abstracts: inline maths in 13.5%, LaTeX commands in
+# 7.0%, super/subscripts in 6.2%, whitespace runs in 2.1%, escaped characters in 1.2%. No HTML,
+# no entities, no non-Latin text. So the corpus is clean apart from LaTeX and maths, which touch
+# roughly a fifth of it, and those documents score measurably worse on the eval set
+# (bertscore_f1 -0.0110, llm_accuracy -0.0839 across the 93 of 945 golds that carry markup).
+#
+# The stronger reason is a contradiction rather than a correlation: GRAPH_ONLY_SYSTEM instructs
+# "no markup, mathematical notation or headings", and 13.5% of the supervision contains exactly
+# that. The instruction and the targets have been disagreeing on a fifth of the training data.
+#
+# The delimiters go, the content stays: "$O(n^2)$" becomes "O(n^2)", not nothing. Deleting the
+# maths would delete the method, which is the thing the run exists to recover.
+#
+# Declared limitation: the voyage embeddings were computed on the RAW text and re-embedding
+# 384,756 documents is not on the table, so cleaning the targets introduces a mismatch between
+# the feature and the target. It is mild — the features are an input representation, not a
+# label — and it is stated rather than hidden. For the same reason generate.py builds its
+# Corpus with clean=False, so the evaluation golds stay byte-identical to all eight earlier
+# runs and the scores remain comparable.
+_UNWRAP = re.compile(r"\\(?:textit|textbf|emph|texttt|textsc|textrm|mathrm|mathbf|mathit|text)"
+                     r"\s*\{([^{}]*)\}")
+# The old switch form, "{\em text}" rather than "\emph{text}", which is common in abstracts
+# written before the 2000s. Without it the braces survive into the target as "{em text}".
+_UNWRAP_SWITCH = re.compile(r"\{\\(?:em|it|bf|tt|sl|sc|rm)\s+([^{}]*)\}")
+_MATH_DELIM = re.compile(r"(?<!\\)\$+")
+# The last four are the \( \) \[ \] inline- and display-maths delimiters, which are the same
+# class of thing as $ and go the same way: the delimiter is removed, the maths inside stays.
+_ESCAPES = {r"\%": "%", r"\&": "&", r"\_": "_", r"\$": "$", r"\#": "#", r"\\": " ",
+            r"\ ": " ", r"\(": " ", r"\)": " ", r"\[": " ", r"\]": " "}
+# Accent escapes: "Verd\'u" -> "Verdu", "na\"ive" -> "naive". The mark goes rather than being
+# kept as punctuation, which would leave a stray quote in the middle of a word.
+_ACCENT = re.compile(r"""\\['"`^~=.]""")
+_BRACES = re.compile(r"[{}]")
+_COMMAND = re.compile(r"\\([a-zA-Z]+)\s*")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def clean_abstract(text):
+    r"""Strip LaTeX markup and maths delimiters, keeping their contents. -> str
+
+    The order of the six steps is load-bearing and each one is here because the previous one
+    would otherwise do damage:
+
+      1. unwrap the known text-styling commands, innermost first, in both the modern form
+         ("\emph{x}") and the old switch form ("{\em x}");
+      2. strip unescaped maths delimiters, BEFORE step 3 — otherwise a price written "US\$49"
+         becomes "US$49" and then loses its dollar sign along with the real delimiters;
+      3. resolve the remaining escapes to their literals;
+      4. un-backslash any control word that is left, keeping its NAME. Deleting it instead was
+         tried and is wrong: "$\Omega(N \log\log N)$" becomes "(N N)" under deletion and
+         "Omega (N log log N)" under this — the stray space before the bracket is accepted,
+         because every rule that removes it also glues "\log\log" into "loglog";
+      5. drop accent escapes and the grouping braces the commands leave behind
+         ("\tilde{O}" -> "tilde O");
+      6. collapse whitespace.
+
+    There is deliberately NO rule turning a literal "\n" or "\t" two-character sequence into
+    whitespace. It was in the first version and it was wrong: across 60,000 abstracts this
+    corpus has **10** bare "\n"/"\r" escapes and **5,172** LaTeX commands beginning with those
+    letters, so the rule fired almost exclusively on "\times", "\tilde" and "\rho" — turning
+    "a Z \times Z" into "a Z imes Z". Step 4 handles all of them.
+    """
+    text = str(text)
+    for _ in range(3):                       # nested \textbf{\textit{x}}; 3 covers the corpus
+        text, n = _UNWRAP.subn(r"\1", text)
+        text, m = _UNWRAP_SWITCH.subn(r"\1", text)
+        if not n and not m:
+            break
+    text = _MATH_DELIM.sub("", text)         # delimiters only; the maths itself stays
+    for src, dst in _ESCAPES.items():
+        text = text.replace(src, dst)
+    text = _ACCENT.sub("", text)
+    text = _COMMAND.sub(r"\1 ", text)
+    text = _BRACES.sub(" ", text)
+    return _WHITESPACE.sub(" ", text).strip()
+
+
 class Corpus:
     """Node text and reference lists, for turning a node_id into a training example."""
 
-    def __init__(self, nodes=None, edges=None):
+    def __init__(self, nodes=None, edges=None, clean=True):
         nodes = nodes or os.path.join(JOINT_DIR, "nodes.csv")
         edges = edges or os.path.join(JOINT_DIR, "edges.csv")
 
         df = pd.read_csv(nodes, usecols=["node_id", "title", "abstract"]).set_index("node_id")
         self.title = df["title"].fillna("")
         self.abstract = df["abstract"].fillna("")
+        if clean:
+            self.abstract = self.abstract.map(clean_abstract)
         self.refs = pd.read_csv(edges).groupby("src_node_id")["dst_node_id"].apply(list)
 
     def example(self, tokenizer, node_id):

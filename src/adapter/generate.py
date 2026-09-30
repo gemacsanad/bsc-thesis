@@ -68,8 +68,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
-                    FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR,
-                    MAX_LENGTH, MAX_NEW_TOKENS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
+                    FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR, MAX_LENGTH, MAX_NEW_TOKENS,
+                    NODE_EMBEDDINGS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
 from graph import load_graph, make_loader, select_neighbour_rows
 from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
 from prefix_generation import generate_with_prefix, patch_for_prefix
@@ -128,6 +128,13 @@ def load_adapter(path, device, sets, llm, oracle):
         f"{path} was trained {'with' if was_oracle else 'without'} --oracle but generation "
         f"has --oracle {'set' if oracle else 'not set'}; the adapter would be fed a kind of "
         f"vector it was never trained on")
+    # Whitened and raw node features have identical shapes (run 8, whiten_features.py), so a
+    # mismatch loads cleanly and runs a trained encoder on a distribution it has never seen.
+    was_features = checkpoint.get("node_embeddings", "node_embeddings.npy")
+    assert was_features == os.path.basename(NODE_EMBEDDINGS), (
+        f"{path} was trained on {was_features} but config.NODE_EMBEDDINGS is "
+        f"{os.path.basename(NODE_EMBEDDINGS)}; the encoder would be fed a feature "
+        f"distribution it was never trained on")
     gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
     gnn_conv = checkpoint.get("gnn_conv", "sage")  # everything before stage 9 was GraphSAGE
     encoder = GraphEncoder(num_layers=gnn_layers, conv=gnn_conv).to(device)
@@ -228,7 +235,12 @@ def main():
     # --- data -------------------------------------------------------------
     with open(os.path.join(FROZEN_DIR, eval_file)) as f:
         eval_nodes = json.load(f)
-    corpus = Corpus()
+    # clean=False: the evaluation golds stay byte-identical to all eight earlier runs, so the
+    # scores remain comparable. Training cleans its targets (text.clean_abstract) because the
+    # prompt instructs "no markup, mathematical notation or headings" while 13.5% of the
+    # targets carried exactly that — but cleaning what the generations are SCORED against
+    # would silently move every number in experiments/.
+    corpus = Corpus(clean=False)
     mag_id = pd.read_csv(os.path.join(JOINT_DIR, "nodes.csv"),
                          usecols=["node_id", "mag_id"]).set_index("node_id")["mag_id"]
     print(f"{len(eval_nodes)} eval nodes, mode={args.mode}, sets={args.sets} ({eval_file})")

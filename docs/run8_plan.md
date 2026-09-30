@@ -20,7 +20,7 @@ lied. Today: **0.32% top-1, 195/945 distinct.** Chance is 0.106%.
 
 | # | change | file | verification |
 |---|---|---|---|
-| 1 | **ZCA-whiten the node features**, fitted on non-eval nodes, eigenvalue floor `1e-3·λmax`, L2-renormalised afterwards. Written to `node_embeddings_whitened.npy`; `load_graph` already takes an `embeddings` path, so nothing else changes. | new `src/adapter/whiten_features.py`, `config.py` | pooled-reference retrieval on the 945 eval nodes ≥ 75% (measured 78.52% with a leaky fit; a train-only fit must be re-measured and is expected to be lower) |
+| 1 | **ZCA-whiten the node features**, fitted on the 383,005 non-eval/valid nodes, eigenvalue floor `1e-3·λmax`, L2-renormalised afterwards. Written to `node_embeddings_whitened.npy`; `load_graph` already takes an `embeddings` path, so nothing else changes. | new `src/adapter/whiten_features.py`, `config.py` | **measured**: pooled pairwise cosine 0.6602 → **0.0547**, eval retrieval 64.34% → **72.59%**, participation ratio 122 → 948 of 1024. Gate is cosine < 0.10 and no loss of retrieval — *not* a retrieval threshold; see below |
 | 2 | **Fix the `rank_acc` selection bug.** `NegativePool` is indexed over `sets["train"]`, so no validation node is ever in it, `rank_acc` is never computed, and `selection_score` silently falls back to LM validation loss — the criterion step 6 proved is anti-correlated with conditioning. Index over `train + valid`. | `train.py:525` | `valid/rank_acc` appears in W&B from the first validation, and is not `None` |
 | 3 | **Clean the targets**: unwrap `\textit{…}`/`\emph{…}`, strip `$` delimiters keeping their contents, decode `\%` `\&` `\\`, collapse whitespace runs, drop the one empty abstract and anything under 30 words from the training set *and* the negative pool. | `text.py`, `rank.py` | the §4.1 artefact counts go to ~0 on a re-audit; train-set size falls by <10 nodes |
 
@@ -89,7 +89,7 @@ changes six, so the split has to be stated:
 ## 6. Order of operations
 
 ```
-1.  whiten features locally            -> gate A: eval retrieval >= 75%
+1.  whiten features locally            -> gate A: pooled cosine < 0.10, retrieval not worse
 2.  re-audit cleaned text locally      -> artefact counts ~0
 3.  Stage A on GPU (cheap, no 14B)     -> gate B: output pairwise cosine < 0.4 AND top-1 > 64.34%
 4.  Stage B, 10 epochs, patience 2     -> gate C at epoch 1 (below)
@@ -98,6 +98,13 @@ changes six, so the split has to be stated:
 
 Evaluation goes back to **`best.pt`** once item 2 lands — the last-epoch override in
 `run_generate_eval.sh` exists only because selection was silently reading LM validation loss.
+
+**Gate A is not a retrieval threshold, and that is a correction.** The first draft of this plan set
+it at "eval retrieval ≥ 75%", transcribed from a measurement whose transform had been fitted on
+nodes including the eval set. The honest train-only fit reaches 72.59%, and the gate as written
+would have blocked a transform that does exactly what it is for. Retrieval was never the diagnosis:
+step 7 had 64.34% of the information retrievable and delivered 0.11%. The quantity that failed is
+**contrast between nodes**, and that is what the gate now reads.
 
 **Gate C, at epoch 1 of Stage B:** canary shows **> 8 distinct of 16**, and `rank_hit` has left
 chance (0.111) well before step 2,100. It took 2,100 steps last time to extract signal from a

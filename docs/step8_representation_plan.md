@@ -92,18 +92,32 @@ eigenvalue floor, so these are regularised numbers, not the optimistic ones):
 | **C. `pool(ZCA(features))` — whiten the inputs, then pool** | **78.52%** |
 | D. both | 83.81% |
 
-**Whitening the input features recovers +14.2 of the available +20 points**, and it is ordinary
-feature preprocessing — no new model component, applied identically to the GNN, the neighbour
-tokens and the oracle, so every arm is treated the same and the comparisons stay honest. That
-placement answers the objection to bolting a fixed 1024×1024 matrix onto the adapter: the anisotropy
-belongs to the features, so it should be corrected where the features are made.
+It is ordinary feature preprocessing — no new model component, applied identically to the GNN, the
+neighbour tokens and the oracle, so every arm is treated the same and the comparisons stay honest.
+That placement answers the objection to bolting a fixed 1024×1024 matrix onto the adapter: the
+anisotropy belongs to the features, so it should be corrected where the features are made.
 
-For scale: the **oracle**, which generates 944 distinct abstracts at 16.72% top-1, is fed vectors at
-pairwise cosine **0.378**. Step 7's graph arm was fed **0.660**. Centring alone takes the graph
-input past the oracle's contrast.
+**Correction (2026-09-30), from the honest fit.** The table above was fitted on nodes *including*
+the eval set. `whiten_features.py` fits on the 383,005 nodes that are not eval or validation seeds,
+and the retrieval gain is smaller than the leaky fit promised:
 
-**Caveat.** These are fitted on the nodes reachable from the eval set. The production transform must
-be fitted on the **training** nodes only, with shrinkage, and verified on eval before it is trusted.
+| | raw | whitened (train-only fit) |
+|---|---|---|
+| eval top-1 out of 945 | 64.34% | **72.59%** (+8.3, not +14.2) |
+| pooled pairwise cosine | 0.6602 | **0.0547** |
+| participation ratio | 122 / 1024 | **948 / 1024** |
+| ‖mean direction‖ | 0.5458 | **0.0078** (isotropic ≈ 0.006) |
+
+**Retrieval was never the diagnosis, and it should not be the gate.** Step 7 had 64.34% of the
+information retrievable and delivered 0.11% — what it lacked was a prefix that *varied between
+nodes*. That is the row that moved by a factor of twelve. The **oracle**, which generates 944
+distinct abstracts at 16.72% top-1, is fed vectors at pairwise cosine **0.378**; whitening takes the
+graph input to **0.055**, seven times past it. The gate in `config.py` is therefore pooled cosine
+< 0.10 *and* no loss of retrieval, both measured in the same run so neither can go stale.
+
+`eps` barely matters: swept from 1e-4 to 1e-1 over 945 held-out **training** nodes — never the eval
+set — dev retrieval moves only between 69.3% and 70.6%, which is inside the noise at n=945. 1e-3 is
+kept as the standard choice rather than chasing a 1.3-point difference.
 
 ### 3.3 Fixing it in the objective instead of by matrix
 

@@ -44,14 +44,23 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.utils import coalesce, remove_self_loops
 
-from config import (FROZEN_DIR, GNN_LAYERS, JOINT_DIR, NUM_NEIGHBOUR_TOKENS,
-                    num_neighbors)
+from config import (FROZEN_DIR, GNN_LAYERS, JOINT_DIR, NODE_EMBEDDINGS,
+                    NUM_NEIGHBOUR_TOKENS, num_neighbors)
 
 
 def load_graph(embeddings=None, edges=None):
-    """Build the directed reference graph with voyage embeddings as node features."""
-    embeddings = embeddings or os.path.join(JOINT_DIR, "node_embeddings.npy")
+    """Build the directed reference graph with voyage embeddings as node features.
+
+    Since run 8 the default is the ZCA-whitened features (config.NODE_EMBEDDINGS), written by
+    whiten_features.py. The raw voyage features are anisotropic enough that the adapter read
+    them as a constant — see docs/step8_representation_plan.md. Every arm loads through here,
+    so the oracle, the GNN and the neighbour tokens all get the same treatment.
+    """
+    embeddings = embeddings or NODE_EMBEDDINGS
     edges = edges or os.path.join(JOINT_DIR, "edges.csv")
+    assert os.path.exists(embeddings), (
+        f"{embeddings} does not exist — run `python whiten_features.py` first, or point "
+        f"config.NODE_EMBEDDINGS back at node_embeddings.npy to reproduce a pre-run-8 run")
 
     x = torch.from_numpy(np.load(embeddings))
     citing, cited = torch.from_numpy(

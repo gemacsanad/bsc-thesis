@@ -10,10 +10,19 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/generate_eval_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# STAGE 10 — scores the checkpoint from run_train_adapter.sh's step-7 run: a pretrained
-# encoder, the contrastive ranking loss, opened gates and LoRA back to r=16. Pooled prefix
-# only — this run has no per-neighbour tokens.
-# See docs/soft_prompt_only.md, step 7, and docs/step6_failure_analysis.md.
+# RUN 8 — scores the checkpoint from run_train_adapter.sh's run-8 training: ZCA-whitened node
+# features, VICReg in stage A, a warmed-in ranking loss over a random window, cleaned targets
+# and the rank_acc selection bug fixed. Pooled prefix only — no per-neighbour tokens.
+# See docs/run8_plan.md and docs/step8_representation_plan.md.
+#
+# The targets were cleaned for TRAINING only. generate.py builds its Corpus with clean=False,
+# so original_abstract in generations.csv is byte-identical to all eight earlier runs and the
+# scores stay comparable. Nothing here needs to do anything about that; it is stated because
+# the asymmetry is deliberate and would otherwise look like an oversight.
+#
+# Success, from docs/run8_plan.md §7: 5-15% top-1 and 700-900 distinct abstracts, against
+# step 7's 0.32% and 195. At or below step 2's 2.86% means the representation was not the
+# binding constraint and the next question is the channel, not the features.
 #
 # THE BAR IS STEP 2, not step 5 or step 6. Beating the runs that collapsed proves nothing.
 # The frozen-LLM graph run (experiments/2026-09-17-14395431_...) is the best the graph has
@@ -105,29 +114,31 @@ mkdir -p $BASE_DIR/logs
 # Nothing here names an architecture either: the encoder kind, the encoder depth, the
 # neighbour-token width and the LoRA tensors are all read back out of the checkpoint, so a
 # wrong directory scores another run's weights but can never build the wrong model for them.
-CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-rank-gatv2-lora16
-ARM=rank-gatv2-lora16                   # experiments/<date>-<job>_$ARM/
+CKPT_DIR=$BASE_DIR/checkpoints/qwen14b-run8-whitened
+ARM=run8-whitened                       # experiments/<date>-<job>_$ARM/
 RUN_BASELINE=0                          # 0 to generate the adapter arm only
 RUN_GATE0=1                             # graph off in BOTH channels — the floor
 RUN_NGATE0=0                            # OFF: there are no neighbour tokens in this run, so
                                         # the arm has nothing to ablate. generate.py asserts
                                         # rather than scoring the adapter arm under its name
 
-# The LAST epoch, not best.pt. best.pt is chosen by train.py's selection_score, which is meant
-# to read validation ranking accuracy — but NegativePool is indexed over the *training* nodes,
-# so no validation node is ever in it, rank_acc is never computed, and selection silently falls
-# back to LM validation loss: the criterion step 6 proved is anti-correlated with conditioning.
-# It picked epoch 4 here, and the ranking loss did not leave chance until step ~2.1k (epoch 5),
-# where rank_hit went 0.11 -> 0.35 and the gates opened while the LM validation loss rose. So
-# best.pt is the checkpoint from immediately before the effect this run exists to measure.
-# `sort -V` so epoch10 would beat epoch2. Restore best.pt once that selection bug is fixed.
-LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
-if [ -z "$LATEST" ]; then
-    echo "no checkpoint in $CKPT_DIR — run run_train_adapter.sh first" >&2
+# best.pt again, and that is a revert with a reason. Step 7 was evaluated at its LAST epoch
+# because selection was broken: NegativePool was indexed over the *training* nodes, so no
+# validation node was ever in it, rank_acc was never computed, and selection_score silently
+# fell back to LM validation loss — the criterion step 6 proved is anti-correlated with
+# conditioning. It picked epoch 4, immediately before the effect the run existed to measure.
+#
+# Run 8 indexes the pool over train + valid, so valid/rank_acc is a real number from the first
+# validation and best.pt is the highest-ranking epoch again. If valid/rank_acc is missing from
+# the W&B run, the bug is back and this should go to the last epoch instead:
+#   LATEST=$(ls -1 "$CKPT_DIR"/epoch*.pt 2>/dev/null | sort -V | tail -1)
+CKPT=$CKPT_DIR/best.pt
+if [ ! -f "$CKPT" ]; then
+    echo "no best.pt in $CKPT_DIR — run run_train_adapter.sh first" >&2
     exit 1
 fi
-echo "evaluating checkpoint $LATEST as $ARM"
-export SINGULARITYENV_CKPT="/app${CKPT_DIR#$BASE_DIR}/$(basename "$LATEST")"
+echo "evaluating checkpoint $CKPT as $ARM"
+export SINGULARITYENV_CKPT="/app${CKPT_DIR#$BASE_DIR}/best.pt"
 
 # Each condition gets its own experiment directory, named for the day, the job and the arm,
 # so several depths evaluated on one day stay tellable apart in experiments/.
