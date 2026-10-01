@@ -110,7 +110,7 @@
 # TWO STAGES, ONE JOB. Stage 10a (pretrain_encoder.py) is InfoNCE on the graph encoder with no
 # LLM loaded: it takes minutes, not hours. It runs here rather than as its own submission so
 # that one queue wait covers both — a separate job would spend longer waiting for a GPU than
-# using one. It is skipped when checkpoints/encoder-gatv2.pt already exists, so a resubmit
+# using one. It is skipped when checkpoints/encoder-gatv2-vicreg.pt already exists, so a resubmit
 # after a timeout goes straight to training and never overwrites the encoder that the
 # partially-trained checkpoint was initialised from.
 #
@@ -209,6 +209,9 @@ LORA=1                                  # rank 16 on q/k/v, per config.py. k_pro
 # A new name, not a reuse: checkpoints/encoder-gatv2.pt was pretrained on the RAW features and
 # without the VICReg terms, and loading it here would silently start run 8 from step 7's
 # collapsed encoder. The two files have identical shapes, so nothing else would catch it.
+# The -vicreg suffix must match the --out the stage 10a loop below writes. Job 14473284 died
+# at stage 10b because it did not: the loop wrote encoder-gatv2.pt and train.py opened
+# encoder-gatv2-vicreg.pt. Changing one of these two lines means changing both.
 ENCODER=$BASE_DIR/checkpoints/encoder-gatv2-vicreg.pt   # written by stage 10a in this same job
 
 mkdir -p "$CKPT_DIR" $BASE_DIR/logs
@@ -294,7 +297,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
             python pretrain_encoder.py \
                 --gnn-layers 2 \
                 --gnn-conv "$CONV" \
-                --out "/app/checkpoints/encoder-$CONV.pt" \
+                --out "/app/checkpoints/encoder-$CONV-vicreg.pt" \
                 --wandb \
                 --wandb-run "pretrain-$CONV-$SLURM_JOB_ID" || exit 1
         done

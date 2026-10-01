@@ -1214,3 +1214,47 @@ the features.
 - **Why the model writes 105 words against an instructed 150–180** is unexplained and deliberately
   out of scope — length does not track information across arms (§4.3 of the plan), so it is not a
   conditioning symptom.
+
+## Step 8, attempt 1 — job 14473284 died between its own two stages
+
+The first run-8 submission completed gate A and both of stage 10a, then crashed at the first line
+of stage 10b:
+
+```
+FileNotFoundError: No such file or directory: '/app/checkpoints/encoder-gatv2-vicreg.pt'
+```
+
+**Cause.** The run-8 edits deliberately gave the pretrained encoder a new filename, so that a
+resubmit could not silently initialise from step 7's raw-feature encoder — the two files have
+identical shapes, so nothing downstream would have caught the substitution. The `ENCODER`
+variable was renamed to `encoder-gatv2-vicreg.pt`; the `--out` inside the stage 10a loop was not,
+and still wrote `encoder-$CONV.pt`. Stage 10a therefore succeeded under the old names and stage
+10b opened the new one.
+
+**Collateral.** Because the loop wrote the old names, it overwrote step 7's
+`checkpoints/encoder-gatv2.pt` and `checkpoints/encoder-sage.pt` on Komondor — the exact
+substitution the rename existed to prevent, in the opposite direction. Nothing run 8 produces is
+affected: the files written are correct run-8 encoders. Step 7's encoder weights are no longer on
+disk and would have to be re-derived by running `pretrain_encoder.py` against
+`node_embeddings.npy`. Its adapter checkpoints and generations are untouched.
+
+**Fix.** One line: the loop now writes `encoder-$CONV-vicreg.pt`. The two lines that have to agree
+are now 215 and 300 of `run_train_adapter.sh`, and each carries a comment naming the other.
+
+**What the dead job still measured.** Gate A passed, so the whitened features exist on Komondor
+and the resubmit skips rebuilding them. Stage 10a passed for both convolutions, which means both
+cleared `ENCODER_COSINE_GATE = 0.40`:
+
+| | eval top-1 (945 nodes) | top-5 | output cosine |
+|---|---|---|---|
+| untrained reference mean | 64.34% | — | — |
+| GraphSAGE, 2 layers, VICReg | 68.25% | 94.18% | 0.031 |
+
+GATv2's numbers are earlier in the same log (`grep -A2 'best eval top-1'`). The output cosine of
+0.031 is the number step 7 never had: stage 10a previously scored 67% on a representation whose
+outputs were near-collinear, because InfoNCE is invariant to that. 0.031 is a representation the
+adapter can actually read as node-dependent.
+
+**Generalisable lesson.** Renaming an artefact to prevent a silent reuse has to change the writer
+and the reader in the same edit, or it converts a silent failure into a loud one at best and a
+silent overwrite at worst. Here it did both at once.
