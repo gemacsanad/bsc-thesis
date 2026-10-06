@@ -1258,3 +1258,130 @@ adapter can actually read as node-dependent.
 **Generalisable lesson.** Renaming an artefact to prevent a silent reuse has to change the writer
 and the reader in the same edit, or it converts a silent failure into a loud one at best and a
 silent overwrite at worst. Here it did both at once.
+
+---
+
+## Step 8, attempt 2 — job 14480430 trained, 14482476 evaluated: the collapse survived
+
+Training ran to early stopping (3 epochs, 1,450 optimizer steps, patience 2). Evaluation produced
+`experiments/2026-10-05-14482476_run8-whitened/` and its `-gate0` control. Both are 945 rows.
+
+### Scorecard against the run-8 targets
+
+The step-7 column is `2026-09-29-14463510_rank-gatv2-lora16`, the directory the run-8 targets were
+set against. (The other step-7 directory, `14462189`, is a different checkpoint of the same run:
+34 distinct, 0.11% top-1. Only `14462189` has a `gate0` sibling, so the paired graph-contribution
+numbers below come from that pair.)
+
+| | step 2 (the bar) | step 7 | run 8 target | **run 8 actual** |
+|---|---|---|---|---|
+| top-1 identifiability | 2.86% | 0.32% | 5–15% | **0.00%** |
+| distinct abstracts | 809 | 195 | 700–900 | **59** |
+| distinct 8-word openings | — | 6 | > 300 | **2** |
+| median words identical to gate=0 | — | 93 | < 15 | **1** ✓ |
+| judge accuracy | 1.737 | 1.377 | — | 1.519 |
+| judge coherence | 7.423 | 7.840 | — | **5.108** |
+| judge language | 7.544 | 7.993 | — | **6.423** |
+
+One target was met and it is not a cosmetic one: the output stops tracking `gate=0` at word 1
+instead of word 93, and the graph channel's paired contribution to judge accuracy is **+0.224**
+(t = 10.2, 288 nodes better / 99 worse) against step 7's +0.075. The graph is connected to the
+output for the first time in the project. It carries almost nothing.
+
+Three numbers say how little. Across all 945 generated abstracts there are **199 distinct word
+types**; the 945 golds have 17,344. The 59 distinct strings are **9 distinct by their first 200
+characters** — the rest differ only in where they stop. The rate of verbatim-duplicated sentences
+inside a single abstract is **0.144**, against 0.004 at step 7 and 0.000 in the golds: the model
+loops, which is what the 2.7-point coherence regression is measuring.
+
+### Root cause: the decorrelation guarantees were enforced on a tensor Stage B discards
+
+`pretrain_encoder.py` computes `z = head(h)`, where `head` is `nn.Linear(1024, 1024)`. InfoNCE,
+the VICReg variance hinge, the VICReg covariance term, the reported top-1, and `output_cosine` —
+the quantity `ENCODER_COSINE_GATE = 0.40` gates on — are **all functions of `z`**. `train.py`
+loads `pre["encoder"]` and never reads `pre["head"]`; the adapter is fed **`h`**. The flag's own
+help text states the decision: *"The head is not loaded: it existed to put the anchor in voyage
+space, and nothing downstream is in it."* That is right about the head's purpose and wrong about
+its consequence — the head is also the only module the decorrelation constraints ever touched.
+
+Three measurements close the argument:
+
+1. **`PrefixAdapter` passes input collinearity through at ≈1:1.** Sweeping a 64-node batch through
+   `trunk → codes → decoders` at initialisation: input pairwise cosine 0.086 → delta 0.085,
+   0.507 → 0.460, 0.902 → 0.875. So `prefix/graph_contrast` is a direct readout of the pairwise
+   cosine of `h`. (The decoders' bias contributes 3.2% of the delta's energy — not the cause.)
+2. **`prefix/graph_contrast` read ≈0.85 at step 10**, then climbed to ≈0.99. Ten steps at
+   lr ≈ 1e-5 move every weight by ~0.3% of its own scale, so this is not something training did:
+   `h` was already ≈0.85 collinear at the instant Stage A certified `head(h)` at 0.031.
+3. **A single rank-1 linear projection is enough to hide it.** With a dominant shared direction
+   `u`, `h` at pairwise cosine 0.878 becomes 0.000 under `(I − uu^T)`. VICReg paid the head to
+   learn exactly that, and the head is the cheapest place in the network to do it.
+
+So input whitening worked, VICReg worked and the gate worked — on the wrong tensor. The encoder
+re-concentrated the features downstream of the whitened inputs and the head masked it. This also
+retro-explains step 7 at 0.660 under the same architecture, and it means the "output cosine 0.031"
+in the previous section is a property of `head(h)`, not of what the adapter reads.
+
+### Second, independent failure: the ranking loss posed an unwinnable task
+
+`RANK_HARD_FRACTION = 0.5` draws half the negatives from the node's **own references**. The prefix
+is a pooled function of those references, so it sits closer to them than to the target by
+construction. Measured on the 945 eval nodes in clean Voyage space — no LLM, no encoder, no noise,
+so this is a ceiling and not a result:
+
+| M negatives | chance | hard=0 | hard=0.25 | **hard=0.5** |
+|---|---|---|---|---|
+| 8 | 11.1% | 97.2% | 61.2% | **46.1%** |
+| 32 | 3.0% | 93.2% | 32.3% | 22.3% |
+| 128 | 0.8% | 74.7% | 13.5% | 10.4% |
+
+The target beats **all** of its own references only 10.8% of the time; its median rank among its
+own ~52 references is 8. Run 8's configuration therefore capped at 46.1% before anything could go
+wrong, and what the run observed is the floor of that: `train/rank_loss` 2.55 → **2.18** against
+ln 9 = **2.197**, `train/rank_hit` ≈ 0.115 against chance 0.111, and `valid/rank_acc` 0.076–0.095
+— *every* validation reading **below** chance, which is what systematically preferring the
+references over the target looks like.
+
+`--lambda-rank 1.0` therefore weighted a term carrying no gradient. The LM loss ran unopposed, and
+the LM loss prefers a constant prefix: `prefix/graph_fraction` rose 0.2 → 2.5 while
+`prefix/graph_contrast` rose 0.85 → 0.99. The channel got twelve times louder and simultaneously
+went constant. That is step 7's pathology exactly, one module downstream, now instrumented.
+
+### Third: selection and the stop-gates
+
+`selection_score` returns `rank_acc`. `rank_acc` never cleared chance, so `best.pt` is the argmax
+of noise — and it chose step 500, the step whose `canary/distinct` read **1 of 16**, the worst
+reading of the entire run. The canary was built to catch this at epoch 1 and did; nothing read it.
+
+The run-8 plan's stop-gate C says, in prose: *"still flat at chance by step 800 means the diagnosis
+is wrong, and the job should be killed rather than finished."* It was flat at chance by step 200.
+The job ran 1,450 steps and then ~7 GPU-hours of evaluation. Gate A was code and it fired. Gate C
+was a sentence in a document and it did not.
+
+### What to change, in order
+
+1. **Stop discarding the head** — either load `pre["head"]` and make the encoder path
+   `adapter(head(h))`, or fold the linear head into `GraphEncoder` as its output layer so there is
+   nothing to discard. The tensor Stage A certifies and the tensor Stage B consumes must be one.
+2. **Gate on what Stage B consumes.** Add the pairwise cosine of raw `h` to `retrieval()` and gate
+   on both. One line, and it would have caught this before any GPU time.
+3. **`RANK_HARD_FRACTION` 0.5 → 0 and `RANK_NEGATIVES` 8 → 32.** Ceiling 46.1% → 93.2% at a chance
+   of 3.0%: solvable, a 31× lift, not saturated. Reintroduce hard negatives as a curriculum only
+   after `rank_hit` clears chance. The principled version is leave-one-out pooling — drop a
+   reference from the prefix when it is that step's negative — but it needs a masked GNN forward.
+4. **Make gates C and D executable.** Assert in `train.py`: after warmup + 300 steps,
+   `rank_hit < 1.5/(M+1)` exits non-zero; and refuse to write `best.pt` on an epoch whose canary
+   is below a threshold.
+5. **Only if 1–3 are not enough:** carry a variance/covariance penalty into Stage B on the probe
+   batch's `delta`. The VICReg docstring rules this out at micro-batch 1, but the 64-node probe
+   already exists and `contrast()` already runs on it every 10 steps.
+
+Items 1 and 2 are a handful of lines and gate everything else: until the adapter is fed a
+decorrelated tensor, no result downstream of it can be attributed.
+
+### Generalisable lesson
+
+A metric, a loss term and a stop-gate are only worth what the tensor they read is worth. Run 8
+added all three and pointed them at `head(h)` while the model consumed `h`. The reliable form of
+the check is to assert the property on the exact tensor the next stage loads, at the boundary
+where it is handed over.
