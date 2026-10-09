@@ -55,6 +55,26 @@ Usage:
                        --checkpoint ../../checkpoints/epoch2.pt
 
 Both are resumable: rerunning appends only the node_ids missing from the output CSV.
+
+Run 9 — what the adapter is fed
+-------------------------------
+A run-9 checkpoint is a decoder trained on embedding-space vectors (train.py --oracle), so one
+checkpoint is evaluated several ways by changing only the vector, with `--input`:
+
+    oracle     the paper's own embedding — a ceiling, it sees the answer
+    refs-mean  the plain mean of its references' embeddings — the graph arm, no graph training
+    stage-a    head(GNN(neighbourhood)) from pretrain_encoder.py — does a GNN beat averaging?
+               (run 11's phase-2 GNN, fed to its phase-1 reader, is this arm)
+    zero       the zero vector — the floor; generated once and copied to every row
+
+    python generate.py --mode adapter --sets run9 --input refs-mean \
+        --checkpoint ../../checkpoints/qwen14b-run9-decoder/best.pt --output ...
+
+Run 11
+------
+A joint fine-tune checkpoint (train.py --reader) carries its GNN + head and loads with the
+default `--input encoder`. `--no-repeat-ngram 6` stops sentence loops at decoding time, and
+`--subset N` generates for a fixed random N of the eval papers — the loop-fix test.
 """
 
 import argparse
@@ -65,13 +85,15 @@ import re
 
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
-                    FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR, MAX_LENGTH, MAX_NEW_TOKENS,
-                    NODE_EMBEDDINGS, NUM_PREFIX_TOKENS, REPETITION_PENALTY)
+                    FEATURES, FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR, MAX_LENGTH, MAX_NEW_TOKENS,
+                    NO_REPEAT_NGRAM, NUM_PREFIX_TOKENS, OUT_CHANNELS, REPETITION_PENALTY, SEED)
 from graph import load_graph, make_loader, select_neighbour_rows
-from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
+from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
+                   oracle_vector, refs_mean_vector)
 from prefix_generation import generate_with_prefix, patch_for_prefix
 from text import PROMPT, Corpus, graph_only_example
 
@@ -79,7 +101,13 @@ from text import PROMPT, Corpus, graph_only_example
 SETS = {
     "capped": "eval_nodes_capped.json",
     "legacy": "eval_nodes.json",
+    # Run 9 trains on its own node set but is scored on the same 945 papers as every run.
+    "run9": "eval_nodes_capped.json",
 }
+
+# Inputs that live in the embedding space an --oracle checkpoint was trained on. Any of them can
+# be fed to such a checkpoint; none of them to a checkpoint trained behind the graph encoder.
+EMBEDDING_INPUTS = ("oracle", "refs-mean", "stage-a", "zero")
 
 
 def remap_encoder(state):
@@ -98,7 +126,7 @@ def remap_encoder(state):
             for key, value in state.items()}
 
 
-def load_adapter(path, device, sets, llm, oracle):
+def load_adapter(path, device, sets, llm, oracle, embeddings):
     """Restore the trained encoder and adapter from a `train.py` checkpoint.
 
     Also returns the encoder depth, which is read off the checkpoint rather than passed in:
@@ -131,15 +159,20 @@ def load_adapter(path, device, sets, llm, oracle):
     # Whitened and raw node features have identical shapes (run 8, whiten_features.py), so a
     # mismatch loads cleanly and runs a trained encoder on a distribution it has never seen.
     was_features = checkpoint.get("node_embeddings", "node_embeddings.npy")
-    assert was_features == os.path.basename(NODE_EMBEDDINGS), (
-        f"{path} was trained on {was_features} but config.NODE_EMBEDDINGS is "
-        f"{os.path.basename(NODE_EMBEDDINGS)}; the encoder would be fed a feature "
+    assert was_features == os.path.basename(embeddings), (
+        f"{path} was trained on {was_features} but --features loads "
+        f"{os.path.basename(embeddings)}; the adapter would be fed a feature "
         f"distribution it was never trained on")
     gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
     gnn_conv = checkpoint.get("gnn_conv", "sage")  # everything before stage 9 was GraphSAGE
-    encoder = GraphEncoder(num_layers=gnn_layers, conv=gnn_conv).to(device)
+    # Run 11's joint checkpoint stores GNN + head (model.EmbeddingEstimator) as its encoder.
+    if checkpoint.get("joint", False):
+        encoder = EmbeddingEstimator(num_layers=gnn_layers, conv=gnn_conv).to(device)
+        encoder.load_state_dict(checkpoint["encoder"])
+    else:
+        encoder = GraphEncoder(num_layers=gnn_layers, conv=gnn_conv).to(device)
+        encoder.load_state_dict(remap_encoder(checkpoint["encoder"]))
     adapter = PrefixAdapter().to(device)
-    encoder.load_state_dict(remap_encoder(checkpoint["encoder"]))
     adapter.load_state_dict(checkpoint["adapter"])
     encoder.eval()
     adapter.eval()
@@ -156,8 +189,10 @@ def load_adapter(path, device, sets, llm, oracle):
 
     lora = checkpoint.get("lora")     # None for every checkpoint trained without --lora
     if lora is not None:
-        from lora import add_lora, load_lora_state
-        add_lora(llm)
+        from lora import add_lora, load_lora_state, targets_of
+        # Read off the checkpoint: run 9 moved config.LORA_TARGETS to q/v, and steps 6-8 used
+        # q/k/v. Taking them from config.py would refuse those checkpoints.
+        add_lora(llm, targets_of(lora))
         load_lora_state(llm, lora)
 
     print(f"loaded {path} (epoch {checkpoint['epoch']}, step {checkpoint['step']}, "
@@ -167,8 +202,43 @@ def load_adapter(path, device, sets, llm, oracle):
     return encoder, adapter, ntoken, gnn_layers
 
 
+def load_stage_a(path, device, embeddings):
+    """-> (vector function, encoder depth) for run 9's `--input stage-a` arm.
+
+    A pretrain_encoder.py checkpoint: the GNN reads the masked neighbourhood and a linear head
+    maps its seed output into the (whitened) embedding space, trained by InfoNCE + VICReg
+    against the seed's own embedding. The HEAD IS LOADED. Run 8 discarded it and fed the
+    adapter the raw GNN output, which was 0.85 collinear across papers; the head output is the
+    tensor Stage A actually decorrelated, and the one that lives in the space the run-9
+    decoder was trained on. Normalised, because every other vector that decoder sees is.
+
+    Stage A trained on whatever config.NODE_EMBEDDINGS was at the time; run 8's encoders
+    (encoder-*-vicreg.pt) were trained on the whitened features, as run 9 is, and record
+    nothing. Run 11's record which, and a mismatch with `embeddings` is refused: the head would
+    map a feature distribution it never saw into the decoder's space.
+    """
+    pre = torch.load(path, map_location=device)
+    was = pre.get("node_embeddings", "node_embeddings_whitened.npy")
+    assert was == os.path.basename(embeddings), (
+        f"{path} was trained on {was} but --features loads {os.path.basename(embeddings)}")
+    encoder = GraphEncoder(num_layers=pre["gnn_layers"], conv=pre["gnn_conv"]).to(device)
+    encoder.load_state_dict(pre["encoder"])
+    head = torch.nn.Linear(OUT_CHANNELS, OUT_CHANNELS).to(device)
+    head.load_state_dict(pre["head"])
+    encoder.eval()
+    head.eval()
+    print(f"stage-a: {pre['gnn_layers']}-layer {pre['gnn_conv']} encoder + head from {path} "
+          f"(stage A epoch {pre.get('epoch')}, output cosine {pre.get('output_cosine')})")
+
+    def vector(batch):
+        h = encoder(batch.x, batch.edge_index, batch.batch_size)[:batch.batch_size]
+        return F.normalize(head(h), dim=-1)
+    return vector, pre["gnn_layers"]
+
+
 @torch.no_grad()
-def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, oracle=False):
+def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, oracle=False,
+                  vector=None):
     """Yield `(node_id, prefix, neighbour_tokens)` for each node, in the order given.
 
     Both tensors are None in baseline mode; `neighbour_tokens` is also None for a checkpoint
@@ -179,6 +249,9 @@ def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, 
     In adapter mode the order comes from `NeighborLoader(shuffle=False)`, and the node_id is
     read back off the batch rather than assumed, so a row can never be paired with another
     node's neighbourhood.
+
+    `vector` (run 9) replaces the encoder: a function of the batch returning the
+    embedding-space vector to feed the adapter (refs-mean, stage-a, zero).
     """
     if encoder is None:
         for node_id in node_ids:
@@ -189,7 +262,9 @@ def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, 
                              gnn_layers=gnn_layers):
         batch = batch.to(device)
         tokens = None
-        if oracle:
+        if vector is not None:
+            graph_vector = vector(batch)
+        elif oracle:
             graph_vector = oracle_vector(batch)
         else:
             h = encoder(batch.x, batch.edge_index, batch.batch_size)
@@ -222,8 +297,29 @@ def main():
                          "(model.oracle_vector). Must match how the checkpoint was trained, "
                          "which is asserted. The arm sees the answer it is asked to write, "
                          "so its score belongs beside no other arm without that label")
+    ap.add_argument("--input", choices=("encoder",) + EMBEDDING_INPUTS, default=None,
+                    help="run 9: which vector the adapter is fed (see the module docstring). "
+                         "Defaults to 'oracle' with --oracle and 'encoder' otherwise, which "
+                         "is every run before run 9")
+    ap.add_argument("--stage-a-encoder", default=None,
+                    help="--input stage-a: a pretrain_encoder.py checkpoint. Its head IS "
+                         "loaded — the head output is the vector Stage A trained into "
+                         "embedding space, and run 8 failed by discarding it")
+    ap.add_argument("--features", choices=sorted(FEATURES), default="whitened",
+                    help="node features; must match the checkpoint, which is asserted. "
+                         "'raw' for run 10a and every run up to step 7")
     ap.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+    ap.add_argument("--no-repeat-ngram", type=int, default=NO_REPEAT_NGRAM,
+                    help="ban any repeated n-gram of this length while decoding; 0 is off, as "
+                         "in every run before run 11 (config.NO_REPEAT_NGRAM)")
+    ap.add_argument("--subset", type=int, default=None,
+                    help="generate for a fixed random N of the eval papers (seeded), not all")
     args = ap.parse_args()
+    args.input = args.input or ("oracle" if args.oracle else "encoder")
+    embedding_input = args.input in EMBEDDING_INPUTS
+    assert args.input != "stage-a" or args.stage_a_encoder, "--input stage-a needs --stage-a-encoder"
+    assert args.mode == "adapter" or args.input in ("encoder", "oracle"), (
+        "--input selects the vector for --mode adapter; the gate ablations keep their own")
 
     eval_file = SETS[args.sets]
 
@@ -235,6 +331,9 @@ def main():
     # --- data -------------------------------------------------------------
     with open(os.path.join(FROZEN_DIR, eval_file)) as f:
         eval_nodes = json.load(f)
+    if args.subset:
+        order = torch.randperm(len(eval_nodes), generator=torch.Generator().manual_seed(SEED))
+        eval_nodes = [eval_nodes[i] for i in sorted(order[:args.subset].tolist())]
     # clean=False: the evaluation golds stay byte-identical to all eight earlier runs, so the
     # scores remain comparable. Training cleans its targets (text.clean_abstract) because the
     # prompt instructs "no markup, mathematical notation or headings" while 13.5% of the
@@ -258,12 +357,13 @@ def main():
     llm.config.use_cache = True            # train.py disables it; decoding needs it back
     llm.eval()
 
-    encoder = adapter = ntoken = data = None
+    encoder = adapter = ntoken = data = vector = None
     gnn_layers = GNN_LAYERS
     if args.mode != "baseline":
         encoder, adapter, ntoken, gnn_layers = load_adapter(args.checkpoint, device,
-                                                            args.sets, llm, args.oracle)
-        if args.oracle:
+                                                            args.sets, llm, embedding_input,
+                                                            FEATURES[args.features])
+        if args.input == "oracle":
             print("=" * 78, "\nORACLE CEILING RUN — the adapter is fed the target abstract's "
                   "own embedding.\nThis arm sees the answer. Its score is a ceiling on the "
                   "prefix channel,\nnever a result, and is not comparable to any arm that "
@@ -290,7 +390,15 @@ def main():
             with torch.no_grad():
                 ntoken.gate.zero_()
             print("neighbour gate forced to zero — the k slots stay, their content goes")
-        data = load_graph()                                # stays on CPU; sampling runs there
+        data = load_graph(FEATURES[args.features])         # stays on CPU; sampling runs there
+        if args.input == "refs-mean":
+            vector = refs_mean_vector
+        elif args.input == "zero":
+            vector = lambda batch: torch.zeros(batch.batch_size, batch.x.size(1),  # noqa: E731
+                                               device=batch.x.device)
+        elif args.input == "stage-a":
+            vector, gnn_layers = load_stage_a(args.stage_a_encoder, device,
+                                              FEATURES[args.features])
         # The neighbour tokens are prefilled into the cache before generate() sees it, so the
         # cache runs P..P+k long and k varies with the node's out-degree.
         patch_for_prefix(llm, NUM_PREFIX_TOKENS,
@@ -322,16 +430,18 @@ def main():
     budget = (MAX_LENGTH - NUM_PREFIX_TOKENS - args.max_new_tokens
               - (ntoken.max_tokens if ntoken is not None else 0))
     overflowed = 0
+    constant, floor_texts = None, []
 
     # One dict for both branches: the conditions must not drift apart in how they decode, and
     # `generate_with_prefix` forwards **kwargs straight to `generate()`, so they cannot.
     decoding = dict(max_new_tokens=args.max_new_tokens, do_sample=False,
                     repetition_penalty=REPETITION_PENALTY,
+                    no_repeat_ngram_size=args.no_repeat_ngram,
                     pad_token_id=tokenizer.pad_token_id)
 
     for i, (node_id, prefix, tokens) in enumerate(
             iter_prefixes(eval_nodes, encoder, adapter, ntoken, data, device, gnn_layers,
-                          args.oracle),
+                          args.input == "oracle", vector),
             start=1):
         if node_id in done:
             continue
@@ -344,7 +454,12 @@ def main():
               f"prompt_tokens={n_tokens}  "
               f"neighbour_tokens={0 if tokens is None else tokens.size(1)}", flush=True)
 
-        if n_tokens > budget:
+        if constant is not None:
+            # --input zero: prompt and prefix are both node-independent, so greedy decoding
+            # writes one string for every node. It was generated twice and checked equal
+            # (below); the remaining ~7 GPU-hours would only reproduce it.
+            generated = constant
+        elif n_tokens > budget:
             overflowed += 1
             generated = f"ERROR: prompt too long ({n_tokens} tokens > {budget} limit)"
         else:
@@ -363,6 +478,14 @@ def main():
             except Exception as e:
                 generated = f"ERROR: {type(e).__name__}: {e}"
             print(f"  >> {generated[:200]}", flush=True)
+            if args.input == "zero":
+                floor_texts.append(generated)
+                if len(floor_texts) == 2:
+                    assert floor_texts[0] == floor_texts[1], (
+                        "--input zero wrote two different texts for two nodes: something "
+                        "node-dependent reaches the decoder, so this is not the floor")
+                    constant = generated
+                    print("floor is constant — copying it to the remaining rows", flush=True)
 
         writer.writerow({"node_id": node_id, "mag_id": mag_id.get(node_id, ""),
                          "original_abstract": original, "generated_abstract": generated})

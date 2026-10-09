@@ -127,6 +127,25 @@ class GraphEncoder(nn.Module):
         return self.convs[-1](h, edge_index)   # no activation on the output layer
 
 
+class EmbeddingEstimator(nn.Module):
+    """Run 11: GraphEncoder + linear head -> a unit-norm estimate of the paper's own embedding.
+
+    pretrain_encoder.py trains it to imitate the seed's voyage embedding from the masked
+    neighbourhood; the reader was trained on exactly such vectors (its own embedding, or its
+    reference mean), so the head output is what it is fed — normalised, like every vector it
+    has seen. Same call signature as GraphEncoder, so train.py and generate.py use either.
+    """
+
+    def __init__(self, num_layers=GNN_LAYERS, conv=GNN_CONV):
+        super().__init__()
+        self.encoder = GraphEncoder(num_layers=num_layers, conv=conv)
+        self.head = nn.Linear(OUT_CHANNELS, OUT_CHANNELS)
+
+    def forward(self, x, edge_index, batch_size):
+        """Returns (num_nodes, out_channels); only the seed rows 0..batch_size-1 are estimates."""
+        return F.normalize(self.head(self.encoder(x, edge_index, batch_size)), dim=-1)
+
+
 class NeighbourTokenAdapter(nn.Module):
     """One 1-hop neighbour embedding (1024) -> one Qwen3 input embedding (5120).
 
@@ -215,6 +234,59 @@ def oracle_vector(batch):
     invariant the mask relies on.
     """
     return batch.x[:batch.batch_size]
+
+
+def corrupt_to_cosine(v, min_cos):
+    """Run 9: rotate each row of `v` to a cosine drawn uniformly from [min_cos, 1] with itself.
+
+    The decoder is trained on a paper's own embedding but evaluated on an *estimate* of it
+    built from the references, which sits at cosine ~0.3-0.6 from the truth in whitened space.
+    Training on the exact vector only would leave that whole range unseen. The noise is a
+    random direction orthogonal to the row, so the cosine is hit exactly rather than on
+    average, and the output stays unit-norm like every other vector the adapter is fed.
+
+    Whitened space is close to isotropic (participation ratio 948 of 1024), which is what makes
+    an isotropic direction a fair stand-in for the estimate's error. In the raw voyage space,
+    with ~100 effective dimensions, most of it would land where real vectors never go.
+    """
+    v = F.normalize(v.float(), dim=-1)
+    cos = min_cos + (1.0 - min_cos) * torch.rand(v.size(0), 1, device=v.device)
+    noise = torch.randn_like(v)
+    noise = F.normalize(noise - (noise * v).sum(-1, keepdim=True) * v, dim=-1)
+    return cos * v + (1.0 - cos ** 2).clamp(min=0).sqrt() * noise
+
+
+def mix_in_refs(batch, v, fraction):
+    """Run 10a: swap each seed's vector for its reference mean with probability `fraction`.
+
+    The oracle half teaches the decoder to read an embedding at all (step 4's signal); the
+    reference half is the exact input the graph arm feeds it at evaluation, so the decoder
+    learns the real estimation error instead of a synthetic one. A paper whose sample holds no
+    references keeps its own embedding, since a zero vector would teach it nothing.
+    """
+    refs = refs_mean_vector(batch)
+    use = ((torch.rand(v.size(0), 1, device=v.device) < fraction)
+           & (refs.abs().sum(-1, keepdim=True) > 0))
+    return torch.where(use, refs.to(v.dtype), v)
+
+
+def refs_mean_vector(batch):
+    """Run 9's graph arm: the normalised mean of each seed's references' embeddings.
+
+    No learned parameter touches it, so whatever the decoder makes of it is the graph's
+    contribution through the plainest possible estimator. A seed's references are its 1-hop
+    in-edges (edge_index is stored cited -> citing), so the batch must have been sampled with at
+    least one hop; a seed with none gets a zero vector rather than a NaN.
+
+    The seed's own row is never read — that row is the answer, and it is what `oracle_vector`
+    returns.
+    """
+    out = torch.zeros(batch.batch_size, batch.x.size(1), device=batch.x.device)
+    for seed in range(batch.batch_size):
+        rows = batch.edge_index[0][batch.edge_index[1] == seed]
+        if rows.numel():
+            out[seed] = F.normalize(batch.x[rows].float().mean(0), dim=0)
+    return out
 
 
 class PrefixAdapter(nn.Module):

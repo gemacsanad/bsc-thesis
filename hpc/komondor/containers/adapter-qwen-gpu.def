@@ -60,6 +60,10 @@ From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
     pip install --no-cache-dir torch_geometric==2.8.0
 
+    # Run 9: train.py ranks generated validation text against its golds by TF-IDF (identify.py),
+    # the same instrument the analysis scripts use. "numpy<2" for the same reason as above.
+    pip install --no-cache-dir "numpy<2" scikit-learn==1.4.2
+
 %environment
     export LC_ALL=C
     export PYTHONUNBUFFERED=1
@@ -67,7 +71,7 @@ From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
 %test
     python -c "
-import numpy, torch, torch_geometric, transformers, wandb, pandas, sentencepiece
+import numpy, torch, torch_geometric, transformers, wandb, pandas, sentencepiece, sklearn
 import torch_geometric.typing as t
 from transformers import Qwen3Config, Qwen3ForCausalLM
 assert t.WITH_PYG_LIB or t.WITH_TORCH_SPARSE, 'no NeighborLoader sampler backend'

@@ -12,6 +12,7 @@ rather than a rewrite of what came before.
 | [`model_swap_qwen.md`](model_swap_qwen.md) | Stage 7, **the plan**: swapping the frozen Vicuna-7B for Qwen3-14B, what must not change, and why. |
 | [`qwen_migration.md`](qwen_migration.md) | Stage 7, **the record**: what was actually built at each step, with the measurements. |
 | [`soft_prompt_only.md`](soft_prompt_only.md) | Stage 8: removing the reference abstracts from the prompt so the graph prefix is the only channel — why (the Qwen gap went negative), the decisions, and the measurements. |
+| [`run9_embedding_decoder.md`](run9_embedding_decoder.md) | Run 9: the review of all soft-prompt runs, the embedding → abstract decoder it motivates, what changed and why, how to read the four evaluation arms, run 9's epoch-1 stop, run 10a (step 4's recipe on 90k papers, trained half on the reference mean), and run 11 (reader, GNN imitation grid, joint fine-tune, loop fix). |
 | [`weekly/week_4.md`](weekly/week_4.md) | The reference-filtering pipeline — LLM relevance labels, Voyage embeddings, and the two cosine scores. Old generation. |
 | `../src/data/s2/README.md` | The Semantic Scholar bulk download and the joint dataset build. |
 

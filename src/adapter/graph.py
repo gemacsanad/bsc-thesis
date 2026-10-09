@@ -76,16 +76,34 @@ def load_graph(embeddings=None, edges=None):
 
 
 def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0,
-                gnn_layers=GNN_LAYERS):
-    """NeighborLoader over `seed_nodes`, returning their full `gnn_layers`-hop neighbourhoods."""
+                gnn_layers=GNN_LAYERS, hops=None):
+    """NeighborLoader over `seed_nodes`, returning their full `gnn_layers`-hop neighbourhoods.
+
+    `hops` overrides the depth for callers that do not run the encoder: 0 returns the seeds
+    alone, which is what oracle training needs — run 9 trains on ~90k papers, some with
+    2-hop neighbourhoods in the tens of thousands, and none of those rows would be read.
+    """
+    depth = gnn_layers if hops is None else hops
     return NeighborLoader(
         data,
-        num_neighbors=num_neighbors(gnn_layers),
+        num_neighbors=num_neighbors(depth) if depth else [0],
         input_nodes=torch.as_tensor(seed_nodes, dtype=torch.long),
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
     )
+
+
+def with_references(data, nodes):
+    """-> the nodes of `nodes` that cite at least one paper in the graph, order kept.
+
+    Run 11: a GNN estimate for a paper with no references is the [MASK] row alone, the same
+    vector for all of them, so they are left out of GNN training. Its in-edges are its
+    references, since edge_index is stored cited -> citing.
+    """
+    has = torch.zeros(data.num_nodes, dtype=torch.bool)
+    has[data.edge_index[1]] = True
+    return [n for n in nodes if has[n]]
 
 
 def centroid_distances(x):

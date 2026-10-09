@@ -196,7 +196,12 @@ WANDB_PROJECT = "dytag-adapter"
 LORA_R = 16
 LORA_ALPHA = 32             # 2 x rank; peft scales the adapter by alpha / r
 LORA_DROPOUT = 0.05
-LORA_TARGETS = ["q_proj", "k_proj", "v_proj"]
+#
+# Run 9 (2026-10-07): back to q/v, the targets of step 4 — the only run that carried paper
+# identity, and the configuration run 9 extends. k_proj was added for the neighbour tokens,
+# which run 9 does not have. generate.py reads the targets back off the checkpoint's LoRA keys,
+# so the q/k/v checkpoints of steps 6-8 still load.
+LORA_TARGETS = ["q_proj", "v_proj"]
 
 # --- Stage 10: contrastive supervision ---------------------------------------
 # Step 6 posted the lowest training loss of any run in the project (1.83, below the oracle and
@@ -311,8 +316,72 @@ CANARY_NODES = 16
 CANARY_TOKENS = 48          # past the 8-word opening the collapse is measured on, and ~18 s
                             # per validation on an A100
 
+# --- Stage 12 (run 9): the embedding -> abstract decoder ---------------------
+# Run 9 splits the task in two. The LLM side is trained to write a paper's abstract from that
+# paper's OWN (whitened) embedding, on every train-split core paper rather than 7,750 of them;
+# the graph side — estimating that embedding from the references — needs no LLM and is joined
+# only at evaluation. See docs/run9_embedding_decoder.md.
+#
+# The decoder will be handed an *estimate* at evaluation, so it is trained on corrupted
+# embeddings: each one is rotated to a cosine drawn uniformly from [ORACLE_MIN_COS, 1] with the
+# true vector. Measured in whitened space, the plain reference mean sits at cosine
+# 0.313 / 0.487 / 0.617 (p10 / p50 / p90) from its target, so 0.3 covers what the graph arm
+# will feed it while the upper part of the range keeps the clean oracle arm in distribution.
+ORACLE_MIN_COS = 0.3
+
+# ~90k training papers is ~5,600 optimizer steps per pass — too long between checkpoints for a
+# 48 h walltime. An "epoch" is therefore a fixed-size slice of one seeded permutation of the
+# training nodes, so successive epochs walk through all of them before any repeats.
+EPOCH_SIZE = 15000
+
+# Model selection and the stop rules read generated text, not loss. At each epoch end the
+# decoder writes VAL_ID_TOKENS tokens for VAL_ID_NODES fixed validation papers, twice — from the
+# true embedding and from the plain reference mean — and each text is ranked against those
+# papers' golds by TF-IDF (identify.py). best.pt is the epoch with the highest reference-mean
+# MRR: the arm the thesis reports, measured without ever touching the eval set.
+VAL_ID_NODES = 128
+VAL_ID_TOKENS = 96          # ~70 words; the first ~32 words of an abstract already identify it
+                            # lexically at 63% top-1 out of 945 (soft_prompt_only.md, step 7)
+
+# Stop rules, enforced in code rather than written in a plan (run 8 ran 1,250 steps past a
+# prose stop-gate). Checked at every epoch end from VAL_ID_GATE_EPOCH on; the epoch is saved
+# first so the failure can be inspected, then the job exits non-zero.
+#
+# Both rules wait for epoch 2 since run 10a. Run 9 checked the canary at epoch 1 (937 steps);
+# step 4, starting its gate at 0, needed ~1,000 steps before the vector moved validation loss.
+CANARY_MIN_DISTINCT = 9     # of CANARY_NODES. Step 4's oracle wrote 944 distinct of 945
+VAL_ID_GATE_EPOCH = 2       # from this epoch on, the oracle arm's top-1 must be at least
+VAL_ID_MIN_LIFT = 10        # this many times chance (1 / VAL_ID_NODES)
+
+# --- Stage 13 (run 10a): back to step 4's recipe, trained on real estimates ----------
+# Run 9 stopped at epoch 1 with the vector unused (validation gain 0.0003 nats against step 4's
+# 0.022 at the same step; gate x1.2 against x13). It had changed three things about the
+# adapter's input at once relative to step 4: whitened features, gate-init 0.2 and synthetic
+# noise. Run 10a returns to step 4's raw features and gate 0, and replaces the noise with the
+# real estimate: each training paper is fed its reference mean with probability REFS_MIX, its
+# own embedding otherwise. See docs/run9_embedding_decoder.md, "Run 10a".
+FEATURES = {"raw": RAW_NODE_EMBEDDINGS, "whitened": NODE_EMBEDDINGS}
+REFS_MIX = 0.5
+
+# --- Stage 14 (run 11): reader, GNN imitation, joint fine-tune -------------------------
+# Three phases, each trained from scratch so the run stands alone: (1) the reader, run 10a's
+# recipe; (2) GNNs imitating the paper's raw embedding (pretrain_encoder.py), one winner chosen
+# on validation cosine; (3) both fine-tuned together (train.py --reader). The 10a oracle arm
+# showed the reader is close to the text baseline given a perfect vector (judge 3.41 vs 3.59),
+# so the estimate is the bottleneck. See docs/run9_embedding_decoder.md, "Run 11".
+
+# Phase 3. The cosine term keeps the GNN estimate in the space the reader decodes while the LM
+# loss pulls on it; the GNN moves at a tenth of the reader's rate because it arrives trained.
+JOINT_LAMBDA_COS = 1.0
+JOINT_GNN_LR = 1e-5
+
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen
                                       # under would need references the freeze dropped
 
 REPETITION_PENALTY = 1.00
+# Run 11: generate.py --no-repeat-ngram bans any repeated n-gram of this length. 17.6% of run
+# 10a's oracle outputs repeat a whole sentence, scoring coherence 3.8 against 7.7. 0 disables it
+# and reproduces every run before run 11; 6 is long enough that ordinary technical phrasing
+# ("the number of ...") is not touched, and short enough to stop a sentence repeating.
+NO_REPEAT_NGRAM = 0

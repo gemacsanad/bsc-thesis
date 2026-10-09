@@ -13,6 +13,19 @@ Usage:
         --pretrained-encoder ../../checkpoints/encoder-gatv2.pt \
         --gate-init 0.2 --lambda-rank 1.0
     python adapter/train.py --lambda-rank 0 --gate-init 0   # the step-6 objective, for ablation
+
+    # run 9 — the embedding -> abstract decoder (docs/run9_embedding_decoder.md):
+    python adapter/train.py --oracle --lora --sets run9 --oracle-noise 0.3 --epoch-size 15000 \
+        --neighbour-tokens 0 --lambda-rank 0 --epochs 6
+
+    # run 10a — step 4's recipe (raw features, gate 0) on 90k papers, half fed the reference mean:
+    python adapter/train.py --oracle --lora --sets run9 --features raw --refs-mix 0.5 \
+        --gate-init 0 --epoch-size 15000 --neighbour-tokens 0 --lambda-rank 0 --epochs 6
+
+    # run 11, phase 3 — joint fine-tune of a phase-1 reader and a phase-2 GNN (--reader):
+    python adapter/train.py --lora --sets run9 --features raw --reader <reader best.pt> \
+        --pretrained-encoder <gnn.pt> --gnn-conv <its conv> --gnn-layers <its depth> --gate-init 0 \
+        --epoch-size 15000 --neighbour-tokens 0 --lambda-rank 0 --epochs 3
 """
 
 import argparse
@@ -27,15 +40,22 @@ from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import Cache
 
-from config import (BASE_MODEL, BATCH_SIZE, CANARY_NODES, CANARY_TOKENS, CHECKPOINT_DIR,
-                    DEFAULT_SETS, ENV_FILE, EPOCHS, EVAL_EVERY, FROZEN_DIR,
+from contextlib import contextmanager
+
+from config import (BASE_MODEL, BATCH_SIZE, CANARY_MIN_DISTINCT, CANARY_NODES, CANARY_TOKENS,
+                    CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE, EPOCH_SIZE, EPOCHS, EVAL_EVERY,
+                    FEATURES, FROZEN_DIR, ORACLE_MIN_COS, REFS_MIX,
                     GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
-                    HIDDEN_SIZE, LAMBDA_RANK, LEARNING_RATE, LOG_EVERY, LORA_R, LORA_TARGETS,
-                    NODE_EMBEDDINGS, NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
+                    HIDDEN_SIZE, JOINT_GNN_LR, JOINT_LAMBDA_COS, LAMBDA_RANK, LEARNING_RATE,
+                    LOG_EVERY, LORA_R, LORA_TARGETS,
+                    NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
                     RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, RANK_WARMUP_STEPS, SEED,
+                    VAL_ID_GATE_EPOCH, VAL_ID_MIN_LIFT, VAL_ID_NODES, VAL_ID_TOKENS,
                     WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
-from graph import load_graph, make_loader, select_neighbour_rows
-from model import GraphEncoder, NeighbourTokenAdapter, PrefixAdapter, oracle_vector
+from graph import load_graph, make_loader, select_neighbour_rows, with_references
+from identify import ranks, summary
+from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
+                   corrupt_to_cosine, mix_in_refs, oracle_vector, refs_mean_vector)
 from prefix_generation import generate_with_prefix, patch_for_prefix
 from rank import NegativePool, rank_loss
 from text import PROMPT, Corpus, encode, graph_only_example
@@ -47,6 +67,8 @@ from text import PROMPT, Corpus, encode, graph_only_example
 SETS = {
     "capped": "training_sets_capped.json",
     "legacy": "training_sets.json",
+    # Run 9: every train-split core paper (prepare_run9_sets.py), same 806 validation nodes.
+    "run9": "training_sets_run9.json",
 }
 
 
@@ -133,8 +155,10 @@ def sliced_loss(llm, hidden, labels):
 
 
 def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dtype,
-              oracle=False):
-    """One forward pass. Returns (mean loss over this batch's target tokens, the prefix).
+              oracle=False, noise=None, refs_mix=None):
+    """One forward pass. -> (mean loss over this batch's target tokens, the prefix, the vector
+    the adapter was fed — run 11's joint fine-tune scores that vector against the paper's own
+    embedding).
 
     Two graph channels reach the LLM here, and they are deliberately different kinds of thing:
 
@@ -152,6 +176,13 @@ def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dty
     `ntoken` is None in oracle mode: that arm bypasses the encoder entirely, so there are no
     neighbour embeddings to project, and keeping k=0 leaves the ceiling run byte-identical to
     the one already measured.
+
+    `noise` (run 9) is the lowest cosine the oracle vector is rotated to before the adapter
+    sees it — model.corrupt_to_cosine. Training passes it; validation does not, so the
+    validation loss stays the clean-oracle number.
+
+    `refs_mix` (run 10a) is the probability that a training paper is fed its reference mean
+    instead of its own embedding (model.mix_in_refs). Training only, like `noise`.
     """
     p, (b, length) = NUM_PREFIX_TOKENS, input_ids.shape
     device = input_ids.device
@@ -159,6 +190,10 @@ def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dty
     neighbour_tokens, k = None, 0
     if oracle:
         graph_vector = oracle_vector(batch)
+        if noise is not None:
+            graph_vector = corrupt_to_cosine(graph_vector, noise)
+        if refs_mix:
+            graph_vector = mix_in_refs(batch, graph_vector, refs_mix)
     else:
         h = encoder(batch.x, batch.edge_index, batch.batch_size)
         graph_vector = h[:batch.batch_size]
@@ -191,7 +226,7 @@ def step_loss(llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dty
         cache_position=torch.arange(p, p + k + length, device=device),
         use_cache=False,
     ).last_hidden_state
-    return sliced_loss(llm, hidden, labels), prefix
+    return sliced_loss(llm, hidden, labels), prefix, graph_vector
 
 
 def ranked(llm, prefix, node_id, pool, negatives, tokens, dtype, pad_id, prompt_ids=None,
@@ -256,6 +291,30 @@ def contrast(encoder, adapter, probe, oracle=False):
     return mean_cosine(delta), mean_cosine(g)
 
 
+@contextmanager
+def generation_mode(llm, *modules):
+    """Switch everything to eval with the KV cache on, and back to training afterwards.
+
+    Generation needs the KV cache and gradient checkpointing forbids it, so both are toggled
+    around the call and restored. Shared by the canary and run 9's identifiability pass.
+    `modules` may contain None (an absent neighbour-token adapter).
+    """
+    modules = [m for m in modules if m is not None]
+    llm.gradient_checkpointing_disable()
+    llm.config.use_cache = True
+    llm.eval()
+    for m in modules:
+        m.eval()
+    try:
+        yield
+    finally:
+        llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        llm.config.use_cache = False
+        llm.train()
+        for m in modules:
+            m.train()
+
+
 @torch.no_grad()
 def canary(llm, encoder, adapter, ntoken, data, node_ids, tokenizer, example, device, dtype,
            gnn_layers, oracle=False):
@@ -267,17 +326,16 @@ def canary(llm, encoder, adapter, ntoken, data, node_ids, tokenizer, example, de
     rising rank_hit while emitting 2 distinct openings across 945 nodes. This is one integer,
     logged every EVAL_EVERY steps, that would have said so at epoch 1.
 
-    Generation needs the KV cache and gradient checkpointing forbids it, so both are toggled
-    around the call and restored afterwards. ~18 s per call for 16 nodes x 48 tokens.
+    ~18 s per call for 16 nodes x 48 tokens.
     """
-    llm.gradient_checkpointing_disable()
-    llm.config.use_cache = True
-    llm.eval()
-    encoder.eval()
-    adapter.eval()
-    if ntoken is not None:
-        ntoken.eval()
+    with generation_mode(llm, encoder, adapter, ntoken):
+        outputs = _canary_outputs(llm, encoder, adapter, ntoken, data, node_ids, tokenizer,
+                                  example, device, dtype, gnn_layers, oracle)
+    return len(set(outputs)), outputs[0]
 
+
+def _canary_outputs(llm, encoder, adapter, ntoken, data, node_ids, tokenizer, example, device,
+                    dtype, gnn_layers, oracle):
     outputs = []
     for batch in make_loader(data, node_ids, 1, shuffle=False, gnn_layers=gnn_layers):
         batch = batch.to(device)
@@ -295,15 +353,70 @@ def canary(llm, encoder, adapter, ntoken, data, node_ids, tokenizer, example, de
             max_new_tokens=CANARY_TOKENS, do_sample=False,
             pad_token_id=tokenizer.pad_token_id)
         outputs.append(tokenizer.decode(new, skip_special_tokens=True).strip())
+    return outputs
 
-    llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    llm.config.use_cache = False
-    llm.train()
-    encoder.train()
-    adapter.train()
-    if ntoken is not None:
-        ntoken.train()
-    return len(set(outputs)), outputs[0]
+
+@torch.no_grad()
+def identifiability(llm, adapter, data, node_ids, tokenizer, example, golds, device, dtype,
+                    arms, hops, encoder=None):
+    """Run 9's selection metric. -> {arm: {top1, mrr}} for each of `arms`
+
+    Writes VAL_ID_TOKENS tokens for each of `node_ids`, greedily, once per arm — a function of
+    the batch returning the vector the adapter is fed. Run 9/10a score the paper's own
+    embedding (the clean oracle — can the decoder read a vector at all?) and the plain mean of
+    its references' embeddings (the graph arm the thesis reports); run 11's joint fine-tune
+    scores its GNN estimate beside that mean. Each text is ranked against the golds of the same
+    nodes (identify.py); chance top-1 is 1 / len(node_ids).
+
+    `hops` is what the deepest arm reads: 1 for the reference mean, the encoder depth for a
+    GNN. `encoder` is switched to eval mode with the rest when an arm runs it.
+
+    Generated text rather than LM loss, because LM loss is the number that has misled this
+    project: step 6 posted the lowest loss on record with the worst conditioning on record.
+    """
+    texts = {arm: [] for arm in arms}
+    with generation_mode(llm, adapter, encoder):
+        for batch in make_loader(data, node_ids, 1, shuffle=False, hops=hops):
+            batch = batch.to(device)
+            prompt, _ = example(int(batch.n_id[0]))
+            input_ids = torch.tensor([tokenizer(prompt).input_ids], device=device)
+            for arm, vector in arms.items():
+                new = generate_with_prefix(llm, input_ids, adapter(vector(batch)).to(dtype),
+                                           max_new_tokens=VAL_ID_TOKENS, do_sample=False,
+                                           pad_token_id=tokenizer.pad_token_id)
+                texts[arm].append(tokenizer.decode(new, skip_special_tokens=True).strip())
+    gold = [str(golds[n]) for n in node_ids]
+    return {arm: summary(ranks(t, gold)) for arm, t in texts.items()}
+
+
+STOP_EXIT_CODE = 3
+
+
+def stop(message):
+    """Run 9's stop rules end the process with exit code 3, and only they do.
+
+    A crash exits 1 and a SLURM timeout kills the job, and both of those should simply be
+    resubmitted. A stop rule should not: the resume would continue the run that just failed.
+    The distinct code is how run_decoder_all.sh tells the two apart and refuses a resubmit.
+    """
+    print(message, flush=True)
+    raise SystemExit(STOP_EXIT_CODE)
+
+
+def epoch_nodes(nodes, epoch, size, seed=SEED):
+    """-> the training nodes of `epoch`: a fixed-size slice of ONE seeded permutation.
+
+    Run 9 trains on ~90k papers; a full pass is ~5,600 optimizer steps, too long between
+    checkpoints for a 48 h walltime. Slicing one permutation (rather than drawing a fresh
+    sample per epoch) means consecutive epochs walk through every node before any repeats,
+    and a resumed run gets exactly the slice it would have had. `size` 0 or None is the whole
+    set, which is every run before run 9.
+    """
+    if not size:
+        return nodes
+    order = torch.randperm(len(nodes), generator=torch.Generator().manual_seed(seed)).tolist()
+    start = epoch * size
+    return [nodes[order[(start + i) % len(nodes)]] for i in range(size)]
 
 
 @torch.no_grad()
@@ -351,8 +464,8 @@ def validate(llm, encoder, adapter, ntoken, loader, tokenizer, example, device, 
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
             n_tokens = int((labels != -100).sum())
-            loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch,
-                                     input_ids, labels, mask, dtype, oracle)
+            loss, prefix, _ = step_loss(llm, encoder, adapter, ntoken, batch,
+                                        input_ids, labels, mask, dtype, oracle)
             loss_sum += loss.item() * n_tokens
             token_sum += n_tokens
 
@@ -410,7 +523,13 @@ def selection_score(losses):
     and step 6 posted the project's lowest LM validation loss while its graph channel was worth
     about 0.001 nats. Optimising a metric that is anti-correlated with the goal is how the
     wrong epoch gets shipped.
+
+    Run 9 adds a third, preferred above both: the MRR of text generated from the graph arm the
+    thesis reports (`identifiability`) — the plain reference mean for a reader, the GNN
+    estimate in run 11's joint fine-tune — read off generated text, on validation nodes only.
     """
+    if "val_id_mrr" in losses:
+        return losses["val_id_mrr"]
     if "rank_acc" in losses:
         return losses["rank_acc"]
     return -losses["graph"]
@@ -451,6 +570,24 @@ def main():
                          "Measures whether a KV prefix from one dense vector can steer the "
                          "frozen LLM at all. The arm sees the answer, so its score is not "
                          "comparable to any arm that does not")
+    ap.add_argument("--oracle-noise", type=float, default=None, metavar="MIN_COS",
+                    help="run 9: rotate each training oracle vector to a cosine drawn uniformly "
+                         "from [MIN_COS, 1] with the truth (model.corrupt_to_cosine), so the "
+                         "decoder learns to write from an estimate of the embedding, which is "
+                         "what the graph arm will feed it. --oracle only; validation is clean. "
+                         f"config.ORACLE_MIN_COS = {ORACLE_MIN_COS} is the measured value")
+    ap.add_argument("--refs-mix", type=float, default=None, metavar="P",
+                    help="run 10a: feed each training paper its reference mean instead of its "
+                         "own embedding with probability P (model.mix_in_refs). --oracle only; "
+                         "validation stays clean. Loads each paper's references, one hop. "
+                         f"config.REFS_MIX = {REFS_MIX}")
+    ap.add_argument("--features", choices=sorted(FEATURES), default="whitened",
+                    help="node features: 'whitened' is run 8 and run 9, 'raw' is every run "
+                         "up to step 7 and run 10a. Recorded in the checkpoint")
+    ap.add_argument("--epoch-size", type=int, default=None,
+                    help="run 9: nodes per epoch, sliced from one seeded permutation of the "
+                         "training set (epoch_nodes). Unset is the whole set per epoch, as in "
+                         f"every run before run 9. config.EPOCH_SIZE = {EPOCH_SIZE}")
     ap.add_argument("--lora", action="store_true",
                     help="also train LoRA adapters on the LLM's attention projections "
                          "(config.LORA_TARGETS, lora.py). Without it the LLM is frozen. "
@@ -490,10 +627,31 @@ def main():
                     help="share of the prefix norm the graph supplies at step 0, calibrated "
                          "on a real batch. 0 reproduces the step-6 initialisation, where "
                          "ignoring the graph was both the default and the starting point")
+    ap.add_argument("--reader", default=None,
+                    help="run 11, phase 3: start the adapter and LoRA from this --oracle reader "
+                         "checkpoint and train them jointly with the GNN + head of "
+                         "--pretrained-encoder (model.EmbeddingEstimator), which now feeds the "
+                         "adapter. Fresh optimizer; --resume continues such a run")
+    ap.add_argument("--lambda-cos", type=float, default=JOINT_LAMBDA_COS,
+                    help="--reader only: weight on 1 - cosine(GNN estimate, own embedding), "
+                         "kept from phase 2 so the LM loss cannot drag the estimate away from "
+                         "the space the reader was trained on")
+    ap.add_argument("--gnn-lr", type=float, default=JOINT_GNN_LR,
+                    help="--reader only: learning rate of the GNN + head; the adapter and LoRA "
+                         f"keep config.LEARNING_RATE = {LEARNING_RATE}")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
     args = ap.parse_args()
+    assert args.oracle_noise is None or args.oracle, (
+        "--oracle-noise corrupts the oracle vector and means nothing without --oracle")
+    assert args.refs_mix is None or args.oracle, (
+        "--refs-mix swaps the oracle vector for the reference mean and needs --oracle")
+    embeddings = FEATURES[args.features]
+    joint = args.reader is not None
+    assert not joint or (args.pretrained_encoder and not args.oracle and args.lora), (
+        "--reader fine-tunes a LoRA reader together with a pretrained GNN: it needs --lora and "
+        "--pretrained-encoder, and cannot be combined with --oracle")
 
     # authenticate before anything expensive — a missing key should not surface after the
     # 13 GB checkpoint has been loaded
@@ -524,11 +682,16 @@ def main():
     print(f"{args.sets} sets ({sets_file}): "
           f"{len(sets['train']):,} train nodes, {len(sets['valid']):,} valid nodes")
 
-    data = load_graph()                                   # stays on CPU; sampling runs there
-    train_loader = make_loader(data, sets["train"], BATCH_SIZE, shuffle=True,
-                               gnn_layers=args.gnn_layers)
+    data = load_graph(embeddings)                         # stays on CPU; sampling runs there
+    print(f"node features: {args.features} ({os.path.basename(embeddings)})")
+    # The training loader is built per epoch (epoch_nodes), below. Under --oracle the encoder
+    # is bypassed, so both loaders return the seeds alone: run 9 trains on ~90k papers, some
+    # with 2-hop neighbourhoods in the tens of thousands, and not one of those rows is read.
+    # --refs-mix (run 10a) reads the references, so its training loader takes one hop.
+    hops = 0 if args.oracle else None
+    train_hops = 1 if args.refs_mix else hops
     valid_loader = make_loader(data, sets["valid"], BATCH_SIZE, shuffle=False,
-                               gnn_layers=args.gnn_layers)
+                               gnn_layers=args.gnn_layers, hops=hops)
 
     corpus = Corpus()
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
@@ -557,7 +720,9 @@ def main():
     llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     llm.train()
 
-    encoder = GraphEncoder(num_layers=args.gnn_layers, conv=args.gnn_conv).to(device)
+    # Run 11's joint fine-tune feeds the adapter the head output, so the head comes too.
+    encoder = (EmbeddingEstimator if joint else GraphEncoder)(
+        num_layers=args.gnn_layers, conv=args.gnn_conv).to(device)
     adapter = PrefixAdapter().to(device)
 
     if args.pretrained_encoder:
@@ -571,9 +736,32 @@ def main():
         assert pre.get("gnn_layers", 2) == args.gnn_layers, (
             f"{args.pretrained_encoder} pretrained {pre.get('gnn_layers')} layers but "
             f"--gnn-layers is {args.gnn_layers}")
-        encoder.load_state_dict(pre["encoder"])
-        print(f"encoder initialised from {args.pretrained_encoder} "
-              f"(stage 10a, eval top-1 {pre.get('eval_top1', float('nan')):.2%})")
+        if joint:
+            was_features = pre.get("node_embeddings", "node_embeddings_whitened.npy")
+            assert was_features == os.path.basename(embeddings), (
+                f"{args.pretrained_encoder} was trained on {was_features} but --features is "
+                f"{args.features}")
+            encoder.encoder.load_state_dict(pre["encoder"])
+            encoder.head.load_state_dict(pre["head"])
+            print(f"GNN + head initialised from {args.pretrained_encoder} (phase 2, epoch "
+                  f"{pre['epoch']}, validation cosine {pre['valid']['mean_cosine']:.4f})")
+        else:
+            encoder.load_state_dict(pre["encoder"])
+            print(f"encoder initialised from {args.pretrained_encoder} "
+                  f"(stage 10a, eval top-1 {pre.get('eval_top1', float('nan')):.2%})")
+
+    if joint and not args.resume:
+        reader = torch.load(args.reader, map_location=device)
+        # The reader must have been trained to decode embedding-space vectors on the same
+        # features and nodes; anything else loads cleanly and decodes a space it never saw.
+        assert reader.get("oracle") and reader.get("sets") == args.sets, (
+            f"{args.reader} is not an --oracle reader on the '{args.sets}' sets")
+        assert reader.get("node_embeddings") == os.path.basename(embeddings), (
+            f"{args.reader} was trained on {reader.get('node_embeddings')}, not {args.features}")
+        adapter.load_state_dict(reader["adapter"])
+        load_lora_state(llm, reader["lora"])
+        print(f"adapter and LoRA initialised from {args.reader} (phase 1, epoch "
+              f"{reader['epoch']})")
 
     # None disables the channel entirely rather than running it with k=0: the module would
     # otherwise sit in the optimizer collecting no gradient, and its (untrained) weights
@@ -597,17 +785,30 @@ def main():
     # Sampled once and kept: `contrast` runs on it at every logging step, and a NeighborLoader
     # call per log would cost more than the GNN forward it feeds.
     probe = next(iter(make_loader(data, sets["train"][:64], 64, shuffle=False,
-                                  gnn_layers=args.gnn_layers))).to(device)
+                                  gnn_layers=args.gnn_layers, hops=hops))).to(device)
     # 16 validation nodes, fixed for the run, so the canary's distinct count means the same
     # thing at every step. Validation nodes rather than training ones: a collapse the model has
     # memorised its way out of on the training set is still a collapse.
     canary_nodes = sets["valid"][:CANARY_NODES]
+    # Run 9's selection set: fixed validation nodes, so the score means the same thing at
+    # every epoch. Only under --oracle, where the decoder reads embedding-space vectors and
+    # the reference mean is a meaningful input; every other run keeps its old selection.
+    val_id_nodes = sets["valid"][:VAL_ID_NODES] if args.oracle or joint else []
+    # The arms it writes from, and the one best.pt is chosen by: the reference mean for a
+    # reader, the GNN estimate for the joint fine-tune.
+    if joint:
+        val_id_arms = {"gnn": lambda b: encoder(b.x, b.edge_index, b.batch_size)[:b.batch_size],
+                       "refs": refs_mean_vector}
+        val_id_select, val_id_hops = "gnn", args.gnn_layers
+    else:
+        val_id_arms = {"oracle": oracle_vector, "refs": refs_mean_vector}
+        val_id_select, val_id_hops = "refs", 1
     # generate() has to be told the cache starts non-empty. Installed once here; it only
     # affects llm.generate, never the forward passes training runs.
     patch_for_prefix(llm, NUM_PREFIX_TOKENS,
                      max_extra=0 if ntoken is None else ntoken.max_tokens)
 
-    if args.gate_init > 0 and not args.resume:
+    if args.gate_init > 0 and not args.resume and not joint:
         with torch.no_grad():
             h_probe = (oracle_vector(probe) if args.oracle
                        else encoder(probe.x, probe.edge_index, probe.batch_size))
@@ -658,7 +859,11 @@ def main():
         # like a method.
         print("ranking loss disabled under --oracle (the arm already sees the answer)")
 
-    optimizer = AdamW(trainable, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # The joint fine-tune moves the pretrained GNN more slowly than the reader around it.
+    groups = ([{"params": encoder_params, "lr": args.gnn_lr},
+               {"params": [p for p in trainable if all(p is not q for q in encoder_params)]}]
+              if joint else trainable)
+    optimizer = AdamW(groups, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda s: min(1.0, (s + 1) / WARMUP_STEPS)
     )
@@ -683,7 +888,11 @@ def main():
                     "num_prefix_tokens": NUM_PREFIX_TOKENS,
                     "gnn_conv": args.gnn_conv,
                     "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
-                    "lora_r": LORA_R, "lora_targets": list(LORA_TARGETS)},
+                    "lora_r": LORA_R, "lora_targets": list(LORA_TARGETS),
+                    "oracle_noise": args.oracle_noise, "epoch_size": args.epoch_size,
+                    "refs_mix": args.refs_mix, "joint": joint,
+                    "lambda_cos": args.lambda_cos if joint else None,
+                    "gnn_lr": args.gnn_lr if joint else None},
         )
 
     # Early-stopping state lives in the checkpoint: a 10-epoch run does not fit one job, so
@@ -746,10 +955,22 @@ def main():
         # Whitened and raw features have identical shapes, so this loads cleanly and
         # continues a trained encoder on a distribution it has never seen.
         was_features = ckpt.get("node_embeddings", "node_embeddings.npy")
-        assert was_features == os.path.basename(NODE_EMBEDDINGS), (
-            f"{args.resume} was trained on {was_features} but config.NODE_EMBEDDINGS is "
-            f"{os.path.basename(NODE_EMBEDDINGS)}; the feature distributions differ, so this "
-            f"would not be a continuation")
+        assert was_features == os.path.basename(embeddings), (
+            f"{args.resume} was trained on {was_features} but --features is "
+            f"{args.features} ({os.path.basename(embeddings)}); the feature distributions "
+            f"differ, so this would not be a continuation")
+        # Run 9. The noise defines the training distribution of the decoder's input, and the
+        # epoch size defines which nodes each epoch slices; resuming across a change of either
+        # would continue a different run under the same directory.
+        # Run 11: a joint checkpoint holds GNN + head under "encoder", a reader's a bare GNN.
+        assert ckpt.get("joint", False) == joint, (
+            f"{args.resume} was {'' if ckpt.get('joint') else 'not '}a --reader joint run; "
+            f"use a separate --out-dir")
+        for key, now in (("oracle_noise", args.oracle_noise), ("epoch_size", args.epoch_size),
+                         ("refs_mix", args.refs_mix)):
+            assert ckpt.get(key) == now, (
+                f"{args.resume} was trained with {key}={ckpt.get(key)} but this run uses "
+                f"{now}; use a separate --out-dir")
         encoder.load_state_dict(ckpt["encoder"])
         adapter.load_state_dict(ckpt["adapter"])
         if ntoken is not None:
@@ -787,13 +1008,26 @@ def main():
     running, running_n, tokens, clock = 0.0, 0, 0, time.time()
     rank_running, rank_hits, rank_n = 0.0, 0, 0
 
+    # A GNN estimate for a paper with no references is the [MASK] row alone (graph.py).
+    train_nodes = with_references(data, sets["train"]) if joint else sets["train"]
+    if joint:
+        print(f"joint fine-tune on {len(train_nodes):,} training papers with references; "
+              f"loss = LM + {args.lambda_cos} x (1 - cosine to own embedding), GNN lr "
+              f"{args.gnn_lr:.0e}")
+    cos_running = 0.0
+
     for epoch in range(start_epoch, args.epochs):
+        train_loader = make_loader(data, epoch_nodes(train_nodes, epoch, args.epoch_size),
+                                   BATCH_SIZE, shuffle=True, gnn_layers=args.gnn_layers,
+                                   hops=train_hops)
         for i, batch in enumerate(train_loader):
             node_ids = batch.n_id[:batch.batch_size].tolist()
             input_ids, labels, mask = collate(tokenizer, example, node_ids, device)
 
-            lm_loss, prefix = step_loss(llm, encoder, adapter, ntoken, batch.to(device),
-                                        input_ids, labels, mask, dtype, args.oracle)
+            batch = batch.to(device)
+            lm_loss, prefix, graph_vector = step_loss(
+                llm, encoder, adapter, ntoken, batch, input_ids, labels, mask, dtype,
+                args.oracle, noise=args.oracle_noise, refs_mix=args.refs_mix)
 
             # L_LM stays primary and unweighted; the ranking term is what makes the objective
             # ask about *this* paper at all. They genuinely conflict — one rewards likely text,
@@ -811,6 +1045,11 @@ def main():
             lam = args.lambda_rank * (min(1.0, opt_step / args.rank_warmup)
                                       if args.rank_warmup else 1.0)
             loss = lm_loss if rank_term is None else lm_loss + lam * rank_term
+            if joint:
+                cos_term = 1 - F.cosine_similarity(
+                    graph_vector.float(), oracle_vector(batch).float(), dim=-1).mean()
+                loss = loss + args.lambda_cos * cos_term
+                cos_running += cos_term.item()
             (loss / GRAD_ACCUM).backward()
 
             running += lm_loss.item()
@@ -837,13 +1076,13 @@ def main():
                          if rank_n else "")
                 print(f"epoch {epoch} step {opt_step:>5}  loss {running / running_n:.4f}{extra}"
                       f"  contrast {delta_cos:.3f}"
-                      f"  lr {scheduler.get_last_lr()[0]:.2e}  {tokens / elapsed:,.0f} tok/s",
+                      f"  lr {scheduler.get_last_lr()[-1]:.2e}  {tokens / elapsed:,.0f} tok/s",
                       flush=True)
                 if run is not None:
                     gate = adapter.gate.detach().float().cpu()
                     run.log({
                         "train/loss": running / running_n,
-                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/lr": scheduler.get_last_lr()[-1],
                         "train/tokens_per_sec": tokens / elapsed,
                         "train/grad_norm": grad_norm.item(),   # pre-clip
                         "train/epoch": epoch,
@@ -863,8 +1102,11 @@ def main():
                         **({"train/rank_loss": rank_running / rank_n,
                             "train/rank_hit": rank_hits / rank_n,
                             "train/lambda_rank": lam} if rank_n else {}),
+                        # the GNN estimate's distance from the paper's own embedding
+                        **({"train/cos_loss": cos_running / running_n} if joint else {}),
                     }, step=opt_step)
                 running, running_n, tokens, clock = 0.0, 0, 0, time.time()
+                cos_running = 0.0
                 rank_running, rank_hits, rank_n = 0.0, 0, 0
 
             if opt_step % EVAL_EVERY == 0:
@@ -889,6 +1131,19 @@ def main():
                           args.rank_tokens, tokenizer.pad_token_id, prompt_ids)
         distinct, _ = canary(llm, encoder, adapter, ntoken, data, canary_nodes, tokenizer,
                              example, device, dtype, args.gnn_layers, args.oracle)
+        val_id = None
+        if val_id_nodes:
+            val_id = identifiability(llm, adapter, data, val_id_nodes, tokenizer, example,
+                                     corpus.abstract, device, dtype, val_id_arms, val_id_hops,
+                                     encoder if joint else None)
+            losses["val_id_mrr"] = val_id[val_id_select]["mrr"]
+            print(f"  identifiability over {len(val_id_nodes)} validation nodes "
+                  f"(chance top-1 {1 / len(val_id_nodes):.3f}): "
+                  + "  ".join(f"{arm} top1 {v['top1']:.3f} mrr {v['mrr']:.3f}"
+                              for arm, v in val_id.items()), flush=True)
+            if run is not None:
+                run.log({f"val_id/{arm}_{k}": x for arm, v in val_id.items()
+                         for k, x in v.items()}, step=opt_step)
         score = selection_score(losses)
         improved = score > best_score
         if improved:
@@ -914,11 +1169,17 @@ def main():
                     "gnn_layers": args.gnn_layers, "gnn_conv": args.gnn_conv,
                     "neighbour_tokens": ntoken.max_tokens if ntoken is not None else 0,
                     "oracle": args.oracle,
+                    "oracle_noise": args.oracle_noise, "epoch_size": args.epoch_size,
+                    "refs_mix": args.refs_mix,
+                    "joint": joint, "reader": args.reader,
+                    "pretrained_encoder": args.pretrained_encoder,
+                    "lora_targets": list(LORA_TARGETS) if args.lora else None,
+                    "val_id": val_id, "canary_distinct": distinct,
                     # Which node features the encoder was trained on. Whitened and raw features
                     # have identical shapes, so a checkpoint loaded against the wrong ones
                     # would run a trained encoder on a distribution it has never seen and
                     # produce fluent text rather than an error. generate.py refuses a mismatch.
-                    "node_embeddings": os.path.basename(NODE_EMBEDDINGS),
+                    "node_embeddings": os.path.basename(embeddings),
                     "valid_loss": losses["graph"], "best_score": best_score,
                     "rank_acc": losses.get("rank_acc"),
                     "bad_epochs": bad_epochs}, path)
@@ -930,6 +1191,23 @@ def main():
         if improved:
             shutil.copyfile(path, best_path)
             print(f"saved {best_path} (epoch {epoch + 1}, selection score {best_score:.4f})")
+
+        # Run 9's stop rules — code, not a sentence in a plan. Run 8's plan said "flat at
+        # chance by step 800 means stop"; it was flat by step 200 and ran to the end. The epoch
+        # is already saved, so the failure can be inspected; the job then exits non-zero.
+        if args.oracle and epoch + 1 >= VAL_ID_GATE_EPOCH:
+            if distinct < CANARY_MIN_DISTINCT:
+                stop(
+                    f"STOP: canary wrote {distinct} distinct texts for {len(canary_nodes)} "
+                    f"papers at epoch {epoch + 1} (minimum {CANARY_MIN_DISTINCT}). The decoder "
+                    f"is collapsing to a template; resubmitting would only continue it.")
+            floor = VAL_ID_MIN_LIFT / len(val_id_nodes)
+            if val_id["oracle"]["top1"] < floor:
+                stop(
+                    f"STOP: from its own embedding the decoder identifies "
+                    f"{val_id['oracle']['top1']:.3f} of validation papers at epoch {epoch + 1}, "
+                    f"below {VAL_ID_MIN_LIFT}x chance ({floor:.3f}). It cannot read the "
+                    f"vector, so no graph estimate of that vector can help.")
 
         if PATIENCE and bad_epochs >= PATIENCE:
             print(f"\nearly stop: {bad_epochs} epochs without improvement on the validation "

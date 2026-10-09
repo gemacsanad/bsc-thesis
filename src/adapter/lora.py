@@ -35,13 +35,23 @@ from peft import LoraConfig, inject_adapter_in_model
 from config import LORA_ALPHA, LORA_DROPOUT, LORA_R, LORA_TARGETS
 
 
-def lora_config():
+def lora_config(targets=None):
     """The one place the adapter's shape is defined — train.py and generate.py must agree."""
     return LoraConfig(r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
-                      target_modules=list(LORA_TARGETS), bias="none", task_type="CAUSAL_LM")
+                      target_modules=list(targets or LORA_TARGETS), bias="none",
+                      task_type="CAUSAL_LM")
 
 
-def add_lora(llm):
+def targets_of(state):
+    """-> the target modules a saved LoRA state was trained on, read off its keys.
+
+    Run 9 moved LORA_TARGETS from q/k/v back to q/v. Reading the targets from the checkpoint
+    rather than from config.py lets the q/k/v checkpoints of steps 6-8 still be generated from.
+    """
+    return sorted({part for key in state for part in key.split(".") if part.endswith("_proj")})
+
+
+def add_lora(llm, targets=None):
     """Inject LoRA into `llm` in place. -> the list of new trainable parameters.
 
     The parameters are moved to fp32 in training *and* generation. AdamW on bf16 parameters
@@ -49,7 +59,7 @@ def add_lora(llm):
     on the way in — so if the two halves disagreed, generation would not be running what
     training produced.
     """
-    inject_adapter_in_model(lora_config(), llm)
+    inject_adapter_in_model(lora_config(targets), llm)
 
     params = []
     for name, param in llm.named_parameters():
