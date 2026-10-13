@@ -36,3 +36,24 @@ how the current numbers were produced.
 - **The gate bootstraps from zero** (`adapter.md`, Stage 3b addendum) — at `gate = 0` the entire
   13.7M-parameter graph pathway receives exactly zero gradient, so it has to learn its way open
   from a random delta.
+
+## The `final_model` branch cleanup (2026-10-13)
+
+The `final_model` branch starts from `be93232` and removes only code that no experiment or job
+depends on. **Every folder under `experiments/` is kept**, including `_archive/`: runs that look
+superseded still back arguments in the thesis (for example `_archive/random-sample` is the
+evidence that BERTScore cannot separate the arms).
+
+Removed, all recoverable with `git show be93232:<path>`:
+
+| path | why it went |
+|---|---|
+| `src/analysis/probe.py` | TF-IDF identifiability; the same instrument now lives in `src/adapter/identify.py` and in `src/evaluation/evaluate_detailed.py` (`tfidf_rank`) |
+| `src/analysis/refsignal.py` | the 64.34% reference-mean retrieval; superseded by the run-11 GNN grid's `refs_mean` baseline and `retrieval_baseline.py` |
+| `src/analysis/memo.py`, `selpolicy.py`, `domain_probe.py` | step-6-era one-off analyses; their results are in `soft_prompt_only.md` and `step6_failure_analysis.md` |
+| `src/evaluation/evaluate_results_simple.py` | never used by any experiment |
+| `archive/graphsage_classification/`, `hpc/komondor/jobs/run_train_graphsage_full.sh`, `hpc/komondor/containers/graphsage-gpu.def` | the ogbn-arxiv node-classification side project; it produced no experiment in this repo |
+
+`.env_local` is no longer tracked and is now in `.gitignore`; the file itself stays on disk. It
+holds real API keys and is still present in every earlier commit, so **rotate those keys before
+this repository is pushed anywhere**.
