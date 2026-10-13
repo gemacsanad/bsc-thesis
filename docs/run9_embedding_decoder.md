@@ -385,3 +385,69 @@ noise.
   swept.
 - **The reader is retrained from scratch**, so run 11's reader is a second sample of run 10a's
   recipe. The two oracle arms show how much that recipe varies between runs.
+
+## 9. Run 11 result (job 14541449): the loop fix worked, the estimate barely moved
+
+Trained 2026-10-09/10 in one job. Only the joint arm has been judged so far. The other arms
+were scored with TF-IDF identifiability (`loop_check.py`) alone.
+
+**GNN grid** (validation cosine to own embedding; plain reference mean = 0.816, top-1 63.5%):
+
+| variant | val cos | val top-1 | eval cos | eval top-1 |
+|---|---|---|---|---|
+| **GATv2 1-layer cos (winner)** | **0.828** | 70.5% | 0.833 | 70.8% |
+| GATv2 2-layer cos | 0.822 | 64.4% | 0.822 | 63.2% |
+| GATv2 1-layer cos+NCE | 0.820 | 72.3% | 0.826 | 75.2% |
+| SAGE 1-layer cos | 0.820 | 67.2% | 0.825 | 68.4% |
+| SAGE 2-layer cos | 0.819 | 66.0% | 0.821 | 65.2% |
+| SAGE 1-layer cos+NCE | 0.818 | 72.0% | 0.822 | 72.8% |
+| GATv2 2-layer cos+NCE | 0.814 | 71.0% | 0.814 | 69.4% |
+| SAGE 2-layer cos+NCE | 0.810 | 70.6% | 0.812 | 71.0% |
+
+All eight variants fall within 0.02 of each other and of the plain mean. Second-hop layers
+are worse. InfoNCE trades cosine for top-1. On eval, the winner beats the mean by +0.010
+cosine (0.833 against 0.823). By run 10a's slope of ~0.6 judge per 0.1 cosine, that is worth
+about +0.06. Architecture is not the limit; what the references say about a paper is.
+
+**Loop test** (200 papers): `--no-repeat-ngram 6` kept. Loop rate 14.0% → 0%, top-1
+52.0% → 51.5%, 123 → 107 words.
+
+**Training.**
+- **Reader:** the gate opened from the first eval (`valid/delta` 0 → 0.085). Selected at
+  epoch 5 on refs-mean MRR, which peaked at 0.530 and was flat at epoch 6. Oracle MRR was
+  still rising (0.62 → 0.70), and the learning rate never decayed.
+- **Joint:** `train/cos_loss` stayed at 0.20 and `encoder/output_cosine` at 0.54 for all three
+  epochs, so at lr 1e-5 the GNN did not move and the stage only adapted the reader to the GNN
+  output. Validation GNN MRR rose 0.59 → 0.64 (128 papers, SE ~0.04).
+
+**Eval (945 papers).**
+
+| arm | judge acc | ≥3 | coherence | TF-IDF top-1 | MRR | loops |
+|---|---|---|---|---|---|---|
+| Qwen text baseline | 3.59 | 80% | 7.90 | 42.9% | 0.557 | 0% |
+| 10a oracle | 3.41 | 70% | 6.99 | 32.6% | 0.449 | 17.6% |
+| 10a refs-mean | 2.82 | 52% | 7.19 | 15.2% | 0.256 | 13.7% |
+| **11 joint** | **2.94** | 60% | **7.86** | 18.8% | 0.301 | 0% |
+| 11 reader ← oracle | – | – | – | 27.8% | 0.408 | 0% |
+| 11 reader ← GNN | – | – | – | 18.5% | 0.305 | 0% |
+| 11 reader ← refs-mean | – | – | – | 16.5% | 0.271 | 0% |
+| 11 reader ← zero | – | – | – | 0.1% | 0.008 | 0% |
+
+- **Joint − 10a refs-mean = +0.125 (paired SE 0.039)**, but it comes almost entirely from the
+  loop fix. On the 129 papers where 10a looped the gain is +0.61. On the other 816 it is +0.05
+  (SE 0.04), which is not significant. Coherence rose by 0.67, as expected.
+- **The joint stage added nothing measurable.** Joint and reader ← GNN have the same TF-IDF
+  top-1 and MRR (18.8% / 0.301 against 18.5% / 0.305).
+- **GNN against plain mean, same reader:** +2.0 points of top-1 and +0.034 MRR. That is
+  small, and in line with the cosine gain.
+- **This reader's oracle arm is weaker than 10a's** (27.8% against 32.6% top-1). It is not
+  the n-gram ban, which cost 0.5 points in the loop test. Retraining the same recipe varies by
+  this much, and the reader was selected for its refs-mean arm.
+- **Where the gap to the oracle sits:** on the fifth of papers whose references are least
+  like them (refs-mean cosine < 0.79), the joint arm scores 2.52 against the oracle's 3.34. On
+  the most similar fifth it scores 3.32 against 3.57. The estimate fails where the references
+  do not describe the paper.
+
+**Against the expected range:** the loop fix was as predicted for coherence, and larger for
+accuracy because looped outputs scored low. The GNN gain was below the +0.1–0.2 guess, and
+the joint stage came in under 3.1–3.3.

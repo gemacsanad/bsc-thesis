@@ -13,6 +13,10 @@ rather than a rewrite of what came before.
 | [`qwen_migration.md`](qwen_migration.md) | Stage 7, **the record**: what was actually built at each step, with the measurements. |
 | [`soft_prompt_only.md`](soft_prompt_only.md) | Stage 8: removing the reference abstracts from the prompt so the graph prefix is the only channel — why (the Qwen gap went negative), the decisions, and the measurements. |
 | [`run9_embedding_decoder.md`](run9_embedding_decoder.md) | Run 9: the review of all soft-prompt runs, the embedding → abstract decoder it motivates, what changed and why, how to read the four evaluation arms, run 9's epoch-1 stop, run 10a (step 4's recipe on 90k papers, trained half on the reference mean), and run 11 (reader, GNN imitation grid, joint fine-tune, loop fix). |
+| [`run11_model.md`](run11_model.md) | The run-11 model as one description: each component (masked GATv2 estimator, prefix adapter, LoRA on a frozen Qwen3-14B, decoding), the three training phases with their W&B curves, the 945-paper results and limitations. |
+| [`other_datasets.md`](other_datasets.md) | Candidate non-citation datasets for the same pipeline (Goodreads, Amazon co-purchase, Wikipedia), what rules others out, and the CPU check to run before any GPU time. |
+| [`chosen_evaluations.md`](chosen_evaluations.md) | Which experiment folders make up the thesis ablation table (text baseline, end-to-end, run-11 arms), the paired comparisons they answer, and what is still to judge. |
+| [`detailed_evaluation.md`](detailed_evaluation.md) | `src/evaluation/evaluate_detailed.py`: the accuracy score split into blind facet labels, subfield/problem/task, claim precision, identification among hard distractors, pairwise preference and on-target margin; how each works, the reading rules and the cost. |
 | [`weekly/week_4.md`](weekly/week_4.md) | The reference-filtering pipeline — LLM relevance labels, Voyage embeddings, and the two cosine scores. Old generation. |
 | `../src/data/s2/README.md` | The Semantic Scholar bulk download and the joint dataset build. |
 
