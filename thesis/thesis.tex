@@ -1,29 +1,28 @@
-% !TeX spellcheck = hu_HU
+% !TeX spellcheck = en_GB
 % !TeX encoding = UTF-8
 % !TeX program = xelatex
-% TODO Change language to en_GB (recommended) or en_US for English documents
 \documentclass[11pt,a4paper,oneside]{report}             % Single-side
 %\documentclass[11pt,a4paper,twoside,openright]{report}  % Duplex
 
 \input{include/packages}
 
 %TODO Set the main variables
-\newcommand{\vikszerzoVezeteknev}{Gipsz}
-\newcommand{\vikszerzoKeresztnev}{Jakab}
+\newcommand{\vikszerzoVezeteknev}{Gema}
+\newcommand{\vikszerzoKeresztnev}{Csanád}
 
-\newcommand{\vikkonzulensAMegszolitas}{dr.~}
-\newcommand{\vikkonzulensAVezeteknev}{Konzulens}
-\newcommand{\vikkonzulensAKeresztnev}{Egy}
+\newcommand{\vikkonzulensAMegszolitas}{Dr.~}
+\newcommand{\vikkonzulensAVezeteknev}{Gyires-Tóth}
+\newcommand{\vikkonzulensAKeresztnev}{Bálint}
 
 \newcommand{\vikkonzulensBMegszolitas}{}
-\newcommand{\vikkonzulensBVezeteknev}{Konzulens}
-\newcommand{\vikkonzulensBKeresztnev}{Kettő}
+\newcommand{\vikkonzulensBVezeteknev}{Unyi}
+\newcommand{\vikkonzulensBKeresztnev}{Dániel}
 
 \newcommand{\vikkonzulensCMegszolitas}{}
 \newcommand{\vikkonzulensCVezeteknev}{}
 \newcommand{\vikkonzulensCKeresztnev}{}
 
-\newcommand{\vikcim}{Elektronikus terelők} % Cím
+\newcommand{\vikcim}{Neighborhood-Based Node Text Generation with Graph Neural Networks and Large Language Models} % Cím
 \newcommand{\viktanszek}{\bmemit} % Tanszék
 \newcommand{\vikdoktipus}{\bsc} % Dokumentum típusa (\bsc vagy \msc)
 \newcommand{\vikmunkatipusat}{szakdolgozatot} % a "hallgató nyilatkozat" részhez: szakdolgozatot vagy diplomatervet
@@ -46,11 +45,6 @@
 \begin{document}
 
 \pagenumbering{gobble}
-
-%TODO These includes define guidelines -- remove these
-%~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-\include{include/guideline}
-\include{include/project}
 
 \selectthesislanguage
 
@@ -78,9 +72,6 @@
 
 %TODO import your own content
 \include{content/introduction}
-\include{content/latex-tools}
-\include{content/thesis-format}
-\include{content/template-usage}
 
 
 % Acknowledgements

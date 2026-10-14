@@ -17,6 +17,7 @@ rather than a rewrite of what came before.
 | [`other_datasets.md`](other_datasets.md) | Candidate non-citation datasets for the same pipeline (Goodreads, Amazon co-purchase, Wikipedia), what rules others out, and the CPU check to run before any GPU time. |
 | [`chosen_evaluations.md`](chosen_evaluations.md) | Which experiment folders make up the thesis ablation table (text baseline, end-to-end, run-11 arms), the paired comparisons they answer, and what is still to judge. |
 | [`detailed_evaluation.md`](detailed_evaluation.md) | `src/evaluation/evaluate_detailed.py`: the accuracy score split into blind facet labels, subfield/problem/task, claim precision, identification among hard distractors, pairwise preference and on-target margin; how each works, the reading rules and the cost. |
+| [`thesis_context/`](thesis_context/00_index.md) | Ten self-contained, sourced context files for writing the thesis: literature with verified URLs, data and preprocessing, the final model, development history, evaluation methods (incl. planned validity experiments), results (not final), proposed other datasets, reproducibility, limitations. Start at `00_index.md`. |
 | [`weekly/week_4.md`](weekly/week_4.md) | The reference-filtering pipeline — LLM relevance labels, Voyage embeddings, and the two cosine scores. Old generation. |
 | `../src/data/s2/README.md` | The Semantic Scholar bulk download and the joint dataset build. |
 

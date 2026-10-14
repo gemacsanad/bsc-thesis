@@ -92,3 +92,85 @@ of its own.
 - [CS-TAG: A Comprehensive Study on Text-attributed Graphs](https://proceedings.neurips.cc/paper_files/paper/2023/hash/37d00f567a18b478065f1a91b95622a0-Abstract.html) and [TAG-Benchmark repo](https://github.com/sktsherlock/TAG-Benchmark)
 - [TAGLAS: An atlas of text-attributed graph datasets](https://arxiv.org/html/2406.14683)
 - [TANS: Can LLMs Convert Graphs to Text-Attributed Graphs?](https://arxiv.org/html/2412.10136)
+
+## Measured, 2026-10-13: access, size, text length and neighbour signal
+
+Samples were downloaded to a scratch directory and measured on CPU. Nothing was embedded or
+added to `data/`.
+
+### One probe for every graph
+
+For 1,000 nodes with ≥ 80 words of text and ≥ 3 neighbours: TF-IDF of the node's own text
+against the concatenated texts of its neighbours. Top-1 is the share of nodes whose neighbours
+are closer to their own text than to any of the other 999. This is a cheap, model-free version
+of "how much do the neighbours say about this node", the quantity run 11 found to be the ceiling.
+
+| graph | edges mean | top-1 of 1,000 | cos(neighbours, own) vs random |
+|---|---|---|---|
+| **arXiv/S2 citations (ours)** | references | **46.9%** (of 945) | 0.243 vs 0.102 |
+| Amazon books, co-purchase (CS-TAG History) | also bought | 31.1% | 0.221 vs 0.062 |
+| WikiCS | hyperlinks | 5.2% | 0.227 vs 0.118 |
+| Goodreads, children's books | `similar_books` | 4.2% | 0.091 vs 0.045 |
+
+**Our citation graph is the most informative of the four.** No candidate measured here gives
+the model more to work with than the dataset it already has.
+
+### Per dataset
+
+| dataset | how to get it | download | nodes / edges | node text | findings |
+|---|---|---|---|---|---|
+| **CS-TAG Books-History** | HF `Sherirto/CSTAG`, `History/History.csv` | 63 MB | 41,551 / 358,574 | Amazon book description + title: median 131 words, mean 220, 68% ≥ 80 | Ready to use, with neighbour lists in the CSV. Degree median 3, mean 8.6. 16,564 nodes have ≥ 80 words and ≥ 3 neighbours. Same-title neighbours 0.10%. |
+| CS-TAG Books-Children | same repo, `Children/Children.csv` | 110 MB | 76,875 / 1,554,578 | same format | Not measured; the same construction as History. |
+| CS-TAG Goodreads | same repo | 95 MB | 676,084 / 8,582,324 | **titles only** | Unusable as a target: there are no descriptions in the file. |
+| CS-TAG Ele-Computers / Ele-Photo / Sports-Fitness | same repo | 53 / 77 / 39 MB | 87k / 48k / 173k nodes | reviews (Computers, Photo), titles (Fitness) | Not a description of the node; unusable. |
+| **Goodreads (UCSD Book Graph)** | `mcauleylab.ucsd.edu/public_datasets/gdrive/goodreads/`, direct links. Academic use only, no redistribution. | 1.9 GB gz all books; per genre 27 MB (poetry) to 348 MB (romance) | 2.36M books; edges from `similar_books` | blurb: median 69 words (children), 75 (poetry); 12–21% empty | 47% of children's books have any `similar_books`, 44% have ≥ 3 inside the genre file. 27,179 usable children's books. No leakage: 0.00% of neighbours are another edition of the same work. Neighbours are genre-level, hence the 4.2% probe. Only 26–31% are coded English. |
+| **Amazon 2018 metadata** | `mcauleylab.ucsd.edu/public_datasets/data/amazon_v2/metaFiles2/meta_<Category>.json.gz`, direct. No explicit licence; cite the paper. | Books 1.22 GB gz (2.9M items); Electronics 1.20 GB gz; all categories 24 GB | built from `also_buy` / `also_view` | Books description median 45 words, 41% ≥ 80; Electronics median 59, 42% ≥ 80 | Books: `also_buy` on 62% of items, mean 16. Electronics: `also_buy` on only **10%**. Descriptions contain HTML. |
+| Amazon 2023 (Reviews'23) | HF `McAuley-Lab/Amazon-Reviews-2023` | Books meta 14.7 GB | — | — | **No graph:** `bought_together` was empty on all 20,000 sampled books. |
+| WikiCS | `github.com/pmernyei/wiki-cs-dataset`, `dataset/data.json` + `metadata.json`. MIT licence. | 83 + 56 MB | 11,701 / 297,110 directed links | **preprocessed tokens: lowercased, stop words removed**, median 219 | Not prose, so it cannot be a generation target as is. Text would have to be re-fetched from Wikipedia by title. 8% of a node's linked articles contain its title (leakage). |
+| TAGLAS Product-subset | `github.com/JiaruiFeng/TAGLAS` | — | 54,025 / 144,638 | title + description, 113.9 words on average (paper) | Not measured. From TAPE / ogbn-products: co-purchase, so the closest ready-made "complements" graph. |
+
+### What this means for the recommendations above
+
+- **Best second domain: Amazon books co-purchase** (CS-TAG Books-History, then Children). It is
+  the only candidate with a strong neighbour signal (31.1%), it's a 63 MB download with the
+  graph included, and the text is a description of the item. Expect a weaker result than on
+  papers, not a stronger one.
+- **Goodreads is a contrast case, not a win.** Its neighbours are about the genre, not the book
+  (4.2%). On the run-11 argument that is useful: it is the extreme case of "the domain is
+  recoverable, the specifics are not".
+- **The "complements" hypothesis is untested.** The co-purchase graph that exists in quantity is
+  book-to-book, and those neighbours look like the node (similar books). Electronics, where
+  complements would appear, has `also_buy` on only 10% of items. TAGLAS Product-subset is the
+  ready-made place to test it.
+- **Drop WikiCS** unless the article text is re-fetched. Drop Amazon 2023 for graph work.
+
+### WikiCS with the text recovered (2026-10-13)
+
+The WikiCS text is unusable as stored, but its titles are intact. Fetching each article's lead
+section from the MediaWiki API (TextExtracts, `exintro`, plain text, 20 titles per request,
+about 3 minutes) recovered **11,024 of 11,701 leads (94%)**.
+
+- **Lead length:** median 95 words, mean 120, p90 249; 58% have ≥ 80 words. Shorter than an
+  abstract (median 174) but in the right range.
+- **Usable nodes** (lead ≥ 80 words, ≥ 3 linked articles with a lead): **5,923**. That is far
+  too few to train a reader; run 11 used 90k papers.
+- **Leakage:** 5% of linked leads name the target. Removing the name barely moves the probe
+  (10.8% → 10.6%), so the signal does not come from the name.
+
+| neighbours | top-1 of 1,000 | cos vs random |
+|---|---|---|
+| out-links | 10.8% | 0.218 vs 0.069 |
+| **in-links** | **24.1%** | 0.213 vs 0.055 |
+| both | 10.8% | 0.219 vs 0.073 |
+
+In-links (articles that link *to* the target) carry about twice the signal of out-links, which
+tend to point at broad topics. Concatenating both dilutes the in-link signal.
+
+Two open problems before it can be used:
+1. **Size.** It needs expanding to tens of thousands of articles, for example by a
+   breadth-first crawl of the API from the WikiCS seeds. The link graph would then come from
+   today's Wikipedia rather than the 2020 snapshot.
+2. **Memorisation.** Qwen3-14B was trained on Wikipedia. If the soft prompt only conveys
+   *which* article it is, the model may recall the lead from pretraining. That would make the
+   reader look better than the graph signal justifies. A title-only control is needed: prompt
+   the model with the article's title alone, no graph, and score the result.

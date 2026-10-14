@@ -56,3 +56,6 @@ duckdb_tmp/
 *.fdb_latexmk
 *.synctex.gz
 *.xdv
+
+# Local secrets (tracked until the final_model cleanup; rotate its keys before publishing)
+.env_local
