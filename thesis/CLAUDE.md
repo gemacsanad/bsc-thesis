@@ -112,15 +112,14 @@ Do these silently, then say in one or two lines where things stand:
 - run `git status` on this folder;
 - open the last-written `.tex` file.
 
-### AI-use log
+### AI-use declaration
 
 The thesis must contain a declaration of generative-AI use: a table in the appendix with the
 type of use, the sections affected, a brief summary of the prompts, and the share of use.
 `include/AI_nyilatkozat_tablazat_EN.tex` is the table.
 
-Keep `plans/ai_use.md` up to date: one line per section you helped plan or write, with the
-type of help ("outline", "text blocks", "proofreading"). This lets the author fill the table
-truthfully. Filling the table itself is the author's job.
+Do **not** keep an AI-use log during writing. The author will handle the declaration once the
+thesis is finished.
 
 ---
 

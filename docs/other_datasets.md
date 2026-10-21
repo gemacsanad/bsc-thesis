@@ -174,3 +174,70 @@ Two open problems before it can be used:
    *which* article it is, the model may recall the lead from pretraining. That would make the
    reader look better than the graph signal justifies. A title-only control is needed: prompt
    the model with the article's title alone, no graph, and score the result.
+
+## Final recommendation, 2026-10-19: one book, one Wikipedia, one product dataset
+
+New measurements on CPU, same probe as above (TF-IDF of the node's own text against its
+neighbours' concatenated text, top-1 among 1,000). Samples are in a scratch directory, not in
+`data/`. "Usable" means ≥ 80 words of own text and ≥ 3 neighbours.
+
+| | **Books: CS-TAG Books-Children** | **Wikipedia: Kensho Derived Wikimedia Dataset** | **Products: full ogbn-products** |
+|---|---|---|---|
+| get it | HF `Sherirto/CSTAG`, `Children/Children.csv` (110 MB, neighbour lists included) | Kaggle `kenshoresearch/kensho-derived-wikimedia-data`, HF mirror `pakkinlau/Kensho_Derived_Wikimedia_Dataset`; `link_annotated_text.jsonl` is 18 GB. CC BY-SA 3.0, 2019 snapshot. | graph: OGB `products.zip` (+ `mapping/nodeidx2asin`); text: Amazon-3M, HF mirror `pkuHaowei/amazon-3m` (3 GB, 2.46M items) |
+| edges | co-purchase, book–book | in-text hyperlinks with target page IDs (no template links); use **in-links** | co-purchase, product–product |
+| text to generate | book description | article intro section | product description |
+| nodes / edges | 76,875 / 1.16M undirected; degree median 11, mean 30 | ~5.3M pages (not counted here) | 2.45M / ~62M |
+| text length | median 127 words, mean 190, p90 399; 64% ≥ 80 | 82-page sample: intro median 227, 90% ≥ 80; ~20 links per intro. Biased to old, long articles. | TAGLAS 54k subset: median 61, mean 95, p90 212; 40% ≥ 80; 7% empty |
+| usable nodes | **38,537** | not counted; likely millions | not counted; 40% of 2.45M have ≥ 80 words |
+| probe top-1 | **36.5%** (cos 0.222 vs 0.057 random) | not measured | **29.7%** on the subset (29.1% without neighbour titles); cos 0.216 vs 0.022 |
+| leakage | 0.05% same-title neighbours | neighbour leads that name the target (5% on WikiCS) | 6.8% same-title neighbours (colour/size variants) |
+| cleaning | HTML unescape; drop seller condition notes (0.8%) | strip names of the target from neighbour text | HTML unescape, length filter, drop variants |
+
+For comparison, the arXiv/S2 citation graph scores 46.9% on the same probe. Books-Children
+replaces Books-History as the book pick: 2.3× the usable nodes (38,537 vs 16,564) and a
+stronger probe (36.5% vs 31.1%).
+
+### What each run tests and what to expect
+
+- **Books-Children: generalisation.** Neighbours are similar books, as citations are similar
+  papers, so expect the run-11 picture again: the plain neighbour mean close to the ceiling and
+  little GNN margin. Expect a lower absolute score than on papers, since the probe is weaker.
+  It is the only candidate near run 11's training size (39k vs 90k).
+- **Wikipedia: a clean, high-quality domain, with a memorisation risk.** Qwen3-14B has read
+  Wikipedia. If the prefix conveys only which article it is, the model can recall the lead.
+  A **title-only control** (title in the prompt, no graph) is required before any score is
+  credited to the graph. In-links carried twice the signal of out-links on WikiCS (24.1% vs
+  10.8%), so expect them to matter here too.
+- **Products: where a GNN can beat the mean.** Neighbours are complements, not look-alikes
+  (a Galaxy Tab screen protector's neighbours are Galaxy Tab cases). A weak mean leaves room
+  for a learned aggregator only when the neighbours hold the information and averaging hides
+  it, in one of two ways:
+  - *Selection:* a few neighbours are informative, and attention can find them.
+  - *Translation:* neighbours point at the target without resembling it, and a learned map can
+    get from one to the other.
+
+  If the information is not in the neighbours at all (as on Goodreads, 4.2%), no aggregator
+  wins. The TF-IDF probe likely understates complements, because they share few words with
+  the target.
+
+### Baseline to add
+
+Run 11's GNN has a linear head; the plain mean does not. On a complements graph, part of any
+margin could come from the head alone. The fair baseline is **neighbour mean + the same linear
+head**. The GNN has earned its place only if it beats that.
+
+### Checks before GPU time
+
+1. **Kensho:** stream the 18 GB file once, build in-links, and run the probe with
+   target-name filtering.
+2. **ogbn-products:** join the Amazon-3M text to OGB node IDs. The HF mirror has no ASIN
+   column, so match by title or use the original Amazon-3M files, which carry the ASIN as
+   `uid` (the TAGLAS subset uses that format). Then run the probe on the full graph.
+3. **All three, on embeddings:**
+   - mean cosine to the node's own embedding;
+   - best single neighbour vs mean (room for selection);
+   - linear map from mean to node, held out (room for translation);
+   - unrelated-node control.
+
+   A dataset where neither the selection nor the translation check beats the control will
+   not show a GNN margin.

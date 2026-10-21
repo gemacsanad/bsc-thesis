@@ -1,0 +1,42 @@
+%----------------------------------------------------------------------------
+\chapter{Background and related work}
+\label{chap:background}
+%----------------------------------------------------------------------------
+
+%----------------------------------------------------------------------------
+\section{Graph neural networks}
+\label{sec:gnn}
+%----------------------------------------------------------------------------
+
+\subsection{Text-attributed graphs and homophily}
+\label{sec:tag}
+
+For a graph $G = (V, E)$, the neighbourhood of a node $v$ is $\mathcal{N}(v) = \{u \in V : (u, v) \in E\}$; in a directed graph these are the nodes with an edge pointing into $v$. Each node carries a feature vector $\mathbf{x}_v \in \mathbb{R}^d$. A text-attributed graph (TAG) is a graph whose nodes also carry a piece of text $t_v$, for example the title and abstract of a paper in a citation graph~\textcolor{red}{[TODO: cite a TAG definition]}. The node features of a TAG can be computed from this text, for instance as an embedding of $t_v$ produced by a text encoder.
+
+Many real-world networks are homophilous. The term comes from sociology, where the principle is summarised as ``similarity breeds connection''~\cite{mcpherson2001birds}. In graph learning, homophily means that linked nodes often belong to the same class or have similar features; a citation graph is an example, since papers tend to cite papers from the same research area~\cite{zhu2020beyond}. The opposite property, heterophily, describes graphs in which linked nodes are likely to belong to different classes or to have dissimilar features~\cite{zhu2020beyond}.
+
+When every node has a class label $y_v$, the homophily of a graph can be measured by the edge homophily ratio~\cite{zhu2020beyond}, the fraction of edges that connect nodes with the same label:
+\begin{align}
+  h = \frac{\left|\{(u, v) \in E : y_u = y_v\}\right|}{|E|}.
+  \label{eq:edge-homophily}
+\end{align}
+A graph has strong homophily when $h \to 1$ and strong heterophily when $h \to 0$. The distinction matters for graph neural networks: they model the homophily principle by aggregating features over neighbourhoods, and many popular architectures fail to generalise under heterophily, where they are outperformed even by models that ignore the graph structure~\cite{zhu2020beyond}.
+
+\subsection{Message passing}
+\label{sec:message-passing}
+
+Gilmer et al.~\cite{gilmer2017neural} reformulated a number of earlier graph neural networks into a single framework, which they call message passing neural networks (MPNNs). The framework is defined on an undirected graph $G$ whose nodes carry feature vectors $\mathbf{x}_v$, and it extends directly to directed graphs~\cite{gilmer2017neural}. The framework also allows features on the edges; they are omitted here, because the graphs in this thesis have none.
+
+The forward pass of an MPNN has two phases: a message passing phase and a readout phase. During the message passing phase, which runs for $T$ steps, every node $v$ keeps a hidden state $\mathbf{h}_v^{(t)}$, initialised with its features, $\mathbf{h}_v^{(0)} = \mathbf{x}_v$. At each step, a message function $M_t$ computes a message from every neighbour, the messages are summed, and a vertex update function $U_t$ combines the result with the node's current state:
+\begin{align}
+  \mathbf{m}_v^{(t+1)} &= \sum_{w \in \mathcal{N}(v)} M_t\big(\mathbf{h}_v^{(t)}, \mathbf{h}_w^{(t)}\big), \label{eq:mp-message} \\
+  \mathbf{h}_v^{(t+1)} &= U_t\big(\mathbf{h}_v^{(t)}, \mathbf{m}_v^{(t+1)}\big). \label{eq:mp-update}
+\end{align}
+The readout phase then computes an output for the whole graph from the final node states with a readout function $R$:
+\begin{align}
+  \hat{\mathbf{y}} = R\big(\{\mathbf{h}_v^{(T)} \mid v \in V\}\big).
+  \label{eq:mp-readout}
+\end{align}
+$M_t$, $U_t$ and $R$ are all learned differentiable functions. $R$ operates on a set of node states, which have no natural order, so it must be invariant to permutations of the node states; this makes the whole network invariant to graph isomorphism~\cite{gilmer2017neural}. For tasks with a target at each node rather than for the whole graph, the final node states $\mathbf{h}_v^{(T)}$ themselves serve as the output.
+
+Since each step brings in information from one more hop, the state $\mathbf{h}_v^{(T)}$ depends on all nodes within $T$ edges of $v$. Running many steps, however, leads to over-smoothing. The graph convolution of the graph convolutional network has been shown to be a special form of Laplacian smoothing~\cite{li2018deeper}, which computes the new features of a node as a weighted average of its own and its neighbours' features. A few rounds of smoothing make the features of nodes in the same cluster similar, which eases classification; applied repeatedly, it makes the features within each connected component converge to the same values, so that nodes from different clusters become indistinguishable~\cite{li2018deeper}. This raises a concern about stacking many message passing layers.
