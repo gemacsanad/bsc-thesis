@@ -43,7 +43,7 @@ from transformers.cache_utils import Cache
 from contextlib import contextmanager
 
 from config import (BASE_MODEL, BATCH_SIZE, CANARY_MIN_DISTINCT, CANARY_NODES, CANARY_TOKENS,
-                    CHECKPOINT_DIR, DEFAULT_SETS, ENV_FILE, EPOCH_SIZE, EPOCHS, EVAL_EVERY,
+                    CHECKPOINT_DIR, CLEAN_TARGETS, DEFAULT_SETS, ENV_FILE, EPOCH_SIZE, EPOCHS, EVAL_EVERY,
                     FEATURES, FROZEN_DIR, ORACLE_MIN_COS, REFS_MIX,
                     GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
                     HIDDEN_SIZE, JOINT_GNN_LR, JOINT_LAMBDA_COS, LAMBDA_RANK, LEARNING_RATE,
@@ -51,7 +51,7 @@ from config import (BASE_MODEL, BATCH_SIZE, CANARY_MIN_DISTINCT, CANARY_NODES, C
                     NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
                     RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, RANK_WARMUP_STEPS, SEED,
                     VAL_ID_GATE_EPOCH, VAL_ID_MIN_LIFT, VAL_ID_NODES, VAL_ID_TOKENS,
-                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY)
+                    WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY, check_sets)
 from graph import load_graph, make_loader, select_neighbour_rows, with_references
 from identify import ranks, summary
 from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
@@ -69,6 +69,8 @@ SETS = {
     "legacy": "training_sets.json",
     # Run 9: every train-split core paper (prepare_run9_sets.py), same 806 validation nodes.
     "run9": "training_sets_run9.json",
+    # DYTAG_DATASET=children: src/data/children_books/prepare_sets.py.
+    "children": "training_sets.json",
 }
 
 
@@ -676,6 +678,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # --- data -------------------------------------------------------------
+    check_sets(args.sets)
     sets_file = SETS[args.sets]
     with open(os.path.join(FROZEN_DIR, sets_file)) as f:
         sets = json.load(f)
@@ -693,7 +696,7 @@ def main():
     valid_loader = make_loader(data, sets["valid"], BATCH_SIZE, shuffle=False,
                                gnn_layers=args.gnn_layers, hops=hops)
 
-    corpus = Corpus()
+    corpus = Corpus(clean=CLEAN_TARGETS)
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, use_fast=True)
     if tokenizer.pad_token is None:                        # Llama ships without one
         tokenizer.pad_token = tokenizer.eos_token

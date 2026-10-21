@@ -12,7 +12,7 @@ import re
 import pandas as pd
 from transformers import AutoTokenizer
 
-from config import (BASE_MODEL, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
+from config import (BASE_MODEL, DATASET, FROZEN_DIR, GENERATION_RESERVE, JOINT_DIR, MAX_LENGTH,
                     MAX_OUT_DEGREE, MIN_OUT_DEGREE, NUM_PREFIX_TOKENS,
                     TRAIN_SUBSET, VALID_PER_DEGREE)
 from neighbour_cap import fit_refs
@@ -83,6 +83,30 @@ GRAPH_ONLY_SYSTEM = (
 )
 
 GRAPH_ONLY_USER = "Write the abstract."
+
+# DYTAG_DATASET=children: the same prompt, line for line, for a children's book whose
+# description is reconstructed from the books it was bought with. No word count: descriptions
+# run from 80 to over 700 words (paper abstracts sit near 170), so the length is left to
+# what training shows.
+if DATASET == "children":
+    GRAPH_ONLY_SYSTEM = (
+        "You are a children's book copywriter. "
+        "The context you have been given encodes the books customers bought together with one "
+        "children's book, whose own description is missing. That book is not among them: it is "
+        "a separate book that was bought alongside all of them. "
+        "Reconstruct its description as continuous prose covering: what kind of book it is and "
+        "who it is for, its format and the age of its readers; what it is about, its subject, "
+        "characters or story; and what makes it worth reading. "
+        "Where the context leaves the book's specific content undetermined, state what it does "
+        "determine about its kind, readers and subject, and stop there — a correct general "
+        "statement is worth more than a specific guess. "
+        "Write in the voice of the book's own description: never mention the other books, how "
+        "many there are, or that customers bought them, and do not describe any single one of "
+        "them. "
+        "Write plain prose with no markup or headings. "
+        "Output ONLY the description text."
+    )
+    GRAPH_ONLY_USER = "Write the description."
 
 
 def build_graph_only_prompt(tokenizer):

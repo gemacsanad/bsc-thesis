@@ -90,7 +90,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
                     FEATURES, FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR, MAX_LENGTH, MAX_NEW_TOKENS,
-                    NO_REPEAT_NGRAM, NUM_PREFIX_TOKENS, OUT_CHANNELS, REPETITION_PENALTY, SEED)
+                    NO_REPEAT_NGRAM, NUM_PREFIX_TOKENS, OUT_CHANNELS, REPETITION_PENALTY, SEED,
+                    SOURCE_ID, check_sets)
 from graph import load_graph, make_loader, select_neighbour_rows
 from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
                    oracle_vector, refs_mean_vector)
@@ -103,6 +104,7 @@ SETS = {
     "legacy": "eval_nodes.json",
     # Run 9 trains on its own node set but is scored on the same 945 papers as every run.
     "run9": "eval_nodes_capped.json",
+    "children": "eval_nodes.json",   # DYTAG_DATASET=children
 }
 
 # Inputs that live in the embedding space an --oracle checkpoint was trained on. Any of them can
@@ -321,6 +323,7 @@ def main():
     assert args.mode == "adapter" or args.input in ("encoder", "oracle"), (
         "--input selects the vector for --mode adapter; the gate ablations keep their own")
 
+    check_sets(args.sets)
     eval_file = SETS[args.sets]
 
     output = args.output or os.path.join(EXPERIMENTS_DIR, args.mode, "generations.csv")
@@ -340,8 +343,8 @@ def main():
     # targets carried exactly that — but cleaning what the generations are SCORED against
     # would silently move every number in experiments/.
     corpus = Corpus(clean=False)
-    mag_id = pd.read_csv(os.path.join(JOINT_DIR, "nodes.csv"),
-                         usecols=["node_id", "mag_id"]).set_index("node_id")["mag_id"]
+    source_id = pd.read_csv(os.path.join(JOINT_DIR, "nodes.csv"),
+                            usecols=["node_id", SOURCE_ID]).set_index("node_id")[SOURCE_ID]
     print(f"{len(eval_nodes)} eval nodes, mode={args.mode}, sets={args.sets} ({eval_file})")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
@@ -417,7 +420,7 @@ def main():
         print(f"resuming — {len(done)} rows already written")
 
     out_file = open(output, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_file, fieldnames=["node_id", "mag_id", "original_abstract",
+    writer = csv.DictWriter(out_file, fieldnames=["node_id", SOURCE_ID, "original_abstract",
                                                   "generated_abstract"])
     if write_header:
         writer.writeheader()
@@ -487,7 +490,7 @@ def main():
                     constant = generated
                     print("floor is constant — copying it to the remaining rows", flush=True)
 
-        writer.writerow({"node_id": node_id, "mag_id": mag_id.get(node_id, ""),
+        writer.writerow({"node_id": node_id, SOURCE_ID: source_id.get(node_id, ""),
                          "original_abstract": original, "generated_abstract": generated})
         out_file.flush()
 

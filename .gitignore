@@ -29,6 +29,7 @@ data/raw/ogbn_arxiv/edges.csv
 data/raw/s2/
 data/processed/joint/
 data/processed/s2/
+data/children_books/
 bulk_download_samples/
 
 # Model weights and optimizer state (~196 MB per adapter epoch)

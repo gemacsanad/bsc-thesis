@@ -26,7 +26,8 @@ import os
 
 from transformers import AutoTokenizer
 
-from config import BASE_MODEL, FROZEN_DIR, MAX_LENGTH, NUM_PREFIX_TOKENS
+from config import (BASE_MODEL, CLEAN_TARGETS, DATASET, FROZEN_DIR, MAX_LENGTH,
+                    MAX_NEW_TOKENS, NUM_PREFIX_TOKENS)
 from text import GRAPH_ONLY_SYSTEM, GRAPH_ONLY_USER, Corpus, encode, graph_only_example
 
 # The `<think>\n\n</think>\n\n` is not a mistake: `enable_thinking=False` emits an empty,
@@ -42,11 +43,13 @@ def main():
     args = ap.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    corpus = Corpus()
+    corpus = Corpus(clean=CLEAN_TARGETS)
 
-    with open(os.path.join(FROZEN_DIR, "training_sets_capped.json")) as f:
-        sets = json.load(f)
-    with open(os.path.join(FROZEN_DIR, "eval_nodes_capped.json")) as f:
+    train_file, eval_file = (("training_sets.json", "eval_nodes.json") if DATASET == "children"
+                             else ("training_sets_capped.json", "eval_nodes_capped.json"))
+    with open(os.path.join(FROZEN_DIR, train_file)) as f:
+        sets = {k: v for k, v in json.load(f).items() if k in ("train", "valid")}
+    with open(os.path.join(FROZEN_DIR, eval_file)) as f:
         sets["eval"] = json.load(f)
 
     print("Checking the graph-only prompt …")
@@ -72,6 +75,10 @@ def main():
             assert len(input_ids) + NUM_PREFIX_TOKENS <= MAX_LENGTH, \
                 f"{name} node {node_id}: sequence overflows MAX_LENGTH"
             worst = max(worst, len(input_ids) + NUM_PREFIX_TOKENS)
+            # Books: a target generation could not reproduce within the cap is not in the sets.
+            if DATASET == "children":
+                assert len(input_ids) - n_prompt <= MAX_NEW_TOKENS, \
+                    f"{name} node {node_id}: target + EOS longer than MAX_NEW_TOKENS"
         print(f"  {name:<6} {len(nodes):>5,} nodes ok")
 
     print(f"\nlongest sequence {worst:,} tokens incl. prefix, {MAX_LENGTH - worst:,} under "

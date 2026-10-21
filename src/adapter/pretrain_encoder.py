@@ -69,12 +69,14 @@ from torch.optim import AdamW
 from config import (CHECKPOINT_DIR, ENCODER_COSINE_GATE, FEATURES, FROZEN_DIR, GNN_CONV,
                     GNN_LAYERS, OUT_CHANNELS, PRETRAIN_BATCH, PRETRAIN_EPOCHS, PRETRAIN_LR,
                     PRETRAIN_NEGATIVES, PRETRAIN_TAU, SEED, VICREG_COV, VICREG_GAMMA,
-                    VICREG_VAR, WANDB_PROJECT)
+                    VICREG_VAR, WANDB_PROJECT, check_sets)
 from graph import load_graph, make_loader, with_references
 from model import GraphEncoder, oracle_vector, refs_mean_vector
 
 SETS = {"capped": "training_sets_capped.json", "legacy": "training_sets.json",
-        "run9": "training_sets_run9.json"}
+        "run9": "training_sets_run9.json", "children": "training_sets.json"}
+# Every paper set is checked against the same 945 eval papers; the books have their own.
+EVAL = {"children": "eval_nodes.json"}
 
 
 def info_nce(z, positives, negatives, positive_ids, negative_ids, tau):
@@ -212,9 +214,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
+    check_sets(args.sets)
     with open(os.path.join(FROZEN_DIR, SETS[args.sets])) as f:
         sets = json.load(f)
-    with open(os.path.join(FROZEN_DIR, "eval_nodes_capped.json")) as f:
+    with open(os.path.join(FROZEN_DIR, EVAL.get(args.sets, "eval_nodes_capped.json"))) as f:
         eval_nodes = json.load(f)
     eval_nodes = eval_nodes["nodes"] if isinstance(eval_nodes, dict) else eval_nodes
 

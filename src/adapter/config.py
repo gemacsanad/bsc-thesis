@@ -3,10 +3,21 @@ import os
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
+# --- Which dataset ------------------------------------------------------------
+# DYTAG_DATASET=children runs the same pipeline on the CS-TAG Books-Children co-purchase graph
+# (src/data/children_books/): a book's description from its co-purchased books, instead of a
+# paper's abstract from its references. Every path below and the prompt in text.py follow it;
+# the scripts take `--sets children` with it and refuse any other combination (check_sets).
+DATASET = os.environ.get("DYTAG_DATASET", "papers")
+assert DATASET in ("papers", "children"), f"DYTAG_DATASET={DATASET!r}: papers or children"
+
 # --- Where things live -------------------------------------------------------
 JOINT_DIR = os.path.join(ROOT, "data", "processed", "joint")   # nodes/edges/embeddings
 OGBN_DIR = os.path.join(ROOT, "data", "raw", "ogbn_arxiv")     # the original download
 FROZEN_DIR = os.path.join(ROOT, "data", "frozen")              # eval_nodes, splits_eligible, training_sets
+if DATASET == "children":
+    JOINT_DIR = os.path.join(ROOT, "data", "children_books")
+    FROZEN_DIR = os.path.join(ROOT, "data", "frozen", "children_books")
 CHECKPOINT_DIR = os.path.join(ROOT, "checkpoints")
 EXPERIMENTS_DIR = os.path.join(ROOT, "experiments")            # one directory per run
 ENV_FILE = os.path.join(ROOT, ".env")
@@ -152,6 +163,8 @@ GRAD_CLIP = 1.0
 SEED = 42
 
 DEFAULT_SETS = "capped"     # which frozen node sets; --sets legacy reproduces the old runs
+if DATASET == "children":
+    DEFAULT_SETS = "children"
 
 # The run schedule, previously literals in hpc/komondor/jobs/run_train_adapter.sh.
 EPOCHS = 10                 # upper bound; early stopping usually ends the run sooner
@@ -378,6 +391,25 @@ JOINT_GNN_LR = 1e-5
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen
                                       # under would need references the freeze dropped
+# Book descriptions are longer than abstracts (eval median 317 Qwen tokens, p95 901), so 320
+# would cut half of them. 1,024 covers 96% of eval and 98% of training descriptions; the frozen
+# sets keep only books whose description + EOS fits (prepare_sets.py), and there is no
+# reference freeze to respect.
+if DATASET == "children":
+    MAX_NEW_TOKENS = 1024
+
+# The LaTeX cleaner (text.clean_abstract) is for abstracts: on book text it strips the dollar
+# sign from every price ("$16" -> "16"). Books train on their descriptions as they are.
+CLEAN_TARGETS = DATASET == "papers"
+# The external id generate.py writes beside node_id.
+SOURCE_ID = "mag_id" if DATASET == "papers" else "cstag_id"
+
+
+def check_sets(sets):
+    """`--sets children` goes with DYTAG_DATASET=children, and every other set with papers."""
+    assert (sets == "children") == (DATASET == "children"), (
+        f"--sets {sets} with DYTAG_DATASET={DATASET}: the children's books use --sets children "
+        f"and DYTAG_DATASET=children together")
 
 REPETITION_PENALTY = 1.00
 # Run 11: generate.py --no-repeat-ngram bans any repeated n-gram of this length. 17.6% of run
