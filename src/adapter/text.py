@@ -108,6 +108,54 @@ if DATASET == "children":
     )
     GRAPH_ONLY_USER = "Write the description."
 
+# --- The books' text arm: the neighbours as text, no prefix -----------------------------------
+# The comparison arm for the books. Unlike the papers' 09-10 text baseline, whose era-1 wording
+# differed from the graph prompt (docs/soft_prompt_only.md measured that confound), this is the
+# graph prompt with "the context encodes" re-pointed at a listed block: the evidence is the only
+# difference. Which neighbours are listed is frozen in BOOK_TEXT_REFS (freeze_book_refs.py).
+BOOK_TEXT_SYSTEM = (
+    "You are a children's book copywriter. "
+    "The books listed below are the books customers bought together with one children's "
+    "book, whose own description is missing. That book is not among them: it is a separate "
+    "book that was bought alongside all of them. "
+    "Reconstruct its description as continuous prose covering: what kind of book it is and "
+    "who it is for, its format and the age of its readers; what it is about, its subject, "
+    "characters or story; and what makes it worth reading. "
+    "Where the listed books leave the book's specific content undetermined, state what they "
+    "do determine about its kind, readers and subject, and stop there — a correct general "
+    "statement is worth more than a specific guess. "
+    "Write in the voice of the book's own description: never mention the other books, how "
+    "many there are, or that customers bought them, and do not describe any single one of "
+    "them. "
+    "Write plain prose with no markup or headings. "
+    "Output ONLY the description text."
+)
+BOOK_TEXT_REFS = os.path.join(FROZEN_DIR, "prompt_refs_text.json")
+_book_text_refs = None
+
+
+def build_book_text_prompt(tokenizer, neighbours):
+    """`neighbours` is a list of (title, description). ChatML, thinking disabled."""
+    books = "\n\n".join(f"- Title: {t}\n  Description: {d}" for t, d in neighbours)
+    return tokenizer.apply_chat_template(
+        [{"role": "system", "content": BOOK_TEXT_SYSTEM},
+         {"role": "user", "content": f"Books bought together with it:\n\n{books}\n\n"
+                                     f"{GRAPH_ONLY_USER}"}],
+        tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+
+def book_text_example(tokenizer, corpus, node_id, refs=None):
+    """-> (prompt, target) for the text arm. `refs` defaults to the frozen list for the node."""
+    global _book_text_refs
+    if refs is None:
+        if _book_text_refs is None:
+            with open(BOOK_TEXT_REFS) as f:
+                _book_text_refs = {int(k): v for k, v in json.load(f).items()}
+        refs = _book_text_refs[node_id]
+    return (build_book_text_prompt(tokenizer, [(corpus.title[n], corpus.abstract[n])
+                                               for n in refs]),
+            corpus.abstract[node_id])
+
 
 def build_graph_only_prompt(tokenizer):
     """The one prompt every node gets, in Qwen3's ChatML with thinking disabled.

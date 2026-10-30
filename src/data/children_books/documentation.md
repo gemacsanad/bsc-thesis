@@ -321,3 +321,147 @@ conclusions are unchanged.
   is frozen Qwen with the graph-only prompt. Rebuilding the text arm for books is its own
   step.
 - **The job script** (step 6).
+
+## Step 5b: the text arm (2026-10-21)
+
+**Why.** Run 11's comparison arm on papers was frozen Qwen reading the references as text. The
+books need the same comparison, in the same job, because every queue wait on Komondor can take
+days.
+
+**Same prompt, evidence as text.** The papers' 09-10 text baseline used the older era-1 wording,
+which differed from the graph prompt, and `docs/soft_prompt_only.md` measured that confound as
+large. The books' text arm avoids it. Its system prompt (`text.BOOK_TEXT_SYSTEM`) is the book
+graph prompt with "the context you have been given encodes" re-pointed at "the books listed
+below". The user turn lists the neighbours (`- Title: … / Description: …`), then "Write the
+description." The evidence is the only difference between the two arms.
+
+**Which neighbours are listed** is frozen in `data/frozen/children_books/prompt_refs_text.json`
+by `src/adapter/freeze_book_refs.py`. It uses the selection the papers' text arm used
+(`neighbour_cap.fit_refs`): the 15 neighbours closest to the neighbourhood centroid, with the
+farthest dropped until the prompt fits. The budget is the one `generate.py` checks, 4,096 − 32
+prefix − 1,024 generation = 3,040 prompt tokens, under the Qwen3 tokenizer. No frozen prompt can
+produce an ERROR row. It covers only the 945 evaluation books, since nothing is trained on it.
+
+```bash
+cd src/adapter && DYTAG_DATASET=children python freeze_book_refs.py    # DyTAG-qwen env
+DYTAG_DATASET=children python generate.py --mode text --sets children --no-repeat-ngram 6 --output …
+```
+
+| | |
+|---|---|
+| neighbours listed | mean 8.65, median 8 (min 2, max 15) of a median degree of 18 |
+| all neighbours listed | 30.9% of books |
+| prompt tokens | median 2,650, max 3,040 (= budget) |
+
+**The graph arm reads every neighbour; the text arm reads about half.** This is the same
+asymmetry as on papers, where the text arm saw a median 27% of the references.
+
+## Step 6: the job script (2026-10-21)
+
+`hpc/komondor/jobs/run11_children.sh` is `run11_all.sh` with the dataset swapped:
+`SINGULARITYENV_DYTAG_DATASET=children`, `--sets children`, checkpoints in
+`checkpoints/run11_children/`, experiments named `<tag>_run11-children-*`, W&B runs `run11c-*`.
+The recipe is unchanged: the 8-variant GNN grid, the reader at 6 × 15,000 with refs-mix 0.5,
+and the joint fine-tune at 3 × 15,000. 6 × 15,000 is about 1.8 passes over the 50,999 training
+books, where run 11 saw its 90k papers about once. I kept the steps rather than the passes:
+run 11's reader was still improving at epoch 6, so more passes should not hurt, and the
+schedule stays identical.
+
+**Two changes from run 11, both to fit one queue wait:**
+
+1. **Arms ordered by importance:** refs-mean and GNN (the comparison), text, zero, oracle, then
+   the joint fine-tune and the joint arm. A timeout then costs the least needed parts. The
+   joint stage goes last because on papers it added nothing measurable over reader ← GNN.
+2. **No loop test.** The papers' decision (`--no-repeat-ngram 6`: loops 14.0% → 0%, top-1 −0.5
+   points) is reused, which saves about 6 h at book lengths.
+
+**Walltime: 72 h may not be enough.** An arm took about 7 h on papers at roughly 150 generated
+tokens. Book descriptions are about twice as long, so expect about 14 h per arm, or about 70 h
+for the five long arms on top of about 19 h of training. Resubmitting resumes every phase and
+every arm, so a timeout costs a queue wait, not work.
+
+**To run:**
+
+```bash
+# laptop: send only what the job needs (no --delete)
+rsync -avh --progress --relative src/ hpc/ data/children_books/ data/frozen/children_books/ \
+      vn01:/project/c_gnn42/csanad_thesis/baseline/
+# Komondor
+sbatch hpc/komondor/jobs/run11_children.sh
+```
+
+The container (`adapter-qwen-gpu.sif`), the Qwen3-14B cache and `.env` are already on Komondor
+from run 11.
+
+## Step 6b — the GNN grid ran out of memory (job 14618627)
+
+The first Komondor job failed in phase 2 with `CUDA out of memory` in `pretrain_encoder.py`
+(`loss.backward()`, 38.7 of 39.5 GB in use). The 1-layer variants trained; the 2-layer GATv2
+did not.
+
+**Cause:** the encoder reads the *full* neighbourhood at every hop (`num_neighbors = [-1] *
+layers`, no sampling). The co-purchase graph is much denser than the citation graph (mean
+degree 30.2, max 2,753), so the 2-hop subgraph of a batch reaches most of the graph. Measured
+on 30 random batches of training books:
+
+| seeds per batch | nodes in subgraph | edges, mean | edges, max |
+|---:|---:|---:|---:|
+| 256 (run 11 default) | 49,751 | 681,207 | 810,712 |
+| 64 | 36,676 | 242,584 | 336,560 |
+| 32 | 28,412 | 129,119 | 252,616 |
+| 16 | 18,799 | 63,218 | 150,455 |
+
+**Fix:** `--batch-size 32` for every variant in the grid, so they stay comparable. The
+worst-case batch is about a third of the default's typical batch. This keeps every neighbour
+rather than sampling the second hop, which would have changed what the GNN sees compared with
+the papers. Costs: about 8× more steps per epoch and about 1.5× more edge computation, and
+InfoNCE has 31 in-batch negatives instead of 255. That matters little next to the 4,096
+sampled negatives, and only the `cosnce` variants use InfoNCE at all.
+
+Resubmitting resumes: variants with a checkpoint in `checkpoints/run11_children/gnn/` are
+skipped. The failed variant crashed in its first epoch, before any checkpoint was written.
+
+## Step 6c — restart from zero, with no deliberate stops (after job 14626133)
+
+**What happened.** Job 14626133 trained the GNN grid and two reader epochs, about 10 h in all.
+Then the identification stop rule ended it. From its own embedding, the reader picked out 0.062
+of 128 validation books by TF-IDF (8 of 128), against a floor of 10× chance (0.078). The same
+log shows that the vector is being read:
+
+- validation loss is 2.3998 with the vector and 2.4270 without it, a gain of 0.027 nats (the
+  papers recipe gained 0.022 at the same stage);
+- oracle MRR is 0.151, against roughly 0.04 by chance.
+
+The threshold was set on paper abstracts, whose technical vocabulary makes a text easy to
+match. Book descriptions share genre wording and often open generically, and the check reads
+only the first 96 generated tokens. Training is seeded, so resubmitting without a change would
+have stopped at the same point.
+
+**Decision:** keep the papers recipe and restart the whole run from zero. The failed run's
+folder is renamed, not deleted: `checkpoints/run11_children_stopped_14626133`.
+
+**Changes:**
+
+1. `train.py --stop-rules warn`. Both reader rules (identification and canary) are still
+   computed every epoch. A failure is printed and appended to `reader/WARNINGS.txt`, and
+   training continues. The default stays `stop`, so the papers pipeline is unchanged. Model
+   selection (`best.pt` = highest validation refs-mean MRR) is untouched. The papers run passed
+   both rules, so making them warnings changes nothing about comparability.
+2. **Phase 3 leaves out very large subgraphs.** The cap is
+   `config.JOINT_MAX_SUBGRAPH_EDGES = 60_000` for the books (`None` for the papers), applied
+   through `graph.within_subgraph`. The joint fine-tune backpropagates through the GNN next to
+   Qwen3-14B. The largest 2-hop subgraph of a training book has 223k edges, about the size of
+   the largest batch-32 subgraph in the GNN grid. The cap removes 108 of 50,993 training books
+   (0.21%) when the winner has 2 layers, and none when it has 1. Evaluation books are not
+   filtered (max 85k edges, run under `no_grad`).
+3. **The job no longer exits on a failed evaluation arm.** The failure is recorded, the next
+   arm runs, and the job exits 1 at the end with the list of failed arms. Resubmitting
+   re-runs only their missing rows. The `STOPPED` file and its refusal guard are gone. The CPU
+   checks still exit at once, since they cost no GPU time.
+
+The prompts are unchanged. The reader learns the output style from the targets through LoRA,
+and a prompt more different from the papers' would cost comparability.
+
+**Deviations from the papers run, all forced by the data:** GNN grid batch size 32 (step 6b),
+`MAX_NEW_TOKENS` 1024, no-repeat n-gram 6 reused without a loop test, stop rules as warnings,
+and the phase-3 subgraph cap.

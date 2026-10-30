@@ -5,6 +5,8 @@ Produces one CSV per condition, over the same nodes, with the same prompts, in t
 
     --mode baseline   frozen Qwen3-14B, nothing else                 -> generations.csv
     --mode adapter    GraphSAGE + prefix adapter + frozen Qwen3-14B  -> generations.csv
+    --mode text       books only: frozen Qwen3-14B reading the co-purchased books as text,
+                      no prefix (text.book_text_example, frozen by freeze_book_refs.py)
 
 Each mode writes into its own directory under experiments/; pass --output to name the run.
 
@@ -88,7 +90,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from config import (BASE_MODEL, CHECKPOINT_DIR, DEFAULT_SETS, EXPERIMENTS_DIR,
+from config import (BASE_MODEL, CHECKPOINT_DIR, DATASET, DEFAULT_SETS, EXPERIMENTS_DIR,
                     FEATURES, FROZEN_DIR, GNN_CONV, GNN_LAYERS, JOINT_DIR, MAX_LENGTH, MAX_NEW_TOKENS,
                     NO_REPEAT_NGRAM, NUM_PREFIX_TOKENS, OUT_CHANNELS, REPETITION_PENALTY, SEED,
                     SOURCE_ID, check_sets)
@@ -96,7 +98,7 @@ from graph import load_graph, make_loader, select_neighbour_rows
 from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
                    oracle_vector, refs_mean_vector)
 from prefix_generation import generate_with_prefix, patch_for_prefix
-from text import PROMPT, Corpus, graph_only_example
+from text import PROMPT, Corpus, book_text_example, graph_only_example
 
 # Mirrors train.py's SETS: which frozen eval nodes.
 SETS = {
@@ -279,7 +281,7 @@ def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=["baseline", "adapter", "gate0", "ngate0"],
+    ap.add_argument("--mode", choices=["baseline", "adapter", "gate0", "ngate0", "text"],
                     required=True,
                     help="gate0 disconnects the graph from BOTH channels; ngate0 keeps the "
                          "k neighbour slots and empties them, which separates 'k tokens "
@@ -353,6 +355,9 @@ def main():
 
     # The same builder train.py uses, so both conditions get the byte-identical prompt.
     example = lambda node_id: graph_only_example(tokenizer, corpus, node_id)  # noqa: E731
+    if args.mode == "text":
+        assert DATASET == "children", "--mode text is the books' text arm: DYTAG_DATASET=children"
+        example = lambda node_id: book_text_example(tokenizer, corpus, node_id)  # noqa: E731
 
     # --- models -----------------------------------------------------------
     print(f"Loading {args.model} in {dtype} …")
@@ -362,7 +367,7 @@ def main():
 
     encoder = adapter = ntoken = data = vector = None
     gnn_layers = GNN_LAYERS
-    if args.mode != "baseline":
+    if args.mode not in ("baseline", "text"):
         encoder, adapter, ntoken, gnn_layers = load_adapter(args.checkpoint, device,
                                                             args.sets, llm, embedding_input,
                                                             FEATURES[args.features])

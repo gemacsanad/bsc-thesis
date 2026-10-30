@@ -11,10 +11,14 @@ Metrics added per row:
   llm_coherence (1-10)                   — logical flow from problem to solution
   llm_language  (1-10)                   — scientific register, terminology, no fluff
 
+--dataset children scores children's book descriptions in the same three columns.
+
 Requires OPENAI_API_KEY in .env (or environment).
 
 Usage:
     python evaluate_results_scores_only.py [--input test_results.csv] [--output evaluated_results_scores_only.csv]
+    python evaluate_results_scores_only.py --dataset children --edges data/children_books/edges.csv \
+        --input experiments/<run>/generations.csv --output experiments/<run>/scored_scores_only.csv
 
 Install dependencies:
     pip install rouge-score bert-score openai python-dotenv pandas torch
@@ -29,7 +33,8 @@ import pandas as pd
 from dotenv import load_dotenv
 from rouge_score import rouge_scorer as rs_lib
 from bert_score import score as bs_fn
-from openai import OpenAI, RateLimitError
+from openai import (APIConnectionError, APITimeoutError, InternalServerError, OpenAI,
+                    RateLimitError)
 
 load_dotenv(".env_local")
 
@@ -39,6 +44,8 @@ load_dotenv(".env_local")
 parser = argparse.ArgumentParser()
 parser.add_argument("--input",  default="generations.csv")
 parser.add_argument("--output", default="scored_scores_only.csv")
+parser.add_argument("--dataset", choices=["papers", "children"], default="papers",
+                    help="which judge prompt to use: paper abstracts or children's book descriptions")
 parser.add_argument("--edges",  default="data/processed/joint/edges.csv",
                     help="Path to joint edges.csv used to compute num_of_neighbors (out-degree)")
 parser.add_argument("--model",  default="gpt-5.4-mini", help="OpenAI model for LLM judge")
@@ -106,11 +113,14 @@ if os.path.exists(args.output):
     prev = pd.read_csv(args.output)
     for _, r in prev.iterrows():
         nid = int(r["node_id"])
-        if pd.notna(r.get("llm_accuracy")):
+        # Only real scores are cached: an "ERROR: ..." row is judged again on the next run.
+        if pd.notna(pd.to_numeric(r.get("llm_accuracy"), errors="coerce")):
             llm_cache[nid] = {c: r.get(c) for c in LLM_COLS}
     print(f"\nLoaded {len(llm_cache)} cached LLM scores — will skip those rows.")
 
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# A stalled request otherwise waits the SDK default of 600 s, three times, and the run looks
+# frozen. Retries are handled in call_judge instead.
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=60, max_retries=0)
 
 _JUDGE_SYSTEM = """\
 You are a rigorous scientific peer reviewer. Given an original paper abstract and a generated \
@@ -132,24 +142,54 @@ background problem to a proposed solution, or does it feel like a disjointed lis
 domain terminology, appropriate passive/active voice, and absence of generic conversational fluff.\
 """
 
+# Children's books, in the same shape as the paper prompt. Accuracy names the aspects where the
+# GNN+LLM arms differ from the baselines (src/evaluation/documentation.md): the specific
+# subject, the names, and the kind of book; review boilerplate is excluded because it gave the
+# GNN arms a false lead on names.
+_BOOK_JUDGE_SYSTEM = """\
+You are an experienced children's book editor. Given an original book description and a generated \
+description for the same book, evaluate the generated description on three metrics. \
+Return valid JSON with exactly this structure:
+{
+  "accuracy":  <int 1-10>,
+  "coherence": <int 1-10>,
+  "language":  <int 1-10>
+}
+
+Rubrics:
+- accuracy  (1-10): How recognisably does the generated description describe the same book? \
+Reward matching specifics: the subject and premise, the names of characters, author, illustrator \
+or series, and the kind of book (board book, picture book, chapter book, novel, nonfiction). \
+Generic text that could fit any children's book scores low; ignore review boilerplate such as \
+journal names and copyright lines. Penalise explicit contradictions; do not penalise creative but \
+plausible details.
+- coherence (1-10): Is it one consistent description of one book, or does it repeat itself, \
+loop, break off, or drift between different stories?
+- language  (1-10): Does it read like real published copy for a children's book, such as a \
+publisher's blurb or a library review? Score on concrete, natural wording and absence of filler \
+that says nothing about the book.\
+"""
+JUDGE_SYSTEM = _BOOK_JUDGE_SYSTEM if args.dataset == "children" else _JUDGE_SYSTEM
+TEXT_LABEL = "DESCRIPTION" if args.dataset == "children" else "ABSTRACT"
+
 
 def call_judge(original: str, generated: str, retries: int = 6) -> dict:
-    user_msg = f"ORIGINAL ABSTRACT:\n{original}\n\nGENERATED ABSTRACT:\n{generated}"
+    user_msg = f"ORIGINAL {TEXT_LABEL}:\n{original}\n\nGENERATED {TEXT_LABEL}:\n{generated}"
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
                 model=args.model,
                 messages=[
-                    {"role": "system", "content": _JUDGE_SYSTEM},
+                    {"role": "system", "content": JUDGE_SYSTEM},
                     {"role": "user",   "content": user_msg},
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.0,
             )
             return json.loads(resp.choices[0].message.content)
-        except RateLimitError:
+        except (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError) as e:
             wait = 2 ** attempt
-            print(f"    Rate limit — retrying in {wait}s …", flush=True)
+            print(f"    {type(e).__name__} — retrying in {wait}s …", flush=True)
             time.sleep(wait)
         except Exception as e:
             print(f"    LLM error: {e}", flush=True)
@@ -200,6 +240,9 @@ for idx, row in df.iterrows():
             flush=True,
         )
         out.update(scores)
+        # Save as it goes, so a stopped run resumes from here rather than from row 0.
+        if judged % 10 == 0:
+            pd.DataFrame(rows + [out]).to_csv(args.output, index=False)
 
     rows.append(out)
 

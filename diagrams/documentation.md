@@ -97,3 +97,36 @@ histogram holds exactly 80 values.
 - The throughput spikes after each validation are a measurement artefact: the timer restarts,
   the token count does not. The axis is clipped at 1.5× the median.
 - `valid/best` (a duplicate of one `val_id` MRR) and `valid/bad_epochs` have no figure.
+
+## Background-chapter diagrams in draw.io (2026-10-27)
+
+**Goal.** Schematic figures for Ch. 2 (not plots), in the same print style as the training
+figures.
+
+**Tool.** draw.io Desktop (`brew install --cask drawio`); no MCP server is needed. The `.drawio`
+file is the source: open it in the app to edit. Export from the command line:
+
+    /Applications/draw.io.app/Contents/MacOS/draw.io -x -f pdf --crop \
+        -o figures/background/transformer_causal_mask.pdf figures/background/transformer_causal_mask.drawio
+
+**Style.** Latin Modern Roman (copied from TeX Live into `~/Library/Fonts`, so draw.io can
+use it; embedded in the PDF as Type 3), 12 px labels ≈ 8.7 pt in print, 1 px black strokes,
+light tints of the Okabe–Ito colours as box fills, no titles inside the figure. One draw.io px ≈
+0.256 mm in the exported PDF, so a 440 px wide drawing prints at ≈ 113 mm (include it without
+`width=`).
+
+**Figures.**
+
+| file | shows | size |
+|---|---|---|
+| `figures/background/transformer_causal_mask.{drawio,pdf}` | (a) decoder-only Transformer, post-norm as in Vaswani et al.: token embedding → *L* × [masked multi-head self-attention, add & norm, feed-forward network, add & norm] with residual connections → linear + softmax → next-token probabilities; (b) the causal mask for 5 positions: 0 on and below the diagonal, −∞ above | 113.3 × 85.7 mm |
+| `figures/background/message_passing.{drawio,pdf}` | (a) citation neighbourhood of a target paper *v*: three 1-hop references w1–w3, six 2-hop nodes, two grey nodes outside, arrows in the direction messages flow (towards *v*), 1-hop / 2-hop regions as sky / yellow tinted circles; (b) one step of Eqs. (2.1)–(2.2): h_wi and h_v → M_t → Σ → m_v → U_t (with h_v) → h_v^(t+1). Maths via draw.io MathJax (`math="1"`), which the CLI export renders as vector paths | 106.2 × 50.5 mm |
+| `figures/background/prompt_vs_prefix.{drawio,pdf}` | the same frozen layer stack twice (layers 1, 2, ⋮, *L*; columns = *M* = 2 soft/prefix positions + the tokens "Summarise the document"). (a) prompt tuning: trainable **P**_e at the input only; hidden states at the soft positions computed by the frozen layers (dashed vermillion outlines). (b) prefix tuning: trainable **P**^K_ℓ, **P**^V_ℓ inside every layer, dashed arrows prefix → tokens (they enter the tokens' attention), no states at prefix positions. Key: trainable (vermillion) / frozen (grey) | 112.2 × 66.7 mm |
+| `figures/background/g_retriever.{drawio,pdf}` | the G-Retriever pipeline as one left-to-right flow; the only sentence text is the question ("Where was Pierre Curie’s wife born?") and the answer ("Warsaw"), plus the module words GNN / projection / LLM. Question → a larger unlabelled graph (dashed frame) with 3 retrieved nodes (sky) and the selected connected subgraph (yellow, incl. one unselected connector node) → the cut-out subgraph → two paths: GNN → one pooled vector → projection → one soft-prompt cell (vermillion = trainable), and the subgraph as text (document icon); the LLM input is a vertical column read top to bottom: soft prompt, subgraph-text tokens, question tokens → frozen LLM (grey) → "Warsaw". No key: the caption explains the colours and the reading order. A more detailed four-step version (v1) was rejected by the author as too complicated; its generator `make_gr_fig_v1.py` is kept in the session scratchpad next to `make_gr_fig.py`. Approved by the reviewer agent (9.0/10) | 112.2 × 41.7 mm |
+
+**Open.** No positional-encoding box in (a): Qwen3 applies RoPE inside attention, which Ch. 2
+explains separately.
+
+The message-passing figure (2026-10-28) was drawn by a generator script and reviewed by a separate reviewer pass (approved in round 1, 9/10). Known compromise: the sky tint means both the 1-hop region in (a) and U_t in (b).
+
+The prompt-vs-prefix figure (2026-10-28) was approved in review round 2 (9/10). Round 1 was rejected because the dashed arrows pointed from tokens to prefix (read as data flowing into the prefix) and the *M* positions were unmarked (the two cells read as one K + one V).

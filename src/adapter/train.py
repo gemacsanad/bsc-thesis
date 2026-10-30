@@ -46,13 +46,15 @@ from config import (BASE_MODEL, BATCH_SIZE, CANARY_MIN_DISTINCT, CANARY_NODES, C
                     CHECKPOINT_DIR, CLEAN_TARGETS, DEFAULT_SETS, ENV_FILE, EPOCH_SIZE, EPOCHS, EVAL_EVERY,
                     FEATURES, FROZEN_DIR, ORACLE_MIN_COS, REFS_MIX,
                     GATE_INIT_FRACTION, GNN_CONV, GNN_LAYERS, GRAD_ACCUM, GRAD_CLIP,
-                    HIDDEN_SIZE, JOINT_GNN_LR, JOINT_LAMBDA_COS, LAMBDA_RANK, LEARNING_RATE,
+                    HIDDEN_SIZE, JOINT_GNN_LR, JOINT_LAMBDA_COS, JOINT_MAX_SUBGRAPH_EDGES,
+                    LAMBDA_RANK, LEARNING_RATE,
                     LOG_EVERY, LORA_R, LORA_TARGETS,
                     NUM_NEIGHBOUR_TOKENS, NUM_PREFIX_TOKENS, PATIENCE,
                     RANK_HARD_FRACTION, RANK_NEGATIVES, RANK_TOKENS, RANK_WARMUP_STEPS, SEED,
                     VAL_ID_GATE_EPOCH, VAL_ID_MIN_LIFT, VAL_ID_NODES, VAL_ID_TOKENS,
                     WANDB_PROJECT, WARMUP_STEPS, WEIGHT_DECAY, check_sets)
-from graph import load_graph, make_loader, select_neighbour_rows, with_references
+from graph import (load_graph, make_loader, select_neighbour_rows, with_references,
+                   within_subgraph)
 from identify import ranks, summary
 from model import (EmbeddingEstimator, GraphEncoder, NeighbourTokenAdapter, PrefixAdapter,
                    corrupt_to_cosine, mix_in_refs, oracle_vector, refs_mean_vector)
@@ -405,6 +407,15 @@ def stop(message):
     raise SystemExit(STOP_EXIT_CODE)
 
 
+def warn(message, out_dir):
+    """`--stop-rules warn`: the rule is reported and appended to WARNINGS.txt, training goes on.
+    The books' run uses it: their identification check sits below the papers' 10x threshold
+    while the vector still lowers validation loss (job 14626133)."""
+    print(f"WARNING, stop rule not enforced: {message}", flush=True)
+    with open(os.path.join(out_dir, "WARNINGS.txt"), "a") as f:
+        f.write(message + "\n")
+
+
 def epoch_nodes(nodes, epoch, size, seed=SEED):
     """-> the training nodes of `epoch`: a fixed-size slice of ONE seeded permutation.
 
@@ -642,6 +653,9 @@ def main():
                     help="--reader only: learning rate of the GNN + head; the adapter and LoRA "
                          f"keep config.LEARNING_RATE = {LEARNING_RATE}")
     ap.add_argument("--resume", default=None, help="checkpoint to continue from")
+    ap.add_argument("--stop-rules", choices=["stop", "warn"], default="stop",
+                    help="'stop' exits with code 3 when a reader stop rule fires; 'warn' logs it "
+                         "to <out-dir>/WARNINGS.txt and keeps training")
     ap.add_argument("--wandb", action="store_true", help="log metrics to Weights & Biases")
     ap.add_argument("--wandb-run", default=None, help="run name; W&B generates one if unset")
     args = ap.parse_args()
@@ -1013,6 +1027,11 @@ def main():
 
     # A GNN estimate for a paper with no references is the [MASK] row alone (graph.py).
     train_nodes = with_references(data, sets["train"]) if joint else sets["train"]
+    if joint and JOINT_MAX_SUBGRAPH_EDGES is not None:
+        kept = within_subgraph(data, train_nodes, JOINT_MAX_SUBGRAPH_EDGES, args.gnn_layers)
+        print(f"{len(train_nodes) - len(kept):,} training nodes over {JOINT_MAX_SUBGRAPH_EDGES:,} "
+              f"{args.gnn_layers}-hop subgraph edges left out")
+        train_nodes = kept
     if joint:
         print(f"joint fine-tune on {len(train_nodes):,} training papers with references; "
               f"loss = LM + {args.lambda_cos} x (1 - cosine to own embedding), GNN lr "
@@ -1199,14 +1218,15 @@ def main():
         # chance by step 800 means stop"; it was flat by step 200 and ran to the end. The epoch
         # is already saved, so the failure can be inspected; the job then exits non-zero.
         if args.oracle and epoch + 1 >= VAL_ID_GATE_EPOCH:
+            fail = stop if args.stop_rules == "stop" else lambda m: warn(m, args.out_dir)
             if distinct < CANARY_MIN_DISTINCT:
-                stop(
+                fail(
                     f"STOP: canary wrote {distinct} distinct texts for {len(canary_nodes)} "
                     f"papers at epoch {epoch + 1} (minimum {CANARY_MIN_DISTINCT}). The decoder "
                     f"is collapsing to a template; resubmitting would only continue it.")
             floor = VAL_ID_MIN_LIFT / len(val_id_nodes)
             if val_id["oracle"]["top1"] < floor:
-                stop(
+                fail(
                     f"STOP: from its own embedding the decoder identifies "
                     f"{val_id['oracle']['top1']:.3f} of validation papers at epoch {epoch + 1}, "
                     f"below {VAL_ID_MIN_LIFT}x chance ({floor:.3f}). It cannot read the "

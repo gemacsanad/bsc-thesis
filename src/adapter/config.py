@@ -387,6 +387,11 @@ REFS_MIX = 0.5
 # loss pulls on it; the GNN moves at a tenth of the reader's rate because it arrives trained.
 JOINT_LAMBDA_COS = 1.0
 JOINT_GNN_LR = 1e-5
+# The books' co-purchase graph is dense (mean degree 30): a few training books have full 2-hop
+# subgraphs of up to 223k edges, which with backprop next to Qwen3-14B could exhaust the card.
+# Phase 3 leaves out books above this many subgraph edges (108 of 50,993 at 2 layers, none at
+# 1). None for the papers.
+JOINT_MAX_SUBGRAPH_EDGES = 60_000 if DATASET == "children" else None
 
 # --- Stage 5: generation -----------------------------------------------------
 MAX_NEW_TOKENS = GENERATION_RESERVE   # asking for more than the capped sets were frozen

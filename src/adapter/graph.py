@@ -106,6 +106,20 @@ def with_references(data, nodes):
     return [n for n in nodes if has[n]]
 
 
+def within_subgraph(data, nodes, max_edges, gnn_layers):
+    """-> the nodes of `nodes` whose full `gnn_layers`-hop subgraph has at most `max_edges`
+    edges, order kept. The count is the loader's: a node's in-edges, plus at 2 hops the
+    in-edges of each of its in-neighbours (an upper bound, since it does not deduplicate).
+    """
+    deg = torch.bincount(data.edge_index[1], minlength=data.num_nodes)
+    edges = deg.clone()
+    if gnn_layers >= 2:
+        edges += torch.zeros_like(deg).scatter_add_(0, data.edge_index[1],
+                                                    deg[data.edge_index[0]])
+    assert gnn_layers <= 2, "the subgraph count is written for at most 2 hops"
+    return [n for n in nodes if edges[n] <= max_edges]
+
+
 def centroid_distances(x):
     """-> (N,) cosine distance of each row to the centroid direction of the set.
 
