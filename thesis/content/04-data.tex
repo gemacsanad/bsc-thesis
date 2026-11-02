@@ -1,0 +1,74 @@
+%----------------------------------------------------------------------------
+\chapter{Data}
+\label{chap:data}
+%----------------------------------------------------------------------------
+
+%----------------------------------------------------------------------------
+\section{ogbn-arxiv and its limitations}
+\label{sec:ogbn-arxiv}
+%----------------------------------------------------------------------------
+
+The starting point is ogbn-arxiv, a citation graph from the Open Graph Benchmark~\cite{hu2020open}. It contains 169,343 computer science papers from arXiv and 1,166,243 directed citation edges between them, and it was built from the Microsoft Academic Graph (MAG)~\cite{hu2020open,wang2020microsoft}. Each edge points from a paper to a paper it cites~\cite{hu2020open}. Each paper has a MAG identifier, a title, an abstract and a publication year. The dataset also assigns each paper a subject category, which this thesis does not use.
+
+The recorded citations are sparse. Counting the recorded references, I found that a paper cites an average of 6.89 other papers in the graph, with a median of 4. For 17,440 papers, about 10\% of the dataset, no outgoing citation is recorded at all, and only 499 papers have more than 50.
+
+These counts do not necessarily reflect the length of a paper's bibliography, because ogbn-arxiv records only citations between papers included in the dataset~\cite{hu2020open}. A reference to a journal or conference paper that is not on arXiv, to a book, or to a paper from another field is therefore missing. The task in this thesis is to generate a paper's abstract from the papers it cites (\autoref{chap:task}). Missing references therefore limit the information available to the model. To include references beyond the papers in ogbn-arxiv, I enriched the graph with citation records from another source.
+
+%----------------------------------------------------------------------------
+\section{Enrichment with Semantic Scholar}
+\label{sec:enrichment}
+%----------------------------------------------------------------------------
+
+The additional citation records come from Semantic Scholar, an open data platform for scholarly literature that releases its data as bulk datasets~\cite{kinney2023semantic}. I used three of them: the paper records, the abstracts and the citations. Within Semantic Scholar, these records are connected by the Corpus ID, Semantic Scholar's identifier for a paper, so I linked each abstract to its paper record using the Corpus ID. The paper record also provides the MAG identifier, which connects the paper to ogbn-arxiv. For each citation, I used the paper records to obtain the MAG identifiers of both the citing and the cited paper. \autoref{fig:enrichment}a illustrates this matching: the ogbn-arxiv paper with MAG identifier 100 is matched to the Semantic Scholar record with Corpus ID 700, and a citation record from Corpus ID 700 to Corpus ID 900, whose paper record gives MAG identifier 200, becomes a citation from MAG identifier 100 to MAG identifier 200.
+
+In what follows, I call the 169,343 papers of ogbn-arxiv \emph{ogbn-arxiv papers} and the papers contributed by Semantic Scholar \emph{added papers}. The graph was then expanded in four steps (\autoref{fig:enrichment}b). First, I collected the papers that the ogbn-arxiv papers cite according to Semantic Scholar. Second, I added referenced papers absent from ogbn-arxiv when Semantic Scholar provided both a MAG identifier and an abstract. Third, I kept every Semantic Scholar citation between two papers of the resulting set for which Semantic Scholar provided both. Fourth, I combined these citations with the original edges of ogbn-arxiv and removed duplicates. All papers and edges of ogbn-arxiv are preserved, including those for which Semantic Scholar provides no MAG identifier or abstract. I did not repeat this expansion for the added papers. Their references were retained only when the cited paper was already in the selected set.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics[width=\textwidth]{../diagrams/figures/data/enrichment.pdf}
+  \caption{Building the joint graph. (a)~Abstracts and citation records are linked through Semantic Scholar's Corpus IDs, while MAG identifiers connect papers to ogbn-arxiv. Identifiers are illustrative; orange lines indicate Corpus ID matches and green lines indicate MAG matches. (b)~Eligible papers cited by ogbn-arxiv papers are added, together with Semantic Scholar citations between retained papers. Expansion is not recursive. Arrows point from citing to cited papers.}
+  \label{fig:enrichment}
+\end{figure}
+
+The two groups of papers play different roles. Only ogbn-arxiv papers are prediction targets. Added papers enter the graph because an ogbn-arxiv paper cites them, and they serve only as additional neighbourhood information. When a paper appears in both sources, its title, abstract and year are taken from ogbn-arxiv. I checked that the two sources record citations in the same direction and that the joint graph contains no duplicate papers or edges. The joint graph has 384,756 papers, 169,343 from ogbn-arxiv and 215,413 added, and 3,844,151 directed citation edges in total.
+
+\autoref{tab:enrichment} compares the recorded references of the ogbn-arxiv papers before and after the enrichment. The median number of recorded references per paper doubles, from 4 to 8, while the mean rises from 6.89 to 12.55, and the number of papers without any recorded reference is approximately halved. The citations made by ogbn-arxiv papers grow from 1,166,243 to 2,125,355: 889,024 of the new ones point to added papers, and 70,088 connect two ogbn-arxiv papers whose citation ogbn-arxiv had not recorded. The other 1,718,796 edges of the joint graph are citations made by added papers.
+
+\begin{table}[!ht]
+  \centering
+  \begin{tabular}{lrr}
+    \toprule
+    Property of the ogbn-arxiv papers & Before & After \\
+    \midrule
+    Mean recorded references & 6.89 & 12.55 \\
+    Median recorded references & 4 & 8 \\
+    Papers with no recorded reference & 17,440 & 8,675 \\
+    Papers with more than 50 recorded references & 499 & 4,284 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Recorded references of the 169,343 ogbn-arxiv papers in ogbn-arxiv alone (before) and in the joint graph (after the enrichment with Semantic Scholar).}
+  \label{tab:enrichment}
+\end{table}
+
+The enrichment is uneven, however (\autoref{fig:enrichment-degree}). Semantic Scholar added at least one citation to 94,756 ogbn-arxiv papers (56\%), which have on average 17.0 recorded references in the joint graph. The other 74,587 papers (44\%) keep only the citations recorded in ogbn-arxiv, on average 6.9; 4,055 of them have a Semantic Scholar record with a MAG identifier and an abstract, but it added no new citation. A low number of recorded references therefore does not necessarily mean a short bibliography: it can also mean that the bibliography was only partly observed. The recorded reference count alone cannot distinguish these explanations. I retained papers that gained no additional citations, because excluding them would restrict the study to papers whose recorded neighbourhoods were expanded by Semantic Scholar. The implications of this uneven coverage are discussed with the limitations of the results \textcolor{red}{[TODO: reference to the discussion chapter]}.
+
+\begin{figure}[!ht]
+  \centering
+  \includegraphics{../diagrams/figures/data/enrichment_degree.pdf}
+  \caption{Number of recorded references per ogbn-arxiv paper. (a)~In ogbn-arxiv alone and after the enrichment with Semantic Scholar. (b)~After the enrichment, separately for the papers to which Semantic Scholar added at least one citation and for the others, which keep only the citations recorded in ogbn-arxiv. The last bin contains papers with 60 or more recorded references.}
+  \label{fig:enrichment-degree}
+\end{figure}
+
+
+%----------------------------------------------------------------------------
+\section{The graph used by the model}
+\label{sec:model-graph}
+%----------------------------------------------------------------------------
+
+In the joint graph, a citation edge points from the paper making the citation to the paper being cited. For example, if paper A cites paper B, the recorded edge is A $\rightarrow$ B. To generate A's abstract, however, the model needs information from B. I therefore reverse the edges for message passing, so that information flows from cited papers into the papers that cite them (\autoref{fig:message-passing}).
+
+This direction also restricts the model to a target paper's references. Papers that later cite the target may contain information about its findings that was unavailable when its abstract was written. Allowing information to flow in both directions would make those later papers available to the model and introduce temporal leakage.
+
+All experiments use the same joint graph. The training, validation and evaluation sets divide the prediction targets rather than the graph itself. A paper assigned to one set can therefore supply reference information to a target in another set. In particular, a validation or evaluation paper can appear among a training paper's references. Its embedding then supplies neighbourhood information, although its abstract is not used as a training target.
+
+I removed citation self-loops, which connect a paper to itself, so that a target cannot appear among its own references. This removal does not replace the masking of the target's own embedding, which is described in \textcolor{red}{[TODO: reference to the method chapter]}. The model uses every recorded reference of a target, without sampling or imposing a neighbourhood-size cap.
