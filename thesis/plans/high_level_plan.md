@@ -64,8 +64,9 @@ Estimated main text: 52–63 pages.
 
 ## 5. Still open
 
-- **Page budget.** The estimate (52–63) is above the recommended ~45; to settle with the
-  advisors, then trim per chapter.
+- **Page budget — settled 2026-11-02.** Maximum 50 pages of main text (author). Write each
+  chapter fully first; trim at the end, when the whole thesis exists (estimate 52–63, so some
+  trimming will be needed). Status 2026-11-02: Ch. 2 ≈ 11 pp., Ch. 4 §4.1–4.4 ≈ 4.5 pp.
 - **The end-to-end comparison in Ch. 8 is not a controlled comparison.** The end-to-end runs
   were trained on 7,750 papers, not 90,461, with an earlier pipeline; they share the 945 eval
   papers and the judge. Decide in the Ch. 8 plan which runs to show and how to state this.
@@ -76,4 +77,5 @@ Estimated main text: 52–63 pages.
 Each chapter's detailed plan is in its own file, named after its `.tex` file:
 
 - Ch. 2: `plans/02-background.md`
-- Ch. 4: `plans/04-data.md` (draft)
+- Ch. 4: `plans/04-data.md`
+- Ch. 5: `plans/05-method.md`

@@ -112,6 +112,8 @@ with `[MASK]` (Ch. 5), the text baseline's input (Ch. 6), evaluation instruments
 
 ### 4.4 Exploring the joint graph (≈ 0.8 page)
 
+*Written 2026-11-02 (`sec:exploration`, `tab:example`). O1 resolved: author chose a cherry-picked example, Hacohen & Weinshall 2019 (node 46116, eval set), stated as chosen. O8: author decided not to mention the empty abstract.*
+
 - **P1 out-degree** (main): distribution after enrichment, heavy-tailed, max 832 [recomputed].
   The before/after comparison is in 4.2 (one plot there, not several overlapping ones).
 - **P2 in-degree** (short, context only): a few very highly cited papers, max 16,504
@@ -124,18 +126,31 @@ with `[MASK]` (Ch. 5), the text baseline's input (Ch. 6), evaluation instruments
   abstract also states the paper's own contribution, which no reference contains. Presented as
   an illustration, not as representative. Selection: O1.
 
-### 4.5 Node text and embeddings (≈ 0.4 page)
+### 4.5 Node text and embeddings (≈ 0.5 page) — approved 2026-11-02
 
-- **P1 the representation.** Every node's title and abstract (`title + "\n\n" + abstract`) is
-  embedded with `voyage-4-large` (document input type) into a 1024-dimensional unit-norm vector;
-  why a sentence-level embedding: the model has to recover what a paper is about. Cite: Voyage AI
-  docs (web, access date). `02_data` §3.
-- **P2 consequence.** A target's embedding contains its title as well as its abstract, so the
-  oracle input (Ch. 6) carries the title. The embeddings are computed on the raw, uncleaned text
-  (link to 4.7).
-- (The reference-mean analysis moved to the end of 4.6, D11.)
+Explain for a reader who has not met them: what an embedding model is, and what similarity
+between two vectors (cosine) means. Ch. 2 uses both without defining them.
+
+- **P1 embedding models and similarity.** An embedding model maps a text to a fixed-length
+  vector so that texts with similar meaning get vectors pointing in similar directions; cosine
+  similarity = cosine of the angle (dot product for unit vectors), 1 = same direction.
+- **P2 the representation.** Every paper (ogbn-arxiv and added) → `title + "\n\n" + abstract`
+  embedded with `voyage-4-large`, document input type, 1024-d, unit length. Why a sentence-level
+  embedding: the model has to recover what a paper is about. Raw, uncleaned text (link to 4.7).
+  `02_data` §3. Cite `voyage2026voyage4` (blog, 15 Jan 2026) and `voyage2026embeddings` (docs,
+  input type, dims).
+- **P3 role.** As a neighbour, a paper's embedding is the information it contributes to a
+  target. (Author: the GNN estimating the target's embedding is left to the GNN part, Ch. 5.)
+- **P4 geometry (O2 resolved: here).** Unrelated papers are already fairly similar: random pairs
+  of papers have median cosine 0.294 (5th–95th percentile 0.173–0.440; 100,000 random pairs,
+  raw embeddings, recomputed 2026-11-02; confirmed by all-pairs check on 2,000 papers: 0.297). Needed to read the 0.823 in 4.6.
+- **Not here (author):** the title in the target's embedding / oracle consequence (→ Ch. 6);
+  whitening (not used by run 11: `--features raw` in `run11_all.sh`); word2vec; storage; empty
+  abstract (O8 dropped).
 
 ### 4.6 Splits and node sets (≈ 1 page)
+
+*Written 2026-11-02 (`sec:splits`, `fig:reference-mean-cosine`, notebook `notebooks/eda/thesis_splits.ipynb`). Author: eval-set sampling justified by analysing generation across a broad range of neighbourhood sizes; baseline = reference means of the other 944 eval papers (mean 0.496; valid 0.488); NOT included: cross-set citations, a table of the sets, the 64.3% retrieval number.*
 
 - **Moved here from 4.3 (review 2026-11-02): cross-set citations.** 17 of the 90,461 training
   targets cite ≥ 1 of the 945 eval papers (14 distinct), 105 cite ≥ 1 of the 806 validation

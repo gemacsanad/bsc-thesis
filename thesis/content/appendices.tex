@@ -9,4 +9,78 @@
 \numberwithin{lstlisting}{section}
 %\numberwithin{tabular}{section}
 
+%----------------------------------------------------------------------------
+\section{Parameter counts}
+\label{app:parameters}
+%----------------------------------------------------------------------------
+
+This appendix gives the calculation behind the parameter counts in \autoref{sec:prefix-adapter} and \autoref{sec:model-size}. A linear layer from $a$ to $b$ values has $ab + b$ parameters: the weight matrix and the bias. A layer normalisation over $d$ values has $2d$ parameters, a scale and a shift for each value. LoRA with rank $r$ on a projection from $a$ to $b$ values adds two matrices with $r(a + b)$ parameters together (\autoref{sec:lora}).
+
+\autoref{tab:params-trainable} lists the trainable components. In the GNN estimator, the four heads of the GATv2 layer each have two transformations from 1024 to 256 values (\autoref{eq:gnn-head}). In LoRA, the query projection maps 5120 values to 5120, while the value projection maps 5120 values to the $8 \times 128 = 1024$ values of the eight key--value heads.
+
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}llr@{}}
+    \toprule
+    part & calculation & parameters \\
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{GNN estimator}} \\
+    head transformations $\mathbf{W}^{(k)}_1, \mathbf{W}^{(k)}_2$, with biases & $2 \times 4 \times (1024 \times 256 + 256)$ & 2,099,200 \\
+    attention vectors $\mathbf{a}^{(k)}$ & $4 \times 256$ & 1,024 \\
+    bias $\mathbf{b}$ of the GATv2 layer & $1024$ & 1,024 \\
+    \texttt{[MASK]} vector $\mathbf{m}$ & $1024$ & 1,024 \\
+    linear output layer & $1024 \times 1024 + 1024$ & 1,049,600 \\
+    total &  & 3,151,872 \\
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{prefix adapter}} \\
+    trunk: linear layer & $1024 \times 1024 + 1024$ & 1,049,600 \\
+    trunk: layer normalisation & $2 \times 1024$ & 2,048 \\
+    code projection & $1024 \times 15{,}360 + 15{,}360$ & 15,744,000 \\
+    key and value decoders & $2 \times (192 \times 32{,}768 + 32{,}768)$ & 12,648,448 \\
+    base prefix $\mathbf{B}$ & $40 \times 2 \times 8 \times 32 \times 128$ & 2,621,440 \\
+    gates $g$ & $40 \times 2$ & 80 \\
+    total &  & 32,065,616 \\
+    \midrule
+    \multicolumn{3}{@{}l}{\textit{LoRA (rank 16)}} \\
+    query projections & $40 \times 16 \times (5120 + 5120)$ & 6,553,600 \\
+    value projections & $40 \times 16 \times (5120 + 1024)$ & 3,932,160 \\
+    total &  & 10,485,760 \\
+    \midrule
+    all trainable components &  & 45,703,248 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Parameter counts of the trainable components.}
+  \label{tab:params-trainable}
+\end{table}
+
+\autoref{tab:params-qwen} calculates the size of Qwen3-14B from its configuration~\cite{qwen2025config}: 40 layers, a hidden size of 5120, 40 query heads and 8 key--value heads of dimension 128, a feed-forward size of 17,408 and a vocabulary of 151,936 tokens. The attention projections have no biases, the feed-forward network consists of three matrices, and the input embeddings and the output layer are separate matrices.
+
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}llr@{}}
+    \toprule
+    part & calculation & parameters \\
+    \midrule
+    query and output projections & $2 \times 5120 \times 5120$ & 52,428,800 \\
+    key and value projections & $2 \times 5120 \times 1024$ & 10,485,760 \\
+    query and key normalisation & $2 \times 128$ & 256 \\
+    feed-forward network & $3 \times 5120 \times 17{,}408$ & 267,386,880 \\
+    two normalisation layers & $2 \times 5120$ & 10,240 \\
+    one layer &  & 330,311,936 \\
+    \midrule
+    40 layers & $40 \times 330{,}311{,}936$ & 13,212,477,440 \\
+    input embeddings & $151{,}936 \times 5120$ & 777,912,320 \\
+    output layer & $151{,}936 \times 5120$ & 777,912,320 \\
+    final normalisation & $5120$ & 5,120 \\
+    total &  & 14,768,307,200 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Parameter count of Qwen3-14B, calculated from its configuration.}
+  \label{tab:params-qwen}
+\end{table}
+
+The direct mapping considered in \autoref{sec:prefix-adapter} would use one linear layer from 1024 to $8 \times 32 \times 128 = 32{,}768$ values for the keys and one for the values of each of the 40 layers. This gives $80 \times (1024 \times 32{,}768 + 32{,}768) = 2{,}686{,}976{,}000$ parameters, about 18\% of Qwen3-14B and about 84 times the 32,065,616 parameters of the factorised adapter.
+
 \input{include/\AIdeclaration}
