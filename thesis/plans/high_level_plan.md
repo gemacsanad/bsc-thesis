@@ -54,6 +54,16 @@ Estimated main text: 52–63 pages.
 - **The ablation chapter comes after Results** so its numbers are read with the instruments
   already defined.
 
+## 3a. Decisions taken (2026-11-13)
+
+- The children's-books experiments are dropped completely; arXiv only.
+- The text baseline is not used for now; Ch. 6 compares five configurations (zero input,
+  reference mean, GNN estimate and oracle with the separately trained reader; the joint model
+  with the jointly fine-tuned reader).
+- Ch. 6 metric set, framed as three questions: text similarity (ROUGE/BERTScore) →
+  identification (TF-IDF) → content agreement (judge: subfield/problem/task). Ch. 6 defines;
+  Ch. 7 reports whether each discriminates. The old 1–10 rubric is dropped. Plan: `plans/06-evaluation.md`.
+
 ## 4. Pending results with reserved space
 
 - run-11 oracle arm: old judge and detailed evaluator (Ch. 7, 8);

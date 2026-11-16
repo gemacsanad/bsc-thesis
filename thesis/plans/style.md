@@ -29,4 +29,8 @@ Preferences stated by the author. They override the defaults in `CLAUDE.md` §7.
 
 | notation (Ch. 5) | $\hat{\mathbf{x}}_v$ estimate of paper $v$; $\mathbf{x}_u$ embedding of paper $u$; $s_{vu}=\cos(\hat{\mathbf{x}}_v,\mathbf{x}_u)$; $\mathcal{C}_v$ candidate set; $\tau$ temperature; $\mathcal{L}_{\cos}$, $\mathcal{L}_{\mathrm{NCE}}$, $\mathcal{L}_{\mathrm{GNN}}$, $\lambda_{\mathrm{NCE}}$ | 2026-11-04 |
 
+| simplicity (evaluation and later chapters) | keep it clear and simple; show the good metrics; every metric has a clear purpose and decision; nothing old or unnecessary (no earlier runs, no dropped experiments) | 2026-11-13 |
+
+| original abstract | the abstract a generated one is compared with is the "original abstract" (not "reference abstract" / "gold"); "reference" means a cited paper | 2026-11-13 |
+
 Still open: tense convention, notation; confirm the cross-reference style.

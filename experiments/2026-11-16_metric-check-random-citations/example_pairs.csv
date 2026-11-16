@@ -1,0 +1,5 @@
+kind,text_a,text_b,rougeL_f,bertscore_f1
+reversed finding,Adding residual connections improves the accuracy of deep graph neural networks on node classification.,Adding residual connections reduces the accuracy of deep graph neural networks on node classification.,0.9285714285714286,0.99350756
+swapped roles,We use a large language model to generate training data for a graph neural network.,We use a graph neural network to generate training data for a large language model.,0.6,0.97399515
+different application,We propose a transformer model for detecting tumours in medical images.,We propose a transformer model for detecting fraud in financial transactions.,0.7272727272727273,0.95579314
+"same meaning, different words",We propose a transformer model for detecting tumours in medical images.,A transformer network is presented that locates cancerous growths in clinical scans.,0.2608695652173913,0.91643554

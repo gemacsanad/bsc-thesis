@@ -83,4 +83,11 @@ This appendix gives the calculation behind the parameter counts in \autoref{sec:
 
 The direct mapping considered in \autoref{sec:prefix-adapter} would use one linear layer from 1024 to $8 \times 32 \times 128 = 32{,}768$ values for the keys and one for the values of each of the 40 layers. This gives $80 \times (1024 \times 32{,}768 + 32{,}768) = 2{,}686{,}976{,}000$ parameters, about 18\% of Qwen3-14B and about 84 times the 32,065,616 parameters of the factorised adapter.
 
+%----------------------------------------------------------------------------
+\section{Judge prompts}
+\label{app:judge-prompt}
+%----------------------------------------------------------------------------
+
+\textcolor{red}{[TODO: the full content prompt (\texttt{COMPARE\_SYSTEM} in \texttt{src/evaluation/evaluate\_detailed.py}) and quality prompt (\texttt{QUALITY\_SYSTEM} in \texttt{experiments/2026-11-16\_judge-repeat-test/run.py}).]}
+
 \input{include/\AIdeclaration}
