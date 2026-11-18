@@ -98,20 +98,41 @@ Identification asks whether a generated abstract distinguishes its own paper fro
 
 Similarity is measured with term frequency--inverse document frequency (TF-IDF), which represents each text by its words and gives more weight to words that are frequent in the text but rare across the collection, so that words common to most abstracts contribute little. The vocabulary and inverse-document-frequency weights are fitted on the original abstracts only; generated abstracts are then represented using the same vocabulary and weighting scheme. I use sublinear term-frequency weighting and remove English stop words. For each generated abstract, the 945 original abstracts are ranked by cosine similarity, and the rank of its own paper's abstract is recorded. Ties receive the worst rank among the tied candidates. An empty output therefore ranks last, while an identical output for every paper cannot achieve high identification accuracy across the collection. I summarise these ranks in two ways. The top-1 accuracy is the share of papers whose own abstract ranks first. The mean reciprocal rank (MRR) is the average of $1/\text{rank}$ over the papers: an own abstract ranked first contributes 1, one ranked second contributes $1/2$, and one ranked tenth contributes $1/10$, so the MRR also gives partial credit when the own abstract is close to the top. Under a uniformly random ranking of the 945 candidates, the expected top-1 accuracy is approximately 0.11\% and the expected MRR is approximately 0.008.
 
-I use identification for two purposes. It is one of the measures with which the configurations are compared in \autoref{chap:results}. The same identification procedure is also used on validation papers for checkpoint selection (\autoref{sec:training}) and in the diagnostic test used to select the decoding constraint (\autoref{sec:decoding-method}). Its limits follow from its design. It compares words, so a generated abstract that describes the right paper in different words can rank low. Its values also depend on this particular collection of 945 abstracts; they are not probabilities of identifying a paper among all published work. Finally, a high identification score shows that the output contains distinguishing vocabulary, but does not establish that its individual claims are correct.
+I use identification for two purposes. It is one of the measures with which the configurations are compared in \autoref{chap:ablations}. The same identification procedure is also used on validation papers for checkpoint selection (\autoref{sec:training}) and in the diagnostic test used to select the decoding constraint (\autoref{sec:decoding-method}). Its limits follow from its design. It compares words, so a generated abstract that describes the right paper in different words can rank low. Its values also depend on this particular collection of 945 abstracts; they are not probabilities of identifying a paper among all published work. Finally, a high identification score shows that the output contains distinguishing vocabulary, but does not establish that its individual claims are correct.
 
 %----------------------------------------------------------------------------
 \section{Content agreement and text quality}
 \label{sec:judge-evaluation}
 %----------------------------------------------------------------------------
 
-Text similarity and identification provide indirect evidence of content agreement, but neither explicitly assesses whether the generated abstract states the same research problem and task as the original. I therefore also use an LLM judge (\autoref{sec:llm-judge}) to assess these aspects against a specified rubric: a language model that reads the original and the generated abstract and scores their agreement on criteria stated in its prompt. The same judge also rates how well the generated abstract is written.
+Text similarity and identification provide indirect evidence of content agreement, but neither explicitly assesses whether the generated abstract states the same research problem and task as the original. I therefore also use an LLM judge (\autoref{sec:llm-judge}), which reads both abstracts and scores their agreement against criteria specified in its prompt. The same judge also rates how well the generated abstract is written.
 
-The judge is \texttt{gpt-5.4-mini}, used through the OpenAI API with temperature 0. I use temperature 0 to minimise variation from token sampling. Identical requests can nevertheless produce different scores, so I measure repeatability below. The judge answers in a fixed JSON format, in two separate calls per generated abstract. The content call receives the original and the generated abstract. The quality call receives only the generated abstract, so that writing quality is assessed without showing the original abstract. Both prompts are given in full in \autoref{app:judge-prompt}.
+The judge is \texttt{gpt-5.4-mini}, used through the OpenAI API with temperature 0. I use temperature 0 to minimise variation from token sampling. Identical requests can nevertheless produce different scores, so I measure repeatability below. The judge answers in a fixed JSON format, in two separate calls per generated abstract, because the two calls measure different things. The content call receives the original and generated abstracts and scores their agreement in subfield, research problem and task. The quality call receives only the generated abstract and assesses its coherence and language. Both prompts are given in full in \autoref{app:judge-prompt}.
 
-The content call scores three aspects of the research described by the two abstracts. The subfield is the specific research niche, narrower than the field. The problem is the underlying problem, gap or motivation that the paper addresses, and the task is the concrete task or objective that the paper takes on. Each aspect is scored on one scale: 0 if the two abstracts differ, 1 if they are related but clearly different, 2 if they are the same with differences in detail, and 3 if they are the same. The quality call scores two aspects of the generated abstract, also from 0 to 3, with a description for each level. Coherence measures whether the abstract forms one logical argument, from a list of loosely connected statements to a logical progression from the problem to the approach and the results. Language measures whether the text follows the norms of scientific writing, from frequent generic or conversational phrasing to precise domain terminology throughout. I report all five aspects separately. The three content aspects show what the generated abstract recovers about the paper. These scores assess agreement in research context and objective; they do not establish that the generated methods or findings are correct. Coherence and language assess the writing without comparing it with the original abstract; a well-written output can still describe the wrong research.
+\autoref{tab:judge-aspects} lists the five aspects. Each content aspect uses the same scale: 0 indicates different subfields, problems or tasks; 1 indicates related but clearly different ones; 2 indicates agreement with differences in detail; and 3 indicates agreement without such differences. The quality aspects are also scored from 0 to 3, with a description for each level in the prompt. I report all five aspects separately. The content scores assess agreement in research context and objective; they do not establish that the generated methods or findings are correct. The quality scores assess the writing without comparing it with the original abstract; a well-written output can still describe the wrong research.
 
-To check that the content aspects respond to the information given to the generator, I scored the generated abstracts of the experiment in \autoref{sec:text-similarity} with the content call (\autoref{tab:judge-check}). Abstracts generated from random citations receive scores close to 0 on all three aspects, while those generated from the real citations reach about 2, and the abstract based on the real citations scores higher for about 91\% of the papers on each aspect. The judge's anchored scale makes this difference interpretable: the random-citation outputs receive scores between ``different'' and ``related but clearly different'', while the real-citation outputs average around ``the same with differences in detail''. The generator of this experiment is a different model from the judge, so the judge does not score its own outputs.
+\begin{table}[!ht]
+  \centering
+  \small
+  \begin{tabular}{@{}p{2.2cm}p{10.4cm}@{}}
+    \toprule
+    aspect & what the judge assesses \tabularnewline
+    \midrule
+    \multicolumn{2}{@{}l}{\textit{content call: the generated abstract compared with the original}} \tabularnewline
+    subfield & whether both abstracts belong to the same specific research niche, narrower than the field \tabularnewline
+    problem & whether both address the same underlying problem, gap or motivation \tabularnewline
+    task & whether both take on the same concrete task or objective \tabularnewline
+    \midrule
+    \multicolumn{2}{@{}l}{\textit{quality call: the generated abstract alone}} \tabularnewline
+    coherence & whether the abstract forms one logical argument, progressing from the problem to the approach and the results, rather than a list of loosely connected statements \tabularnewline
+    language & whether the text follows the norms of scientific writing, with precise domain terminology and without generic or conversational phrasing \tabularnewline
+    \bottomrule
+  \end{tabular}
+  \caption{The five aspects scored by the judge, each from 0 to 3. The full prompts are given in \autoref{app:judge-prompt}.}
+  \label{tab:judge-aspects}
+\end{table}
+
+To check that the content aspects respond to the information given to the generator, I scored the generated abstracts of the experiment in \autoref{sec:text-similarity} with the content call. In this experiment, mean content scores are close to 0 for abstracts generated from random citations and around 2 for those generated from real citations (\autoref{tab:judge-check}). These values correspond approximately to different research and agreement with differences in detail, respectively. The real-citation output receives a higher score for about 91\% of papers on each aspect. The generator of this experiment is a different model from the judge, so the judge does not score its own outputs.
 
 \begin{table}[!ht]
   \centering
@@ -128,9 +149,7 @@ To check that the content aspects respond to the information given to the genera
   \label{tab:judge-check}
 \end{table}
 
-\textcolor{red}{[TODO: coherence and language of this experiment on the 0--3 quality scale; to be scored.]}
-
-To measure how consistent the judge is, I scored the same 100 generated abstracts three times with both calls (\autoref{tab:judge-repeat}). The abstracts were drawn at random from the outputs of the GNN estimate (\autoref{sec:configurations}). The mean score of each aspect differs by at most 0.08 between the three repeats, but a content score changed in at least one of the three repeats for 28--33\% of the papers. The repeat test shows that individual scores can vary even when the text is unchanged. I therefore interpret individual judgements cautiously and report paired aggregate comparisons with uncertainty estimates (\autoref{sec:comparing-configurations}). Repeatability on this sample does not establish that small differences between configurations are robust to repeated judging.
+To measure how consistent the judge is, I scored the same 100 generated abstracts three times with both calls (\autoref{tab:judge-repeat}). The abstracts were drawn at random from the outputs of the GNN estimate (\autoref{sec:configurations}). The mean score of each aspect differs by at most 0.08 between the three repeats, but the scores of individual papers vary: for the content aspects, the per-paper standard deviation averages 0.16--0.21. The repeat test shows that individual scores can vary even when the text is unchanged. I therefore interpret individual judgements cautiously and report paired aggregate comparisons with uncertainty estimates (\autoref{sec:comparing-configurations}). Repeatability on this sample does not establish that small differences between configurations are robust to repeated judging.
 
 \begin{table}[!ht]
   \centering
@@ -149,7 +168,7 @@ To measure how consistent the judge is, I scored the same 100 generated abstract
   \label{tab:judge-repeat}
 \end{table}
 
-The repeat test assesses consistency under the tested settings, while the citation-control experiment assesses sensitivity to changed source information. Neither establishes agreement with human judgement. All scores come from one judge model. The scores are ordinal, so the comparisons in \autoref{sec:comparing-configurations} also report how often one configuration scores higher, equal or lower than another. Finally, the generated abstracts of the GNN estimate already reach 2.84 out of 3 in coherence, so this aspect may separate the configurations only weakly.
+The repeat test assesses consistency under the tested settings, while the citation-control experiment assesses sensitivity to changed source information. Neither establishes agreement with human judgement. All scores come from one judge model. The scores are ordinal, so their means serve as descriptive summaries. In the 100-paper repeat test, mean coherence is already about 2.84 out of 3, suggesting that this aspect may have limited room to distinguish configurations.
 
 %----------------------------------------------------------------------------
 \section{Reporting differences}
@@ -163,5 +182,3 @@ I report the mean difference $\bar d$ together with its standard error,
   \operatorname{SE}(\bar d) = \frac{s_d}{\sqrt{945}},
 \]
 where $s_d$ is the sample standard deviation of the per-paper differences. This describes uncertainty across evaluation papers; it does not separately assess variation from retraining the models or repeating the judge calls.
-
-Because judge scores are ordered categories rather than an equal-interval scale, I also report the proportions of papers receiving higher, equal or lower scores under each comparison. These proportions indicate whether an improvement is widespread or concentrated in a smaller subset of papers.

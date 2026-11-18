@@ -64,6 +64,18 @@ Estimated main text: 52–63 pages.
   identification (TF-IDF) → content agreement (judge: subfield/problem/task). Ch. 6 defines;
   Ch. 7 reports whether each discriminates. The old 1–10 rubric is dropped. Plan: `plans/06-evaluation.md`.
 
+## 3b. Decisions taken (2026-11-16)
+
+- **Ch. 7 = training and the evaluation of the final model.** The final model is the jointly
+  fine-tuned one (the end product of the three phases in Ch. 5), chosen because it is the full
+  pipeline as designed, **not** because it scores best (it does not: joint ≈ GNN estimate, e.g.
+  TF-IDF top-1 18.8% vs 18.5%, old-judge low scores 40.3% vs 38.8%).
+- **Ch. 8 = ablations: every other configuration** as a removed or replaced component (no joint
+  phase = GNN estimate; no GNN = reference mean; no paper-specific input = zero; perfect
+  estimate = oracle), plus end-to-end training. The n-gram ban stays in Ch. 5.
+- "How much the vector carries" (oracle gap, NNLS, retrieval) is not in Ch. 7.
+- Page budget: write freely, trim at the end (author).
+
 ## 4. Pending results with reserved space
 
 - run-11 oracle arm: old judge and detailed evaluator (Ch. 7, 8);

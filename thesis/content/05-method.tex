@@ -207,7 +207,7 @@ Training runs for six fixed-size training epochs of 15,000 papers each. They are
 
 I select the checkpoint using generated text rather than validation loss alone. Validation loss measures prediction of the reference abstract's next tokens when the preceding reference tokens are supplied. It does not directly measure whether an independently generated abstract can be identified with the correct paper. I therefore use a generation-based identification score for checkpoint selection.
 
-After each epoch, I generate up to 96 tokens for each of 128 fixed validation papers; this shorter generation budget reduces the cost of repeated validation, while the final evaluation uses the decoding settings of \autoref{sec:decoding-method}. For each generated text, I rank the 128 reference abstracts by TF-IDF similarity. The score is the mean reciprocal rank (MRR) of the matching abstract: a matching abstract ranked first contributes 1, one ranked second contributes $1/2$, and so on. Higher scores indicate that the generated texts distinguish their target papers more reliably. The measure is defined in \autoref{sec:identification}. I select the epoch with the highest MRR on the reference-mean input.
+After each epoch, I generate up to 96 tokens for each paper of a fixed subset of the validation papers; this shorter generation budget reduces the cost of repeated validation, while the final evaluation uses the decoding settings of \autoref{sec:decoding-method}. For each generated text, I rank the original abstracts of the same papers by TF-IDF similarity. The score is the mean reciprocal rank (MRR) of the matching abstract: a matching abstract ranked first contributes 1, one ranked second contributes $1/2$, and so on. Higher scores indicate that the generated texts distinguish their target papers more reliably. The measure is defined in \autoref{sec:identification}. I select the epoch with the highest MRR on the reference-mean input.
 
 \subsection{Phase 2: the GNN estimator}
 \label{sec:training-gnn}
@@ -239,7 +239,7 @@ The combined objective is
 \]
 where both losses are averaged over the batch. I use batches of 256 papers, so $\mathcal{C}_v$ contains the targets of the batch and 4,096 additional embeddings sampled from the joint graph; a sampled candidate that is the target paper itself is excluded from the competing candidates. I use $\tau = 0.05$; smaller temperatures make the distribution over candidates sharper. The weight is $\lambda_{\mathrm{NCE}} = 0$ for the cosine-only variants and $0.05$ for the combined variants, which compensates for the explicit $1/\tau$ scaling of the InfoNCE similarity-score gradients.
 
-For each variant, I keep the epoch with the highest mean cosine similarity on the 806 validation papers, and among the variants I select the one with the highest such value. The selected estimator is a single GATv2 layer trained with the cosine loss alone; InfoNCE is therefore a tested alternative, not part of the final model. The variants are compared in \autoref{chap:ablations}.
+For each variant, I keep the epoch with the highest mean cosine similarity on the 806 validation papers, and among the variants I select the one with the highest such value. The selected estimator is a single GATv2 layer trained with the cosine loss alone; InfoNCE is therefore a tested alternative, not part of the final model. The variants are compared in \autoref{sec:results-gnn}.
 
 \subsection{Phase 3: joint fine-tuning}
 \label{sec:training-joint}

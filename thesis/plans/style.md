@@ -34,3 +34,5 @@ Preferences stated by the author. They override the defaults in `CLAUDE.md` §7.
 | original abstract | the abstract a generated one is compared with is the "original abstract" (not "reference abstract" / "gold"); "reference" means a cited paper | 2026-11-13 |
 
 Still open: tense convention, notation; confirm the cross-reference style.
+
+| effect sizes | no evaluative adjectives such as "modest"; state the number ("an improvement of 0.012 in mean cosine similarity") | 2026-11-17 |

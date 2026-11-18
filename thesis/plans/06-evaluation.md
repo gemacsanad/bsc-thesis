@@ -129,7 +129,7 @@ questions as the structure of the chapter.
   (not mentioned in the text; the exclusion is visible only in the appendix prompt).
 - P1 why (lexical measures) → P2 judge, temperature 0, two calls → P3 five aspects and scales
   → P4 Tab. `tab:judge-check` (metric check, content aspects; real vs random citations) + red
-  TODO for coherence/language of the check → P5 Tab. `tab:judge-repeat`
+  (TODO for coherence/language removed 2026-11-17) → P5 Tab. `tab:judge-repeat`
   (`experiments/2026-11-16_judge-repeat-test/`) → P6 limits (consistency ≠ correctness, no
   humans, one judge, ordinal, coherence near ceiling 2.84).
 - Appendix B `app:judge-prompt`: red TODO for both prompts.
@@ -169,12 +169,14 @@ questions as the structure of the chapter.
 ## Needs to be run (elsewhere, not on this machine; author decides where)
 
 **Added 2026-11-16 (author: mark, do not run yet):**
+- **Done 2026-11-17: joint model**, content + quality (`src/evaluation/judge_scores.py` →
+  `experiments/2026-10-09-14541449_run11-joint/judge_scores.csv`, 945/945, 0 failures). Remaining:
+  zero, reference mean, GNN estimate, oracle (same script).
 - Quality call (coherence, language, 0–3; `QUALITY_SYSTEM` in
   `experiments/2026-11-16_judge-repeat-test/run.py`) on the configurations used in Ch. 7: zero,
   reference mean, GNN estimate, joint, oracle (≈ 4,725 calls). The old 1–10 coherence/language
   scores are no longer used.
-- Quality call on the metric check (real and same-category generations, 400 calls) → fills the
-  red TODO under `tab:judge-check`.
+- (Dropped 2026-11-17: quality call on the metric check; the TODO under `tab:judge-check` was removed, nothing in §6.4 uses it.)
 - Content call (`evaluate_detailed.compare`, unchanged) on zero, joint and oracle (item 2 below).
 
 

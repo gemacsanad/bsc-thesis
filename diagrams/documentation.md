@@ -139,3 +139,27 @@ The message-passing figure (2026-10-28) was drawn by a generator script and revi
 
 The prompt-vs-prefix figure (2026-10-28) was approved in review round 2 (9/10). Round 1 was rejected because the dashed arrows pointed from tokens to prefix (read as data flowing into the prefix) and the *M* positions were unmarked (the two cells read as one K + one V).
 
+
+## Half-width run-11 figures for Ch. 7 (2026-11-17)
+
+At the author's request, figures that sit side by side in Ch. 7 are now drawn at
+`ts.HALFWIDTH` × 62 mm (72 × 62 mm) instead of 112.5 × 70 mm: `reader_identification_mrr`,
+`reader_gate_magnitude`, `joint_identification_mrr`, `joint_gnn_cos_loss` (the `HALF` size dict in
+cell 1 of the run notebooks; the reader and joint copies are still byte-identical). The loss
+figures stay full size. The top-1 identification figures are unchanged.
+- Later the same day the author asked for all three phase-1 figures in one row: new last cell of
+  the run notebooks → `reader_overview.{pdf,png}` and `joint_overview.{pdf,png}`, 150 × 58 mm,
+  panels (a) training + validation loss (prefix on only; the gate-0 curve dropped as too busy),
+  (b) identification MRR, (c) gate magnitude (reader) or GNN imitation loss (joint); lower-case
+  labels, "oracle input" instead of "own embedding". Thesis Fig. 7.1 uses `reader_overview`.
+- Review 2026-11-17: panel (a) of the overview figures now also shows the validation loss with
+  the gates set to zero (grey dashed); validation curves labelled by their input ("oracle input"
+  for the reader, "GNN estimate" for the joint run — the validation loss uses that input, not the
+  training mix).
+- `figures/gnn_comparison/gnn_selection.{pdf,png}` (2026-11-17): thesis Fig. 7.2, validation cosine
+  of all eight GNN variants in one full-width panel (150 × 62 mm), legend on the right, selected
+  variant thicker with a black ring; last cell of `gnn_comparison.ipynb`.
+- `figures/results/judge_distribution.{pdf,png}` (2026-11-17): thesis Fig. 7.4, share of the 945
+  evaluation papers at each judge score (0–3) for the five aspects of the final (joint) model;
+  100% stacked horizontal bars, content and quality groups, sequential blue, shares ≥ 5% labelled;
+  150 × 50 mm; `notebooks/eda/thesis_results.ipynb`.
