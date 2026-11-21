@@ -36,3 +36,5 @@ Preferences stated by the author. They override the defaults in `CLAUDE.md` §7.
 Still open: tense convention, notation; confirm the cross-reference style.
 
 | effect sizes | no evaluative adjectives such as "modest"; state the number ("an improvement of 0.012 in mean cosine similarity") | 2026-11-17 |
+| uncertainty | no standard errors anywhere (tables or prose), no space; §6.5 reports mean paired differences only | 2026-11-18 |
+| oracle input | a diagnostic control that bypasses neighbourhood-based estimation; never "ceiling" or "rather than a result" | 2026-11-18 |

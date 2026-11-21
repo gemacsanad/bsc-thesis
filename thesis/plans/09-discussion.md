@@ -17,3 +17,19 @@ Evidence, joint model, 945 papers (`experiments/2026-10-09-14541449_run11-joint/
 - Explanations are hypotheses (vector carries too little specific information; the prompt; the
   training distribution; the reader's use of the representation); current checks do not
   separate them.
+
+## From Ch. 1 (2026-11-19)
+- Limits of the simulation: the experiments withhold the text of existing papers in an existing
+  graph; they do not directly test new nodes arriving over time (moved here from §1.2).
+
+## Differences from the assignment — briefly justify here (decided 2026-11-19)
+Mentioned (not justified) in Ch. 1 §1.4. Justify briefly in Ch. 9:
+- prefix tuning instead of projection into the input embedding space (an input-token variant,
+  one token per reference, failed in development: step 6);
+- separate training + joint fine-tuning instead of end-to-end (end-to-end from scratch collapsed
+  in development; in the joint phase the GNN's training cosine loss did not decrease, §7.3);
+- reference mean as the structure-agnostic baseline; a learned structure-agnostic encoder was
+  not run;
+- "information carried by the soft prompts" only partly covered (oracle/zero controls, gates;
+  NNLS analysis of how close the references can get belongs here);
+- one dataset.

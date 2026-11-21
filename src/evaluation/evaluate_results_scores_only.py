@@ -49,6 +49,9 @@ parser.add_argument("--dataset", choices=["papers", "children"], default="papers
 parser.add_argument("--edges",  default="data/processed/joint/edges.csv",
                     help="Path to joint edges.csv used to compute num_of_neighbors (out-degree)")
 parser.add_argument("--model",  default="gpt-5.4-mini", help="OpenAI model for LLM judge")
+parser.add_argument("--no_llm", action="store_true",
+                    help="ROUGE and BERTScore only; leave the old 1-10 judge columns empty "
+                         "(thesis Ch. 8 uses judge_scores.py instead)")
 parser.add_argument("--bertscore_batch_size", type=int, default=32,
                     help="Batch size for BERTScore; lower if you hit memory issues")
 args = parser.parse_args()
@@ -222,7 +225,9 @@ for idx, row in df.iterrows():
     out.update(rouge_data[nid])
     out.update(bertscore_data[nid])
 
-    if nid in llm_cache:
+    if args.no_llm:
+        out.update({c: None for c in LLM_COLS})
+    elif nid in llm_cache:
         out.update(llm_cache[nid])
     else:
         judged += 1

@@ -101,3 +101,5 @@ Each chapter's detailed plan is in its own file, named after its `.tex` file:
 - Ch. 2: `plans/02-background.md`
 - Ch. 4: `plans/04-data.md`
 - Ch. 5: `plans/05-method.md`
+
+- **2026-11-18:** the end-to-end comparison is removed from Ch. 8 (no space); Ch. 8 is now "Ablations". Kept as a possible addition (`plans/08-ablations.md`). The deviation (staged, not end-to-end) still goes in Ch. 9; end-to-end fine-tuning stays in Ch. 10 future work.

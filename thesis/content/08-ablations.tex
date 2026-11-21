@@ -1,6 +1,65 @@
 %----------------------------------------------------------------------------
-\chapter{Ablations and end-to-end comparison}
+\chapter{Ablations}
 \label{chap:ablations}
 %----------------------------------------------------------------------------
 
-\textcolor{red}{[TODO: This chapter removes or replaces components of the final model to show what each contributes: the input ladder (zero, reference mean, GNN estimate, joint, oracle), the grid of eight GNN variants (aggregator, depth, InfoNCE), joint versus separate training, the n-gram ban in decoding, closed gates, and a frozen versus a LoRA reader. It then compares the final model with end-to-end training and explains why end-to-end training fails in this setting. The end-to-end runs used a smaller training set and an earlier pipeline, so this comparison is not controlled, and the chapter states this.]}
+This chapter compares the configurations introduced in \autoref{sec:configurations} to examine the effects of paper-specific conditioning, learned aggregation and joint fine-tuning on the generated abstracts.
+
+%----------------------------------------------------------------------------
+\section{Configurations and measures}
+\label{sec:ablation-setup}
+%----------------------------------------------------------------------------
+
+The main comparison follows three configurations. In the reference-mean configuration, the reader receives the normalised average of the target's reference embeddings, without a learned estimator. In the GNN-estimate configuration, the GNN produces the input vector from the same references. These two configurations use the same separately trained reader, so their comparison tests whether learned estimation improves generation over equal-weight averaging. The joint model then fine-tunes the GNN estimator and reader together, testing the effect of this additional training stage.
+
+Two diagnostic controls help interpret these comparisons. With zero input, the reader receives the same zero vector for every paper, removing paper-specific conditioning. With oracle input, it receives the embedding computed directly from the target's own title and abstract, bypassing neighbourhood-based estimation. Both controls use the separately trained reader. The oracle is unavailable in the actual task because it requires access to the target's own title and abstract.
+
+All configurations are evaluated on the 945 evaluation papers with the measures of \autoref{tab:final-model}: ROUGE-L and BERTScore against the original abstract, identification top-1 and the five aspects scored by the judge. Comparisons between two configurations are reported as mean per-paper differences (\autoref{sec:comparing-configurations}).
+
+%----------------------------------------------------------------------------
+\section{Results across configurations}
+\label{sec:ablation-results}
+%----------------------------------------------------------------------------
+
+\autoref{tab:ablation-results} reports all configurations on the 945 evaluation papers.
+
+\begin{table}[!ht]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{3.5pt}
+  \begin{tabular}{@{}lrrrrrrrrr@{}}
+    \toprule
+    & & \multicolumn{2}{c}{text similarity} & & \multicolumn{3}{c}{judge, content} & \multicolumn{2}{c}{judge, quality} \\
+    \cmidrule(lr){3-4} \cmidrule(lr){6-8} \cmidrule(l){9-10}
+    configuration & distinct & ROUGE-L & BERTScore & top-1 & subfield & problem & task & coherence & language \\
+    \midrule
+    reference mean & 938 & 0.175 & 0.844 & 16.5\% & 1.10 & 1.25 & 1.30 & 2.85 & 2.54 \\
+    GNN estimate & 939 & 0.179 & 0.845 & 18.5\% & 1.26 & 1.39 & 1.44 & 2.82 & 2.45 \\
+    joint model & 941 & 0.176 & 0.844 & 18.8\% & 1.30 & 1.36 & 1.43 & 2.82 & 2.44 \\
+    \midrule
+    zero input & 1 & 0.141 & 0.810 & 0.1\% & 0.00 & 0.00 & 0.00 & 2.00 & 2.00 \\
+    oracle input & 945 & 0.184 & 0.848 & 27.8\% & 1.58 & 1.58 & 1.62 & 2.75 & 2.41 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Mean scores of all configurations on the 945 evaluation papers. Distinct: number of unique generated text strings among the 945 outputs. Top-1: identification (chance 0.11\%). Judge scores range from 0 to 3.}
+  \label{tab:ablation-results}
+\end{table}
+
+Identification and judge-assessed content agreement show a common broad pattern: zero input scores lowest, both GNN configurations outperform the reference mean, and oracle input scores highest. The GNN estimate and joint model remain close, with their relative ordering depending on the measure. Among configurations with paper-specific conditioning, text-similarity scores occupy a narrow numerical range. Writing-quality scores are also similar, with the reference mean receiving the highest coherence and language means.
+
+Zero input produces one identical text for all 945 papers. In this experiment, that text receives zero on all three content aspects, and identification top-1 is approximately at chance. All other configurations produce a different text for nearly every paper. The constant text of the zero input still reaches a ROUGE-L of 0.141 and a BERTScore of 0.810, which illustrates the limitation of these metrics discussed in \autoref{sec:text-similarity}.
+
+%----------------------------------------------------------------------------
+\section{What each component contributes}
+\label{sec:ablation-contributions}
+%----------------------------------------------------------------------------
+
+Paper-specific conditioning has the largest effect. Moving from the zero input to the reference mean raises identification top-1 by 16.4 percentage points and the content scores by 1.10 to 1.30. Both configurations use the same reader, including its LoRA matrices, yet with the zero input it writes the same text for every paper. This shows that the trained reader relies on the conditioning vector to distinguish target papers: with a constant input, it produces the same abstract for every paper.
+
+Replacing the reference mean with the GNN estimate raises top-1 by 2.0 percentage points and the content scores by 0.14 to 0.16. The two configurations use the same reader and the same references and differ in how those embeddings are transformed into the conditioning vector. The improvement in the generated abstracts is consistent with the improvement in embedding estimation reported in \autoref{sec:results-gnn}, where the GNN estimate reached a mean cosine similarity of 0.833 against 0.823 for the reference mean on the evaluation papers.
+
+Joint fine-tuning produces no consistent improvement across the evaluation measures. Compared with the GNN estimate and the separately trained reader, the joint model raises top-1 by 0.3 percentage points, while the differences in the content scores range from $-0.03$ to $+0.03$ and differ in sign between aspects. Although validation identification improved during joint training (\autoref{sec:results-joint}), this does not translate into a consistent improvement across the final evaluation measures.
+
+Giving the reader the target's own embedding instead of the GNN estimate raises top-1 by 9.3 percentage points and the content scores by 0.18 to 0.31. The reader generates more target-specific abstracts when given the target's own embedding than when given the GNN estimate. This leaves a performance gap whose possible explanations are discussed in \autoref{chap:discussion}.
+
+Among the configurations with paper-specific conditioning, higher content scores are not accompanied by higher writing-quality scores. The GNN estimate scores 0.09 lower in language than the reference mean, and the oracle input scores 0.10 lower in coherence and 0.13 lower in language than the reference mean. These differences are reported as observations; their cause was not examined.

@@ -177,8 +177,4 @@ The repeat test assesses consistency under the tested settings, while the citati
 
 All configurations are evaluated on the same 945 papers. I therefore compare them using paired differences: for each paper, I subtract one configuration's score from the other's and average the differences. This accounts for the fact that the same papers may be easier or harder for both configurations.
 
-I report the mean difference $\bar d$ together with its standard error,
-\[
-  \operatorname{SE}(\bar d) = \frac{s_d}{\sqrt{945}},
-\]
-where $s_d$ is the sample standard deviation of the per-paper differences. This describes uncertainty across evaluation papers; it does not separately assess variation from retraining the models or repeating the judge calls.
+The mean difference describes these 945 papers; it does not assess variation from retraining the models or repeating the judge calls.
