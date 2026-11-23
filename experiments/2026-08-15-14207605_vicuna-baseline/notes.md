@@ -1,1 +1,0 @@
-baseline for 5-100 neighbors training with static centroid filter trained on 8000 nodes

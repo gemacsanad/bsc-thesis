@@ -1,1 +1,0 @@
-first experiment with modified prompt (focuses on generating current articles abstract and not hallucinate a completely new one + added degree counts to prompt + made more space for abstract)

@@ -1,1 +1,0 @@
-experiment with lora + soft prompt for 10 epochs with graphsage and pooled embedding

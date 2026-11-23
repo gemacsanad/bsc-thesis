@@ -60,3 +60,10 @@ duckdb_tmp/
 
 # Local secrets (tracked until the final_model cleanup; rotate its keys before publishing)
 .env_local
+
+# Not published: the thesis, the datasets, the W&B exports and local tooling
+thesis/
+data/
+diagrams/data/
+.claude/
+.env_local
