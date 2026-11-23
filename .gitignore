@@ -16,10 +16,8 @@ venv/
 # ---------------------------------------------------------------------------
 # Data
 #
-# Large and regenerable, so not versioned. data/frozen/ is deliberately NOT
-# ignored: eval_nodes.json, splits_eligible.json and training_sets.json define
-# which nodes every experiment runs on, and a result is unreproducible without
-# them. They are small (< 500 KB together).
+# Large and regenerable, so not versioned. Only the node sets of the final run
+# in data/frozen/ are published.
 # ---------------------------------------------------------------------------
 data/raw/ogbn_arxiv/_ogb_cache/
 data/raw/ogbn_arxiv/_titleabs.tsv
@@ -63,7 +61,12 @@ duckdb_tmp/
 
 # Not published: the thesis, the datasets, the W&B exports and local tooling
 thesis/
-data/
+data/*
+!data/frozen/
+data/frozen/*
+!data/frozen/eval_nodes_capped.json
+!data/frozen/training_sets_capped.json
+!data/frozen/training_sets_run9.json
 diagrams/data/
 .claude/
 .env_local
