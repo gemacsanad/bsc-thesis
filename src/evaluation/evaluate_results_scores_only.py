@@ -144,7 +144,7 @@ domain terminology, appropriate passive/active voice, and absence of generic con
 """
 
 # Children's books, in the same shape as the paper prompt. Accuracy names the aspects where the
-# GNN+LLM arms differ from the baselines (src/evaluation/documentation.md): the specific
+# GNN+LLM arms differ from the baselines: the specific
 # subject, the names, and the kind of book; review boilerplate is excluded because it gave the
 # GNN arms a false lead on names.
 _BOOK_JUDGE_SYSTEM = """\

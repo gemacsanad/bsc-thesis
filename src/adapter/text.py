@@ -54,7 +54,7 @@ def frozen_refs():
 # graph prefix, so the text is identical for every node and the prefix is the only thing that
 # differs between two papers.
 #
-# The system message is the era-4 instruction (experiments/prompt_sensitivity_gpt/prompts.py),
+# The system message is the era-4 instruction,
 # the best of the four under Qwen3-14B (5.333 vs era 1's 3.875 on 48 nodes), with the phrases
 # that pointed at a listed bibliography re-pointed at the context the prefix supplies.
 #
@@ -192,8 +192,7 @@ def user_message(neighbours):
 
     `neighbours` is a list of (title, abstract) for the papers the target cites. This is the
     part that must not change between the Vicuna and Qwen runs — only the chat delimiters
-    around it do. Kept separate for exactly that reason, as
-    experiments/prompt_sensitivity_gpt/prompts.py does.
+    around it do. Kept separate for exactly that reason.
     """
     sources = "\n\n".join(f"- Title: {t}\n  Abstract: {a}" for t, a in neighbours)
     return (f"{INSTRUCTION}\n\n"

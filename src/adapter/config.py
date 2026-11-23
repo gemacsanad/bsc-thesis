@@ -164,7 +164,7 @@ DEFAULT_SETS = "capped"     # which frozen node sets; --sets legacy reproduces t
 if DATASET == "children":
     DEFAULT_SETS = "children"
 
-# The run schedule, previously literals in hpc/komondor/jobs/run_train_adapter.sh.
+# The run schedule.
 EPOCHS = 10                 # upper bound; early stopping usually ends the run sooner
 PATIENCE = 2                # epochs without a better validation loss before stopping
 BATCH_SIZE = 1              # micro-batch; 1 x 16 keeps the effective batch at 16, which is the

@@ -137,7 +137,7 @@ def vicreg(z, gamma=VICREG_GAMMA):
 def retrieval(encoder, head, data, node_ids, device, gnn_layers, batch_size, refs_mean=False):
     """Top-1/top-5/median rank of each node's own embedding among the held-out set.
 
-    The same quantity `src/analysis/refsignal.py` computes for an untrained mean-pool, so the
+    The same quantity as for an untrained mean-pool, so the
     two are directly comparable — which is the whole point of running it. `refs_mean` scores
     that mean-pool itself (model.refs_mean_vector) instead of the encoder: the baseline every
     run-11 variant is read against, on the same nodes.

@@ -3,7 +3,7 @@ Run 9 — identifiability: does a generated abstract pick out its own paper?
 
 Every generation is ranked against the gold abstracts of the same set of papers by TF-IDF
 cosine; rank 1 means the text is closer to its own gold than to any other. This is the probe
-every soft-prompt analysis since step 2 has used (src/analysis/probe.py), moved into training so
+every soft-prompt analysis since step 2 has used, moved into training so
 that model selection and the stop rules read generated text rather than LM loss — the number
 that has misled this project three times.
 

@@ -6,7 +6,7 @@ the whole neighbourhood; only the *prompt* is trimmed, by keeping the references
 to the centroid of the node's own reference set — the ones most representative of what
 the paper cites.
 
-Distance is the definition used by src/filters/centroid_cosine_distance.py:
+Distance is defined as:
 
     cosine_distance = (1 - cosine_similarity(reference, centroid)) / 2
 

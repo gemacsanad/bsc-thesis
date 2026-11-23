@@ -32,7 +32,7 @@ scores are never compared with the model's.
 `summary.csv` (paired real − random per metric), `generate.log`.
 
 **Result** (200 papers × 3 conditions, 0 generation errors; `summary.csv`, notebook
-`notebooks/eda/thesis_metric_check.ipynb`, figure `diagrams/figures/evaluation/metric_check.pdf`).
+`notebooks/metric_check.ipynb`).
 `same_category` was added on 2026-11-16 after the first two conditions; it uses a separate seed, so
 the `random` prompts are byte-identical to the first run (checked).
 

@@ -29,7 +29,7 @@ Everything else is held fixed on purpose:
     on top of the effect being measured. The older `experiments/_archive/vicuna-7b-8bit`
     baseline sampled (temperature 0.35); it is therefore not a drop-in comparison for these
     two, which is why the frozen-LLM condition is regenerated here rather than reused.
-  * **bfloat16, not 8-bit.** `src/generation/generate_vicuna.py` loaded the baseline in 8-bit, but
+  * **bfloat16, not 8-bit.** The earlier Vicuna baseline was loaded in 8-bit, but
     the adapter was trained against a bf16 model and its prefix is calibrated to those
     numerics. Both conditions therefore run bf16, so quantisation error cannot be mistaken
     for an adapter effect.
