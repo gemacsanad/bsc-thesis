@@ -14,7 +14,7 @@
 \label{app:parameters}
 %----------------------------------------------------------------------------
 
-This appendix gives the calculation behind the parameter counts in \autoref{sec:prefix-adapter} and \autoref{sec:model-size}. A linear layer from $a$ to $b$ values has $ab + b$ parameters: the weight matrix and the bias. A layer normalisation over $d$ values has $2d$ parameters, a scale and a shift for each value. LoRA with rank $r$ on a projection from $a$ to $b$ values adds two matrices with $r(a + b)$ parameters together (\autoref{sec:lora}).
+This appendix details the parameter counts reported in \autoref{sec:prefix-adapter} and \autoref{sec:model-size}. A linear layer with a bias, mapping $a$ input features to $b$ output features, has $ab+b$ parameters. The adapter's layer normalisation over $d$ features has $2d$ parameters: one learned scale and one learned shift per feature. A rank-$r$ LoRA update adds $r(a+b)$ parameters.
 
 \autoref{tab:params-trainable} lists the trainable components. In the GNN estimator, the four heads of the GATv2 layer each have two transformations from 1024 to 256 values (\autoref{eq:gnn-head}). In LoRA, the query projection maps 5120 values to 5120, while the value projection maps 5120 values to the $8 \times 128 = 1024$ values of the eight key--value heads.
 
@@ -37,8 +37,8 @@ This appendix gives the calculation behind the parameter counts in \autoref{sec:
     trunk: linear layer & $1024 \times 1024 + 1024$ & 1,049,600 \\
     trunk: layer normalisation & $2 \times 1024$ & 2,048 \\
     code projection & $1024 \times 15{,}360 + 15{,}360$ & 15,744,000 \\
-    key and value decoders & $2 \times (192 \times 32{,}768 + 32{,}768)$ & 12,648,448 \\
-    base prefix $\mathbf{B}$ & $40 \times 2 \times 8 \times 32 \times 128$ & 2,621,440 \\
+    two shared key and value decoders & $2 \times (192 \times 32{,}768 + 32{,}768)$ & 12,648,448 \\
+    learned base prefix $\mathbf{B}$ & $40 \times 2 \times 8 \times 32 \times 128$ & 2,621,440 \\
     gates $g$ & $40 \times 2$ & 80 \\
     total &  & 32,065,616 \\
     \midrule
@@ -54,48 +54,80 @@ This appendix gives the calculation behind the parameter counts in \autoref{sec:
   \label{tab:params-trainable}
 \end{table}
 
-\autoref{tab:params-qwen} calculates the size of Qwen3-14B from its configuration~\cite{qwen2025config}: 40 layers, a hidden size of 5120, 40 query heads and 8 key--value heads of dimension 128, a feed-forward size of 17,408 and a vocabulary of 151,936 tokens. The attention projections have no biases, the feed-forward network consists of three matrices, and the input embeddings and the output layer are separate matrices.
+The direct mapping considered in \autoref{sec:prefix-adapter} would use 80 linear projections with biases, one from 1024 to $8 \times 32 \times 128 = 32{,}768$ values for the keys and one for the values of each of the 40 layers. This gives $80 \times (1024 \times 32{,}768 + 32{,}768) = 2{,}686{,}976{,}000$ parameters, about 84 times the 32,065,616 parameters of the factorised adapter. Calculating the parameter count from the Qwen3-14B configuration gives 14,768,307,200 parameters~\cite{qwen2025config}. The direct mapping alone would therefore have about 18\% as many parameters as the frozen backbone.
 
-\begin{table}[!ht]
-  \centering
-  \small
-  \begin{tabular}{@{}llr@{}}
-    \toprule
-    part & calculation & parameters \\
-    \midrule
-    query and output projections & $2 \times 5120 \times 5120$ & 52,428,800 \\
-    key and value projections & $2 \times 5120 \times 1024$ & 10,485,760 \\
-    query and key normalisation & $2 \times 128$ & 256 \\
-    feed-forward network & $3 \times 5120 \times 17{,}408$ & 267,386,880 \\
-    two normalisation layers & $2 \times 5120$ & 10,240 \\
-    one layer &  & 330,311,936 \\
-    \midrule
-    40 layers & $40 \times 330{,}311{,}936$ & 13,212,477,440 \\
-    input embeddings & $151{,}936 \times 5120$ & 777,912,320 \\
-    output layer & $151{,}936 \times 5120$ & 777,912,320 \\
-    final normalisation & $5120$ & 5,120 \\
-    total &  & 14,768,307,200 \\
-    \bottomrule
-  \end{tabular}
-  \caption{Parameter count of Qwen3-14B, calculated from its configuration.}
-  \label{tab:params-qwen}
-\end{table}
+%----------------------------------------------------------------------------
+\section{Generation prompt}
+\label{app:generation-prompt}
+%----------------------------------------------------------------------------
 
-The direct mapping considered in \autoref{sec:prefix-adapter} would use one linear layer from 1024 to $8 \times 32 \times 128 = 32{,}768$ values for the keys and one for the values of each of the 40 layers. This gives $80 \times (1024 \times 32{,}768 + 32{,}768) = 2{,}686{,}976{,}000$ parameters, about 18\% of Qwen3-14B and about 84 times the 32,065,616 parameters of the factorised adapter.
+Listing~\ref{lst:generation-prompt} gives the complete fixed prompt of the reader (\autoref{sec:reader}). It consists of a system message and a user message, formatted with Qwen3's chat template with the reasoning mode disabled; it is identical for every paper.
+
+\begin{lstlisting}[caption={Fixed prompt of the reader.},label={lst:generation-prompt}]
+System:
+You are a scientific writing assistant. The context you have been given encodes the reference list of one paper, whose own abstract is missing. That paper is not among its references: it is a separate, more recent work that cites all of them. Reconstruct its abstract as continuous prose covering, in order: the problem it addresses; what the work it cites has already established about that problem; what it does about what remains open, described by the mechanism it uses the kind of model, data or analysis rather than by a name; and what it evaluates. Where the context leaves the paper's specific contribution undetermined, state what it does determine about its problem and approach, and stop there; a correct general statement is worth more than a specific guess. Write in the voice of the paper's own authors: never mention the cited works as a collection, how many there are, or the authors, and do not restate any single one of them. Write plain prose of 150-180 words, with no markup, mathematical notation or headings. Output ONLY the abstract text.
+
+User:
+Write the abstract.
+\end{lstlisting}
 
 %----------------------------------------------------------------------------
 \section{Judge prompts}
 \label{app:judge-prompt}
 %----------------------------------------------------------------------------
 
-\textcolor{red}{[TODO: the full content prompt (\texttt{COMPARE\_SYSTEM} in \texttt{src/evaluation/evaluate\_detailed.py}) and quality prompt (\texttt{QUALITY\_SYSTEM} in \texttt{experiments/2026-11-16\_judge-repeat-test/run.py}).]}
+This section gives the system prompts of the two judge calls (\autoref{sec:judge-evaluation}). In the content call (Listing~\ref{lst:judge-content}), the user message contains the original abstract after the line ``ORIGINAL ABSTRACT:'' and the generated abstract after the line ``GENERATED ABSTRACT:''. In the quality call (Listing~\ref{lst:judge-quality}), the user message contains only the generated abstract, after the line ``ABSTRACT:''.
+
+\begin{lstlisting}[caption={System prompt of the content call.},label={lst:judge-content}]
+You are a rigorous scientific peer reviewer. Given an original paper abstract and a generated abstract for the same paper, compare them. Return valid JSON with exactly this structure:
+{
+  "subfield":            <int 0-3>,
+  "problem":             <int 0-3>,
+  "task":                <int 0-3>
+}
+
+subfield, problem and task use one scale:
+  0 = different, 1 = related but clearly different, 2 = the same with differences in detail, 3 = the same.
+- subfield: the specific research niche, narrower than the field (e.g. "graph contrastive learning", not "machine learning").
+- problem: the underlying problem, gap or motivation the paper addresses.
+- task: the concrete task or objective the paper takes on (e.g. detection vs segmentation, translation vs summarisation).
+Do not let the methods, models, datasets or numbers named in either abstract influence these three scores.
+\end{lstlisting}
+
+\begin{lstlisting}[caption={System prompt of the quality call.},label={lst:judge-quality}]
+You are a rigorous scientific peer reviewer. Rate the writing of the abstract below, without judging whether its content is correct. Return valid JSON with exactly this structure:
+{
+  "coherence": <int 0-3>,
+  "language":  <int 0-3>
+}
+
+- coherence: does the abstract form one logical argument?
+  0 = no recognisable argument; 1 = a list of loosely connected statements; 2 = a clear argument with gaps or jumps; 3 = a logical progression from the problem to the approach to the results.
+- language: does the text follow the norms of scientific writing?
+  0 = not scientific prose; 1 = frequent generic or conversational phrasing; 2 = scientific register with some vague or imprecise terms; 3 = precise domain terminology throughout, with no generic filler.
+\end{lstlisting}
 
 %----------------------------------------------------------------------------
 \section{Training resources}
 \label{app:resources}
 %----------------------------------------------------------------------------
 
-\textcolor{red}{[TODO: compact table of the training resources: GPU model and number (one NVIDIA A100 40\,GB per job), numerical precision, effective batch size, wall-clock time of each training phase (state whether validation is included), and GPU memory and utilisation during training (needs the W\&B system metrics, not yet exported). Do not use the throughput trace without explaining its artefact.]}
+All training ran on the Komondor supercomputer, with one NVIDIA A100 GPU with 40\,GiB of memory per job. The weights of Qwen3-14B are loaded in bfloat16, while the LoRA parameters and the loss are kept in float32, and gradient checkpointing is enabled during training. The implementation uses transformers 4.51.3, pinned exactly because inserting the prefix into the key--value cache depends on internals of the library that change between versions. \autoref{tab:resources} lists the training time of each phase.
+
+\begin{table}[!ht]
+  \centering
+  \begin{tabular}{@{}lr@{}}
+    \toprule
+    phase & wall-clock time \\
+    \midrule
+    GNN estimator, 8 variants & 31\,min in total \\
+    reader & 11.5\,h \\
+    joint fine-tuning & 5.7\,h \\
+    \bottomrule
+  \end{tabular}
+  \caption{Training time of each phase of the final model on one A100 GPU. The times include model loading and the validation during training.}
+  \label{tab:resources}
+\end{table}
 
 %----------------------------------------------------------------------------
 \section{Example generations}
@@ -127,6 +159,8 @@ This example agrees with the original in research area and task, but the high co
 
 \textbf{Generated abstract.} Face recognition is a challenging task in the wild due to the large variations in illumination, pose, and expression. In this paper, we propose a novel face recognition method that is robust to these variations. Our method is based on a deep convolutional neural network (CNN) that is trained to predict the identity of a face image. We propose a new loss function that is based on the cosine similarity between the predicted and ground-truth identity vectors. We also propose a new training procedure that is based on a combination of hard and easy samples. We show that our method achieves state-of-the-art performance on the LFW, IJB-A, and IJB-B face recognition benchmarks.
 
+Despite the high task score, the generated abstract changes the paper's contribution from analysing accuracy differences to proposing a recognition method.
+
 \subsection{Description of a recorded reference}
 \textit{Exemplar normalization for learning deep representation}~\cite{zhang2020exemplar}. Judge scores: subfield 0, problem 0, task 0, coherence 3, language 3.\nopagebreak[4]
 
@@ -135,12 +169,5 @@ This example agrees with the original in research area and task, but the high co
 \textbf{Generated abstract.} We propose a new convolutional neural network (CNN) architecture, called Residual Network (ResNet), that consists of very deep feed-forward networks with the building blocks of ``identity shortcuts'' and ``bottleneck layers''. We apply it to the 1,000-class ImageNet model, where it improves relative error rate by 37.7\% over its predecessor. We then compare it with the state-of-the-art solution on CIFAR-10/100, which shows 6.49\% and 17.0\% improvement.
 
 The paper's recorded references include \textit{Deep Residual Learning for Image Recognition}~\cite{he2016resnet}, the paper that introduced ResNet. The generated abstract describes ResNet rather than exemplar normalization. Its specific numerical claims are not stated in either recorded abstract.
-
-%----------------------------------------------------------------------------
-\section{Further training diagnostics}
-\label{app:training-diagnostics}
-%----------------------------------------------------------------------------
-
-\textcolor{red}{[TODO: one full-width multi-panel figure per phase (reader, joint) with identification top-1, prefix contrast and the canary; optional: gradient norm, GNN training cosine and output pairwise cosine. Figures exist in \texttt{diagrams/data/run11-*/figures/}.]}
 
 \input{include/\AIdeclaration}

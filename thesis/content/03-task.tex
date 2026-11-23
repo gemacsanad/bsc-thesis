@@ -3,4 +3,36 @@
 \label{chap:task}
 %----------------------------------------------------------------------------
 
-\textcolor{red}{[TODO: This chapter is written last, because the formal task definition, in particular which neighbours a target may use, may still change if datasets other than the citation graph are added.]}
+Given a target paper with known citation connections, the task is to generate its abstract from the information available in its reference neighbourhood. The target's own title and abstract are unavailable to the generator.
+
+%----------------------------------------------------------------------------
+\section{The citation graph}
+\label{sec:task-graph}
+%----------------------------------------------------------------------------
+
+The task is defined on a directed citation graph $G = (V, E)$ whose nodes are papers. Each paper $u \in V$ has a text $t_u$, consisting of its title and abstract, and an embedding $\mathbf{x}_u \in \mathbb{R}^d$ computed from this text by a pre-trained embedding model (\autoref{sec:embeddings}). An edge $(u, v) \in E$ means that paper $v$ cites paper $u$, so the edges point from a reference to the paper that cites it (\autoref{sec:model-graph}). With this direction, the neighbourhood $\mathcal{N}(v)$ defined in \autoref{sec:gnn} is the set of recorded references of $v$.
+
+The papers whose abstracts are generated, the target papers, form a subset $T \subset V$. Each target $v \in T$ has an original abstract $a_v$. Every paper of the graph can provide neighbourhood information for the papers that cite it, but only target papers have their abstracts generated. \autoref{chap:data} describes which papers are targets and how they are divided into training, validation and evaluation papers.
+
+%----------------------------------------------------------------------------
+\section{Input and output}
+\label{sec:task-io}
+%----------------------------------------------------------------------------
+
+The information available for a target $v$ is its neighbourhood in the citation graph. I define the $k$-hop neighbourhood $\mathcal{N}_k(v)$ as the set of papers other than $v$ from which a directed path of at most $k$ edges leads to $v$. Its first hop, $\mathcal{N}_1(v) = \mathcal{N}(v)$, contains the references of $v$, and each further hop adds the references of the papers already included. The input of the task consists of the subgraph $G^{(k)}_v$, which contains the target $v$, the papers of $\mathcal{N}_k(v)$ and the edges on these paths, together with the embeddings of the neighbouring papers:
+\begin{align}
+  I_v = \big(G^{(k)}_v,\; \{\mathbf{x}_u : u \in \mathcal{N}_k(v)\}\big).
+  \label{eq:task-input}
+\end{align}
+The graph structure determines which papers contribute and how they are connected, and the embeddings describe their content.
+
+The target $v$ is identified in the input subgraph, but its own title, abstract and embedding are excluded from the generation input. Original target abstracts remain available for training and assessment.
+
+The neighbourhood information conditions the language model through a soft prompt (\autoref{sec:soft-prompts}), alongside a fixed instruction that is the same for every paper. The output is a generated abstract $\hat{a}_v$.
+
+%----------------------------------------------------------------------------
+\section{Comparison with the original abstract}
+\label{sec:task-success}
+%----------------------------------------------------------------------------
+
+A generated abstract $\hat{a}_v$ is compared with the original abstract $a_v$ of the same target. It is successful if it agrees with $a_v$ in content; matching the wording of $a_v$ is not required. Important aspects of this agreement are the target's research area, problem and task, and $\hat{a}_v$ should distinguish the target from other papers rather than describe a generic paper of its field. Fluent writing alone therefore does not solve the task, and a plausible abstract does not establish that its claims about methods or findings are correct.

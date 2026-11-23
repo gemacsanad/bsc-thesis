@@ -131,7 +131,7 @@ The textual input is a fixed prompt, identical for every paper, in Qwen3's chat 
 \end{minipage}}
 \end{center}
 
-The requested word count is an instruction to the model, not a guarantee about the length of the generated text. The complete prompt is given in \textcolor{red}{[TODO: reference to the appendix with the full prompt]}.
+The requested word count is an instruction to the model, not a guarantee about the length of the generated text. The complete prompt is given in \autoref{app:generation-prompt}.
 
 The reader is trained with the next-token cross-entropy of \autoref{eq:lm-loss}. The context consists of the prefix and the prompt, and the target sequence is the paper's abstract, cleaned as described in \autoref{sec:cleaning}. The loss is computed only for the abstract tokens; prompt tokens remain visible as context but do not contribute directly to the loss. Although the original language-model weights are not updated, gradients are propagated through its computations to train the prefix adapter and LoRA parameters.
 
@@ -140,7 +140,7 @@ The reader is trained with the next-token cross-entropy of \autoref{eq:lm-loss}.
 \label{sec:model-size}
 %----------------------------------------------------------------------------
 
-\autoref{tab:model-size} lists the number of parameters in each component of the model. The trainable components together have 45.7 million parameters, about 0.3\% of the 14.8 billion parameters of Qwen3-14B, which remains frozen. The calculation for each component is given in \autoref{app:parameters}.
+\autoref{tab:model-size} lists the number of parameters in each component of the model. The trainable components together have 45.7 million parameters, about 0.3\% of the 14.8 billion parameters of Qwen3-14B, which remains frozen. The parameter counts of the trainable components are calculated in \autoref{app:parameters}.
 
 \begin{table}[!ht]
   \centering
@@ -156,7 +156,7 @@ The reader is trained with the next-token cross-entropy of \autoref{eq:lm-loss}.
     all trainable components & 45.7 \\
     \bottomrule
   \end{tabular}
-  \caption{Parameters of the model components. LoRA has rank 16 and is applied to the query and value projections of all 40 layers. The exact counts are calculated in \autoref{app:parameters}.}
+  \caption{Parameters of the model components. LoRA has rank 16 and is applied to the query and value projections of all 40 layers. The counts of the trainable components are calculated in \autoref{app:parameters}.}
   \label{tab:model-size}
 \end{table}
 
@@ -178,7 +178,7 @@ To prevent such loops, I block repeated n-grams during decoding: no sequence of 
 \label{sec:training}
 %----------------------------------------------------------------------------
 
-The model is trained in three phases (\autoref{tab:training-phases}). The reader and the GNN estimator are first trained separately, each on an objective that can be computed and monitored on its own, and are then fine-tuned together. The full hyperparameters are listed in \textcolor{red}{[TODO: reference to the appendix with the hyperparameters]}.
+The model is trained in three phases (\autoref{tab:training-phases}). The reader and the GNN estimator are first trained separately, each on an objective that can be computed and monitored on its own, and are then fine-tuned together. The computing resources of each phase are listed in \autoref{app:resources}.
 
 \begin{table}[!ht]
   \centering
