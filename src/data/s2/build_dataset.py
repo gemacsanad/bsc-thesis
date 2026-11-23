@@ -1,27 +1,8 @@
-"""
-Join the raw Semantic Scholar shard files (downloaded by download_shards.py)
-into two consolidated, mag_id-keyed Parquet files - instead of the 30
-raw shard files per dataset:
-
-  papers.parquet      : mag_id, corpusid, abstract
-  references.parquet  : citing_mag_id, cited_mag_id
-
-No full text is kept anywhere in this pipeline - only abstracts and the
-reference (citation) graph, both keyed by mag_id.
-
-Uses DuckDB to read the raw *.jsonl.gz shards directly (including
-gzip decompression) and perform the joins out-of-core, so this works
-without loading the full ~500GB dataset into memory. DuckDB spills
-intermediate state to `--tmp-dir` when it doesn't fit in `--memory-limit`.
-
-Pipeline:
-  1. papers/*.jsonl.gz      -> mag_map(corpusid, mag_id)
-                               (only rows with a non-null externalids.MAG)
-  2. abstracts/*.jsonl.gz  (+ mag_map) -> papers.parquet(mag_id, corpusid, abstract)
-  3. citations/*.jsonl.gz  (+ mag_map twice) -> references.parquet(citing_mag_id, cited_mag_id)
+"""Join the raw Semantic Scholar shards into papers.parquet (mag_id, corpusid, abstract) and
+references.parquet (citing_mag_id, cited_mag_id), out-of-core with DuckDB.
 
 Usage:
-    python build_dataset.py --raw-dir /path/to/data/raw/s2 --out-dir /path/to/data/processed/s2
+    python build_dataset.py --raw-dir <raw/s2> --out-dir <processed/s2>
 """
 
 import argparse

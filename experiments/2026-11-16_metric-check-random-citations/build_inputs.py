@@ -1,20 +1,4 @@
-"""Build the two prompt sets of the metric check: real citations vs random citations.
-
-200 of the 945 evaluation papers (fixed seed). For each paper:
-  real   — the titles and abstracts of its recorded references (out-edges in the joint graph);
-  random — the same number of papers drawn at random from the joint graph, excluding the paper
-           itself and its real references;
-  same_category — the same number of ogbn-arxiv papers drawn at random from the paper's own
-           arXiv category (ogbn-arxiv label), excluding the paper and its real references. Drawn
-           with a separate generator (SEED_CATEGORY), so the `random` condition is unchanged.
-The prompt is identical in both conditions; only the listed publications differ. Every
-reference is shown, with no cap: the generator's context is large enough.
-
-Writes test_set.csv (node_id, mag_id, condition, n_refs, approx_words, prompt, original_abstract).
-
-Usage (from the repository root):
-    python experiments/2026-11-16_metric-check-random-citations/build_inputs.py
-"""
+"""Build the two prompt sets of the metric check: real citations vs random citations."""
 
 import json
 from pathlib import Path

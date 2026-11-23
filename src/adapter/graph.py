@@ -1,37 +1,4 @@
-"""
-Stage 2 — graph tensors and dataloaders for GraphSAGE training.
-
-Builds the PyG `Data` object the GNN runs on, and `NeighborLoader`s that feed it
-complete neighbourhoods.
-
-Graph
------
-All 384,756 joint-dataset nodes. Features are the voyage-4-large embeddings of
-`title + "\\n\\n" + abstract` (row i == node_id i, L2-normalised). Edges come from
-data/processed/joint/edges.csv with the 20 self-loops dropped.
-
-The graph is **directed, references only**. edges.csv stores (citing, cited); PyG
-aggregates along in-edges, so edge_index is stored reversed as (cited, citing) and
-messages flow from a paper's references into the paper. A node therefore learnss
-only from work it cites — never from papers citing it, which are published later
-and would not exist at generation time.
-
-Hop 1 is then exactly the node's reference list, so the graph matches the 5-15
-out-degree filter used to select the nodes rather than cutting across it.
-
-Sampling
---------
-`num_neighbors=[-1] * gnn_layers` — every neighbour at every hop, nothing dropped.
-The depth follows the encoder's layer count: a conv layer reading from an unsampled
-hop would aggregate incomplete neighbourhoods without erroring. Neighbourhoods stay
-small enough not to need a cap (capped train seeds: mean 199 nodes at 2 hops, 876 at
-3, 2,645 at 4). Seed nodes occupy rows 0..batch_size-1 of each batch.
-
-`Data` stays on CPU; sampling runs there and only the sampled subgraph moves to GPU.
-
-Usage:
-    python adapter/graph.py     # build the graph and print stats
-"""
+"""Graph tensors, the citation-graph neighbourhoods and the dataloaders."""
 
 import argparse
 import json
@@ -49,12 +16,7 @@ from config import (FROZEN_DIR, GNN_LAYERS, JOINT_DIR, NODE_EMBEDDINGS,
 
 
 def load_graph(embeddings=None, edges=None):
-    """Build the directed reference graph with voyage embeddings as node features.
-
-    Since run 8 the default is the ZCA-whitened features (config.NODE_EMBEDDINGS). The raw
-    voyage features are anisotropic enough that the adapter read them as a constant. Every arm loads through here,
-    so the oracle, the GNN and the neighbour tokens all get the same treatment.
-    """
+    """Build the directed reference graph with voyage embeddings as node features."""
     embeddings = embeddings or NODE_EMBEDDINGS
     edges = edges or os.path.join(JOINT_DIR, "edges.csv")
     assert os.path.exists(embeddings), (
@@ -76,12 +38,7 @@ def load_graph(embeddings=None, edges=None):
 
 def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0,
                 gnn_layers=GNN_LAYERS, hops=None):
-    """NeighborLoader over `seed_nodes`, returning their full `gnn_layers`-hop neighbourhoods.
-
-    `hops` overrides the depth for callers that do not run the encoder: 0 returns the seeds
-    alone, which is what oracle training needs — run 9 trains on ~90k papers, some with
-    2-hop neighbourhoods in the tens of thousands, and none of those rows would be read.
-    """
+    """NeighborLoader over `seed_nodes`, returning their full `gnn_layers`-hop neighbourhoods."""
     depth = gnn_layers if hops is None else hops
     return NeighborLoader(
         data,
@@ -94,21 +51,16 @@ def make_loader(data, seed_nodes, batch_size, shuffle, num_workers=0,
 
 
 def with_references(data, nodes):
-    """-> the nodes of `nodes` that cite at least one paper in the graph, order kept.
-
-    Run 11: a GNN estimate for a paper with no references is the [MASK] row alone, the same
-    vector for all of them, so they are left out of GNN training. Its in-edges are its
-    references, since edge_index is stored cited -> citing.
-    """
+    """-> the nodes of `nodes` that cite at least one paper in the graph, order kept."""
     has = torch.zeros(data.num_nodes, dtype=torch.bool)
     has[data.edge_index[1]] = True
     return [n for n in nodes if has[n]]
 
 
 def within_subgraph(data, nodes, max_edges, gnn_layers):
-    """-> the nodes of `nodes` whose full `gnn_layers`-hop subgraph has at most `max_edges`
-    edges, order kept. The count is the loader's: a node's in-edges, plus at 2 hops the
-    in-edges of each of its in-neighbours (an upper bound, since it does not deduplicate).
+    """-> the nodes of `nodes` whose full `gnn_layers`-hop subgraph has at most `max_edges` edges,
+    order kept. The count is the loader's: a node's in-edges, plus at 2 hops the in-edges of each of
+    its in-neighbours (an upper bound, since it does not deduplicate).
     """
     deg = torch.bincount(data.edge_index[1], minlength=data.num_nodes)
     edges = deg.clone()
@@ -120,37 +72,14 @@ def within_subgraph(data, nodes, max_edges, gnn_layers):
 
 
 def centroid_distances(x):
-    """-> (N,) cosine distance of each row to the centroid direction of the set.
-
-    The torch twin of neighbour_cap.centroid_distances, which is numpy and runs on the CPU
-    over frozen reference lists. This one runs per training step on whatever device the
-    batch is on, so a round trip through numpy would cost a sync every step. The two must
-    agree.
-    """
+    """-> (N,) cosine distance of each row to the centroid direction of the set."""
     normed = F.normalize(x.float(), dim=1)
     centroid = F.normalize(normed.mean(0), dim=0)
     return ((1.0 - normed @ centroid) / 2.0).abs()
 
 
 def select_neighbour_rows(batch, max_tokens=NUM_NEIGHBOUR_TOKENS, seed_row=0):
-    """-> batch-local rows of the seed's 1-hop neighbours, closest to the centroid first.
-
-    The 1-hop neighbours of a seed are exactly the papers it cites: edge_index is stored
-    reversed (cited, citing), so the in-edges of `seed_row` are its references. graph.py's
-    main() asserts that direction against edges.csv.
-
-    Capped at `max_tokens` by the same centroid score the text prompt trims by
-    (neighbour_cap.rank_refs), so the graph arm and the text arm select the *same*
-    references and the comparison between them is about the encoding, not the sample.
-
-    Ordered closest-first because these become input embeddings and therefore receive RoPE
-    positions: position then encodes relevance rather than an arbitrary row order. It is a
-    choice, not a neutral default — a set is being given an order it does not have.
-
-    Batch size 1 only, which is BATCH_SIZE everywhere in this stage. A wider batch needs
-    padding and a per-seed mask, because k varies per node; the assert is here so that
-    change fails loudly rather than silently taking seed 0's neighbours for every row.
-    """
+    """-> batch-local rows of the seed's 1-hop neighbours, closest to the centroid first."""
     assert batch.batch_size == 1, (
         f"select_neighbour_rows handles batch_size 1, got {batch.batch_size}; k varies "
         f"per node, so a wider batch needs padding and a mask")
@@ -197,8 +126,7 @@ def main():
     loader = make_loader(data, splits["train"], args.batch_size, shuffle=False,
                          gnn_layers=args.gnn_layers)
     batch = next(iter(loader))
-    # Stage 3 substitutes a [MASK] vector at x[:batch_size], which is only correct
-    # if the seed nodes really are the first rows of the batch.
+    # The seed nodes must be the first rows: the [MASK] vector is placed at x[:batch_size].
     assert batch.n_id[:batch.batch_size].tolist() == splits["train"][:args.batch_size], \
         "seed nodes are not the first rows of the batch"
 
@@ -206,8 +134,7 @@ def main():
           f"{batch.num_nodes:,} nodes, {batch.num_edges:,} edges")
     print(f"  x {tuple(batch.x.shape)}, seed nodes at rows 0..{batch.batch_size - 1}")
 
-    # Direction is the thing that could silently be backwards: what the seed
-    # aggregates must be exactly the papers it cites in edges.csv.
+    # Check the direction: a seed aggregates exactly the papers it cites.
     import pandas as pd
     seed = splits["train"][0]
     one = next(iter(make_loader(data, [seed], batch_size=1, shuffle=False)))

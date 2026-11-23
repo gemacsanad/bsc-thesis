@@ -1,18 +1,4 @@
-"""Score both conditions and compare them paper by paper.
-
-Instruments, all against the paper's original abstract:
-  rougeL_f, bertscore_f1 — as in src/evaluation/evaluate_detailed.py (stemming; lang="en");
-  tfidf_rank            — identify.ranks within the 200 papers of this check (chance top-1 0.5%);
-  subfield, problem, task — the content-agreement call of evaluate_detailed.compare (0-3),
-                          judge gpt-5.4-mini; the call's other fields are kept but not used;
-  content               — the single content-agreement score: mean of subfield, problem, task.
-
-Writes <condition>/scored.csv and summary.csv (paired real - control, for each control
-condition `random` and `same_category`, on papers valid in both).
-
-Usage (from the repository root, so .env_local is found):
-    python experiments/2026-11-16_metric-check-random-citations/score.py
-"""
+"""Score both conditions and compare them paper by paper."""
 
 import os
 import sys

@@ -1,82 +1,11 @@
-"""
-Stage 5 — generate abstracts for a frozen evaluation set.
+"""Generate abstracts for the evaluation papers with a trained checkpoint.
 
-Produces one CSV per condition, over the same nodes, with the same prompts, in the same order:
+`--input` selects the vector the reader receives: `stage-a` (the GNN estimate, from
+`--stage-a-encoder`), `refs-mean` (the mean of the reference embeddings), `oracle` (the paper's
+own embedding) or `zero`. Without `--input`, a joint checkpoint uses its own GNN. Reruns are
+resumable: only node_ids missing from the output CSV are generated.
 
-    --mode baseline   frozen Qwen3-14B, nothing else                 -> generations.csv
-    --mode adapter    GraphSAGE + prefix adapter + frozen Qwen3-14B  -> generations.csv
-    --mode text       books only: frozen Qwen3-14B reading the co-purchased books as text,
-                      no prefix (text.book_text_example)
-
-Each mode writes into its own directory under experiments/; pass --output to name the run.
-
-Since the soft-prompt-only change (2026-09-16) the prompt carries no references, so
-`--mode baseline` receives no information about the paper at all: under greedy decoding it
-writes the same abstract for every node. It is a floor, not a control. The comparison arm for
-the graph-only adapter is the 2026-09-10 text-path Qwen baseline.
-
-The two runs differ in exactly one thing — whether a graph-conditioned KV prefix is present.
-Everything else is held fixed on purpose:
-
-  * **Prompts** come from `text.graph_only_example`, the same builder training used: one
-    fixed system message and user turn, identical for every node. Neither the target paper's
-    title nor any reference text is in it; the prefix is the only channel to the paper.
-  * **Greedy decoding** (`do_sample=False`) with `REPETITION_PENALTY`, from one `decoding`
-    dict shared by both branches so they cannot drift apart. The penalty is deterministic, so
-    reruns still reproduce; it is applied to both conditions, so the repair cannot be mistaken
-    for an adapter effect — but the degeneration it repairs is the adapter's (84 of its 945
-    outputs repeat a whole sentence, against 0 for the frozen LLM). Sampling noise would sit
-    on top of the effect being measured. The older `experiments/_archive/vicuna-7b-8bit`
-    baseline sampled (temperature 0.35); it is therefore not a drop-in comparison for these
-    two, which is why the frozen-LLM condition is regenerated here rather than reused.
-  * **bfloat16, not 8-bit.** The earlier Vicuna baseline was loaded in 8-bit, but
-    the adapter was trained against a bf16 model and its prefix is calibrated to those
-    numerics. Both conditions therefore run bf16, so quantisation error cannot be mistaken
-    for an adapter effect.
-  * **Batch size 1.** Padded batches combined with a pre-filled prefix cache were never
-    verified. One node at a time removes the
-    question entirely.
-
-Node sets
----------
-`--sets capped` (default) generates for the 945 nodes of `eval_nodes_capped.json`;
-`--sets legacy` for the older 495 nodes of `eval_nodes.json`. With no references in the prompt
-the choice selects nodes only. Only 2 nodes overlap, and a checkpoint records which sets it was
-trained on, so a mismatched pairing is refused rather than silently measured.
-
-Context overflow
-----------------
-The graph-only prompt is a few hundred tokens against a 4,096 context, so it cannot overflow.
-The budget check and its ERROR row are kept for that reason alone: if one ever fires, the
-prompt path has changed.
-
-Usage:
-    cd src/adapter
-    python generate.py --mode baseline --output ../../experiments/<run>/generations.csv
-    python generate.py --mode adapter  --output ../../experiments/<run>/generations.csv \
-                       --checkpoint ../../checkpoints/epoch2.pt
-
-Both are resumable: rerunning appends only the node_ids missing from the output CSV.
-
-Run 9 — what the adapter is fed
--------------------------------
-A run-9 checkpoint is a decoder trained on embedding-space vectors (train.py --oracle), so one
-checkpoint is evaluated several ways by changing only the vector, with `--input`:
-
-    oracle     the paper's own embedding — a ceiling, it sees the answer
-    refs-mean  the plain mean of its references' embeddings — the graph arm, no graph training
-    stage-a    head(GNN(neighbourhood)) from pretrain_encoder.py — does a GNN beat averaging?
-               (run 11's phase-2 GNN, fed to its phase-1 reader, is this arm)
-    zero       the zero vector — the floor; generated once and copied to every row
-
-    python generate.py --mode adapter --sets run9 --input refs-mean \
-        --checkpoint ../../checkpoints/qwen14b-run9-decoder/best.pt --output ...
-
-Run 11
-------
-A joint fine-tune checkpoint (train.py --reader) carries its GNN + head and loads with the
-default `--input encoder`. `--no-repeat-ngram 6` stops sentence loops at decoding time, and
-`--subset N` generates for a fixed random N of the eval papers — the loop-fix test.
+The commands used for the thesis are in hpc/komondor/jobs/run11_all.sh.
 """
 
 import argparse
@@ -104,25 +33,17 @@ from text import PROMPT, Corpus, book_text_example, graph_only_example
 SETS = {
     "capped": "eval_nodes_capped.json",
     "legacy": "eval_nodes.json",
-    # Run 9 trains on its own node set but is scored on the same 945 papers as every run.
+    # run9 trains on its own node set and is evaluated on the same 945 papers.
     "run9": "eval_nodes_capped.json",
     "children": "eval_nodes.json",   # DYTAG_DATASET=children
 }
 
-# Inputs that live in the embedding space an --oracle checkpoint was trained on. Any of them can
-# be fed to such a checkpoint; none of them to a checkpoint trained behind the graph encoder.
+# Inputs in the embedding space an --oracle checkpoint is trained on.
 EMBEDDING_INPUTS = ("oracle", "refs-mean", "stage-a", "zero")
 
 
 def remap_encoder(state):
-    """`conv1`/`conv2` -> `convs.0`/`convs.1` for checkpoints written before the encoder
-    became a ModuleList (4105279, 2026-08-19, the commit that added --gnn-layers).
-
-    Only the attribute name moved: at two layers both definitions build the same pair of
-    1024-wide `SAGEConv(aggr="mean")` layers, with relu and dropout between them and no
-    activation on the output. `state` is returned unchanged unless an old-style key is
-    actually present, so checkpoints from every run since 08-19 do not go through this.
-    """
+    """Rename `convN.` keys of older checkpoints to `convs.N-1.`."""
     if not any(re.match(r"conv\d+\.", key) for key in state):
         return state
     print("checkpoint predates the ModuleList encoder — remapping convN. -> convs.N-1.")
@@ -131,45 +52,28 @@ def remap_encoder(state):
 
 
 def load_adapter(path, device, sets, llm, oracle, embeddings):
-    """Restore the trained encoder and adapter from a `train.py` checkpoint.
-
-    Also returns the encoder depth, which is read off the checkpoint rather than passed in:
-    the same number has to build the encoder and set the loader's hop count, and there is no
-    reason to let the command line disagree with the weights being loaded.
-
-    If the checkpoint carries LoRA, it is injected into `llm` here. That is not optional and
-    there is no flag for it: the prefix was trained against those LLM weights, so generating
-    without them measures a prefix on a model it never saw — fluent text, no error.
-    """
+    """Restore the trained encoder and adapter from a `train.py` checkpoint."""
     checkpoint = torch.load(path, map_location=device)
-    # A capped-trained prefix evaluated on legacy prompts (or the reverse) produces fluent
-    # text from a neighbourhood the adapter was never calibrated on — silent, not an error.
-    was = checkpoint.get("sets", "legacy")   # checkpoints predating --sets are all legacy
+    was = checkpoint.get("sets", "legacy")
     assert was == sets, (
         f"{path} was trained on the '{was}' node sets but --sets is '{sets}'; "
         f"the nodes differ, so this pairing would not measure the trained adapter")
-    # A text-path Qwen checkpoint has the same shapes and would load cleanly, then be scored
-    # without the abstracts its prefix was trained to sit beside.
-    was_prompt = checkpoint.get("prompt", "text")   # predating PROMPT means abstracts were shown
+    was_prompt = checkpoint.get("prompt", "text")
     assert was_prompt == PROMPT, (
         f"{path} was trained with the '{was_prompt}' prompt but generation uses '{PROMPT}'")
-    # An oracle checkpoint has exactly the shapes of a graph one. Generating an oracle-trained
-    # prefix from graph vectors (or the reverse) is fluent and wrong, so it is refused here.
     was_oracle = checkpoint.get("oracle", False)
     assert was_oracle == oracle, (
         f"{path} was trained {'with' if was_oracle else 'without'} --oracle but generation "
         f"has --oracle {'set' if oracle else 'not set'}; the adapter would be fed a kind of "
         f"vector it was never trained on")
-    # Whitened and raw node features have identical shapes (run 8), so a
-    # mismatch loads cleanly and runs a trained encoder on a distribution it has never seen.
     was_features = checkpoint.get("node_embeddings", "node_embeddings.npy")
     assert was_features == os.path.basename(embeddings), (
         f"{path} was trained on {was_features} but --features loads "
         f"{os.path.basename(embeddings)}; the adapter would be fed a feature "
         f"distribution it was never trained on")
-    gnn_layers = checkpoint.get("gnn_layers", 2)   # predating --gnn-layers means 2-layer
-    gnn_conv = checkpoint.get("gnn_conv", "sage")  # everything before stage 9 was GraphSAGE
-    # Run 11's joint checkpoint stores GNN + head (model.EmbeddingEstimator) as its encoder.
+    gnn_layers = checkpoint.get("gnn_layers", 2)
+    gnn_conv = checkpoint.get("gnn_conv", "sage")
+    # A joint checkpoint stores GNN + head (model.EmbeddingEstimator) as its encoder.
     if checkpoint.get("joint", False):
         encoder = EmbeddingEstimator(num_layers=gnn_layers, conv=gnn_conv).to(device)
         encoder.load_state_dict(checkpoint["encoder"])
@@ -181,9 +85,6 @@ def load_adapter(path, device, sets, llm, oracle, embeddings):
     encoder.eval()
     adapter.eval()
 
-    # Read off the checkpoint, never off config.py: the neighbour-token width is part of the
-    # sequence the prefix was trained beside, so a run generated at a different k would be
-    # fluent and wrong. `strict` loading also catches a checkpoint whose ntoken is absent.
     ntoken = None
     n_tokens = checkpoint.get("neighbour_tokens", 0)
     if n_tokens:
@@ -194,8 +95,7 @@ def load_adapter(path, device, sets, llm, oracle, embeddings):
     lora = checkpoint.get("lora")     # None for every checkpoint trained without --lora
     if lora is not None:
         from lora import add_lora, load_lora_state, targets_of
-        # Read off the checkpoint: run 9 moved config.LORA_TARGETS to q/v, and steps 6-8 used
-        # q/k/v. Taking them from config.py would refuse those checkpoints.
+        # The LoRA targets are read from the checkpoint, not from config.py.
         add_lora(llm, targets_of(lora))
         load_lora_state(llm, lora)
 
@@ -207,20 +107,7 @@ def load_adapter(path, device, sets, llm, oracle, embeddings):
 
 
 def load_stage_a(path, device, embeddings):
-    """-> (vector function, encoder depth) for run 9's `--input stage-a` arm.
-
-    A pretrain_encoder.py checkpoint: the GNN reads the masked neighbourhood and a linear head
-    maps its seed output into the (whitened) embedding space, trained by InfoNCE + VICReg
-    against the seed's own embedding. The HEAD IS LOADED. Run 8 discarded it and fed the
-    adapter the raw GNN output, which was 0.85 collinear across papers; the head output is the
-    tensor Stage A actually decorrelated, and the one that lives in the space the run-9
-    decoder was trained on. Normalised, because every other vector that decoder sees is.
-
-    Stage A trained on whatever config.NODE_EMBEDDINGS was at the time; run 8's encoders
-    (encoder-*-vicreg.pt) were trained on the whitened features, as run 9 is, and record
-    nothing. Run 11's record which, and a mismatch with `embeddings` is refused: the head would
-    map a feature distribution it never saw into the decoder's space.
-    """
+    """-> (vector function, encoder depth) for the `--input stage-a` arm (the GNN estimate)."""
     pre = torch.load(path, map_location=device)
     was = pre.get("node_embeddings", "node_embeddings_whitened.npy")
     assert was == os.path.basename(embeddings), (
@@ -243,20 +130,7 @@ def load_stage_a(path, device, embeddings):
 @torch.no_grad()
 def iter_prefixes(node_ids, encoder, adapter, ntoken, data, device, gnn_layers, oracle=False,
                   vector=None):
-    """Yield `(node_id, prefix, neighbour_tokens)` for each node, in the order given.
-
-    Both tensors are None in baseline mode; `neighbour_tokens` is also None for a checkpoint
-    trained without them. The two come out of ONE encoder pass, the same way training builds
-    them, so the pooled prefix and the neighbour tokens can never describe different
-    neighbourhoods.
-
-    In adapter mode the order comes from `NeighborLoader(shuffle=False)`, and the node_id is
-    read back off the batch rather than assumed, so a row can never be paired with another
-    node's neighbourhood.
-
-    `vector` (run 9) replaces the encoder: a function of the batch returning the
-    embedding-space vector to feed the adapter (refs-mean, stage-a, zero).
-    """
+    """Yield `(node_id, prefix, neighbour_tokens)` for each node, in the order given."""
     if encoder is None:
         for node_id in node_ids:
             yield node_id, None, None
@@ -339,11 +213,6 @@ def main():
     if args.subset:
         order = torch.randperm(len(eval_nodes), generator=torch.Generator().manual_seed(SEED))
         eval_nodes = [eval_nodes[i] for i in sorted(order[:args.subset].tolist())]
-    # clean=False: the evaluation golds stay byte-identical to all eight earlier runs, so the
-    # scores remain comparable. Training cleans its targets (text.clean_abstract) because the
-    # prompt instructs "no markup, mathematical notation or headings" while 13.5% of the
-    # targets carried exactly that — but cleaning what the generations are SCORED against
-    # would silently move every number in experiments/.
     corpus = Corpus(clean=False)
     source_id = pd.read_csv(os.path.join(JOINT_DIR, "nodes.csv"),
                             usecols=["node_id", SOURCE_ID]).set_index("node_id")[SOURCE_ID]
@@ -376,22 +245,14 @@ def main():
                   "own embedding.\nThis arm sees the answer. Its score is a ceiling on the "
                   "prefix channel,\nnever a result, and is not comparable to any arm that "
                   "does not see the target.\n" + "=" * 78, flush=True)
-        # `gate0` is the ablation validate() runs every epoch, carried through to generation:
-        # the same weights, the same LoRA, with the graph disconnected from the prefix. Under
-        # LoRA it is the honest control, since the frozen-Vicuna arm differs by two things.
         if args.mode == "gate0":
             with torch.no_grad():
                 adapter.gate.zero_()
-                # Both channels, or this stops being the "no graph" arm: with the neighbour
-                # tokens still open, zeroing only the prefix would leave the graph's larger
-                # channel running and the control would measure nothing it claims to.
                 if ntoken is not None:
                     ntoken.gate.zero_()
             print("both gates forced to zero — prefix and neighbour tokens are "
                   "node-independent from here on")
         if args.mode == "ngate0":
-            # Not a no-op on a pooled-only checkpoint — it would be the *adapter* arm under
-            # another name, and land in a directory labelled as an ablation.
             assert ntoken is not None, (
                 f"--mode ngate0 needs a checkpoint trained with neighbour tokens; "
                 f"{args.checkpoint} has none")
@@ -407,13 +268,10 @@ def main():
         elif args.input == "stage-a":
             vector, gnn_layers = load_stage_a(args.stage_a_encoder, device,
                                               FEATURES[args.features])
-        # The neighbour tokens are prefilled into the cache before generate() sees it, so the
-        # cache runs P..P+k long and k varies with the node's out-degree.
         patch_for_prefix(llm, NUM_PREFIX_TOKENS,
                          max_extra=ntoken.max_tokens if ntoken is not None else 0)
 
-    # After any LoRA injection: peft builds its modules in train mode, and lora_dropout would
-    # otherwise be live at generation time, making greedy decoding non-deterministic.
+    # peft builds its modules in train mode; eval() turns LoRA dropout off for generation.
     llm.eval()
 
     # --- resume -----------------------------------------------------------
@@ -431,17 +289,11 @@ def main():
         writer.writeheader()
 
     # --- generate ---------------------------------------------------------
-    # The prefix occupies real attention positions, so it is charged against the context in
-    # both modes — the two CSVs must overflow on the same nodes to stay comparable.
-    # The neighbour tokens occupy real attention positions too, so the whole graph side is
-    # charged against the context: P + k + prompt + generation must fit MAX_LENGTH.
     budget = (MAX_LENGTH - NUM_PREFIX_TOKENS - args.max_new_tokens
               - (ntoken.max_tokens if ntoken is not None else 0))
     overflowed = 0
     constant, floor_texts = None, []
 
-    # One dict for both branches: the conditions must not drift apart in how they decode, and
-    # `generate_with_prefix` forwards **kwargs straight to `generate()`, so they cannot.
     decoding = dict(max_new_tokens=args.max_new_tokens, do_sample=False,
                     repetition_penalty=REPETITION_PENALTY,
                     no_repeat_ngram_size=args.no_repeat_ngram,
@@ -464,8 +316,6 @@ def main():
 
         if constant is not None:
             # --input zero: prompt and prefix are both node-independent, so greedy decoding
-            # writes one string for every node. It was generated twice and checked equal
-            # (below); the remaining ~7 GPU-hours would only reproduce it.
             generated = constant
         elif n_tokens > budget:
             overflowed += 1

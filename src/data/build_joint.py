@@ -1,38 +1,9 @@
-"""
-Join the ogbn-arxiv dataset (data/raw/ogbn_arxiv/{nodes,edges}.csv) with the
-S2-expanded subset (data/processed/s2/{papers_filtered,references_subset}.parquet)
-into a single data/processed/joint/{nodes,edges}.csv pair, in the same CSV format
-as the ogbn-arxiv files.
-
-Node id scheme
---------------
-Original ogbn-arxiv node_ids (0..169342) are kept exactly as-is (same
-row order too), so data/processed/joint/nodes.csv stays index-compatible with
-existing node_id-keyed artifacts (node_features.npy, splits.json, ...)
-for the "core" subset. New S2-only nodes (papers referenced by ogbn-arxiv
-nodes but not themselves ogbn-arxiv nodes) get fresh sequential ids
-starting at 169343, assigned in sorted mag_id order for reproducibility.
-
-Node attribute priority
-------------------------
-`label` is dropped (not needed downstream). A new boolean `core` column
-marks whether the node is one of the original ogbn-arxiv nodes. Where a
-mag_id exists in both datasets, ogbn-arxiv's own title/abstract/year are
-kept (ogbn takes priority over S2) - the S2 copy of that paper is not
-used at all.
-
-Edge direction
---------------
-Verified empirically (matching a sample of ogbn edges.csv through mag_id
-into references_subset.parquet) that both files use the same citation
-direction: (src, dst) / (citing_mag_id, cited_mag_id) both mean
-"src/citing cites dst/cited". So no direction flip is needed - edges are
-just unioned after mapping references_subset's mag_id pairs to node_ids
-via the combined mag_id -> node_id mapping built above.
+"""Join ogbn-arxiv with the papers it cites from Semantic Scholar into one graph,
+data/processed/joint/{nodes,edges}.csv. The ogbn-arxiv node ids are kept; new papers get ids
+from 169343.
 
 Usage:
     python build_joint.py
-    python build_joint.py --ogbn-dir ../../data/raw/ogbn_arxiv
 """
 
 import argparse

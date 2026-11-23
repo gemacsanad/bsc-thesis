@@ -1,35 +1,17 @@
 Bootstrap: docker
 From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
-# Same base as adapter-gpu.def, deliberately. Qwen3 needs transformers >= 4.51, and the
-# worry was that a modern transformers would force a newer torch — which would force new
-# torch_scatter / torch_sparse wheels, the one thing here that fails at import rather than
-# at runtime. It does not: transformers 4.51.3 declares no torch pin at all (only
-# huggingface-hub >= 0.30, tokenizers >= 0.21 < 0.22, numpy >= 1.17, safetensors >= 0.4.3).
-# So torch, CUDA, numpy<2 and both compiled extensions below are unchanged from the Vicuna
-# image, and the only moving part is the transformers stack.
+# Qwen3 needs transformers >= 4.51, which works on this torch 2.2 base image.
 
 %labels
     Author gemacsanad
-    Description adapter GPU container - GraphSAGE prefix adapter over a frozen Qwen3-14B
+    Description GNN estimator and prefix adapter over Qwen3-14B
 
 %post
     set -e
 
-    # transformers is pinned exactly, for the same reason 4.39.3 was: the past_key_values
-    # injection in adapter/train.py and adapter/prefix_generation.py depends on Cache
-    # internals (DynamicCache, cache_position, _update_causal_mask) that move between
-    # versions. 4.51.3 is the last of the 4.51 line, the first line with native Qwen3
-    # support — below 4.51.0 the config raises KeyError: 'qwen3'.
-    #
-    # peft and accelerate are contemporaries of it by release date (0.15.2 landed one day
-    # after 4.51.3, 1.6.0 two weeks before), not the newest available. They are not used by
-    # this run — LoRA is off — but verify_lora_prefix.py has to import, and Stage 6d should
-    # not cost another rebuild.
-    #
-    # sentencepiece and protobuf are kept even though Qwen3 uses a BPE tokenizer: they are
-    # what lets the *Vicuna* tokenizer load in here, and the frozen reference lists in
-    # data/frozen/prompt_refs_capped.json are defined by that tokenizer. Dropping them would
-    # lock any re-verification of the freeze out of this image.
+    # transformers is pinned exactly: the prefix is written into the KV cache, whose internals
+    # change between versions. 4.51 is the first line with Qwen3 support.
+    # sentencepiece and protobuf load the Vicuna tokenizer the frozen reference lists use.
     pip install --no-cache-dir \
         transformers==4.51.3 \
         accelerate==1.6.0 \
@@ -39,20 +21,9 @@ From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
         pandas==2.2.2 \
         wandb==0.28.0
 
-    # NeighborLoader needs a sampler backend — either pyg-lib or torch-sparse. The
-    # environment the adapter was verified in uses torch-sparse, so mirror that rather
-    # than introduce an untested one. Both are compiled extensions and must come from
-    # the PyG index for this exact torch/CUDA build; the full local version is pinned so
-    # a missing wheel fails immediately instead of falling back to a source build.
-    # "numpy<2" is a guard: scipy arrives as a torch-sparse dependency and must not drag
-    # numpy past the 1.x the base image's torch is built against.
-    #
-    # ⚠ Komondor's login node cannot resolve data.pyg.org (DNS failure) while PyPI works,
-    # so this step is the one that can fail on a fresh build. Do NOT "fix" it by dropping
-    # the +pt22cu121 local version: PyPI carries only the source distribution, which would
-    # compile CPU-only kernels with no GPU present at build time — a silent degradation,
-    # not an error. If the index is unreachable, stage the two wheels locally instead and
-    # point pip at the directory (-f /wheels), keeping these exact pins.
+    # NeighborLoader needs a sampler backend (torch-sparse), built for this exact torch/CUDA.
+    # numpy<2 matches the torch of the base image. If data.pyg.org is unreachable, stage the
+    # wheels locally and keep these pins; the PyPI source build would be CPU-only.
     pip install --no-cache-dir "numpy<2" \
         torch_scatter==2.1.2+pt22cu121 \
         torch_sparse==0.6.18+pt22cu121 \
@@ -60,8 +31,7 @@ From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
     pip install --no-cache-dir torch_geometric==2.8.0
 
-    # Run 9: train.py ranks generated validation text against its golds by TF-IDF (identify.py),
-    # the same instrument the analysis scripts use. "numpy<2" for the same reason as above.
+    # TF-IDF identification during training (identify.py).
     pip install --no-cache-dir "numpy<2" scikit-learn==1.4.2
 
 %environment
@@ -82,22 +52,12 @@ print('torch', torch.__version__, '| numpy', numpy.__version__,
       '| wandb', wandb.__version__)
 print('sampler backend: pyg_lib', t.WITH_PYG_LIB, '| torch_sparse', t.WITH_TORCH_SPARSE)
 
-# The compiled extensions load and run, not merely import — a wheel built against a
-# different torch fails here rather than as a bad neighbour sample in a queued job.
+# The compiled extensions must load, not just import.
 import torch_scatter, torch_sparse
 print('torch_scatter', torch_scatter.__version__, '| torch_sparse', torch_sparse.__version__)
 
-# Qwen3 on this torch, end to end on CPU: builds, runs, and returns a real per-layer KV
-# cache with grouped heads. The prefix adapter writes one (key, value) pair per layer into
-# that cache, so a model whose cache is not per-layer, or whose kv-head count is not what
-# config says, would break the whole mechanism silently. Tiny random weights are enough —
-# what is under test is the plumbing, not the model.
-#
-# sliding_window is set to None explicitly: Qwen3Config *defaults* it to 4096, but the real
-# Qwen3-14B ships sliding_window: null / use_sliding_window: false, and that is load-bearing.
-# A windowed layer would let prefix positions fall outside attention as generation advances,
-# which is the second of the two properties that made Qwen3 the choice at all. Left at the
-# default this test would also emit a misleading 'Sliding Window Attention is enabled' warning.
+# A tiny random Qwen3 on CPU: one (key, value) cache entry per layer, with grouped KV heads.
+# sliding_window off, as in Qwen3-14B; a window would drop the prefix from attention.
 cfg = Qwen3Config(vocab_size=256, hidden_size=64, intermediate_size=128,
                   num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
                   head_dim=16, sliding_window=None, use_sliding_window=False)

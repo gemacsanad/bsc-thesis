@@ -1,29 +1,9 @@
-"""
-Expand the ogbn-arxiv node set with its "missing" references (papers the
-ogbn-arxiv nodes cite that aren't themselves ogbn-arxiv nodes), using the
-mag_id-keyed papers.parquet / references.parquet built by build_dataset.py.
-
-Pipeline:
-  1. ogbn_ids       <- distinct mag_id from data/raw/ogbn_arxiv/nodes.csv
-  2. new_ref_ids    <- DISTINCT cited_mag_id FROM references
-                       WHERE citing_mag_id IN ogbn_ids
-                       (i.e. every paper referenced by an ogbn-arxiv node)
-  3. combined_ids   <- ogbn_ids UNION new_ref_ids
-  4. papers_filtered.parquet
-                    <- rows of papers.parquet whose mag_id IN combined_ids
-  5. references_subset.parquet
-                    <- rows of references.parquet where BOTH citing_mag_id
-                       and cited_mag_id are in papers_filtered (i.e. every
-                       edge between any two nodes that made it into
-                       papers_filtered.parquet, not just the ones
-                       discovered in step 2)
+"""Keep the ogbn-arxiv papers and every paper they cite, and the references between them.
 
 Usage:
-    python filter_ogbn_references.py \
-        --nodes-csv /path/to/data/raw/ogbn_arxiv/nodes.csv \
-        --papers /path/to/data/processed/s2/papers.parquet \
-        --references /path/to/data/processed/s2/references.parquet \
-        --out-dir /path/to/data/processed/s2
+    python filter_ogbn_references.py --nodes-csv <ogbn_arxiv/nodes.csv> \
+        --papers <processed/s2/papers.parquet> --references <processed/s2/references.parquet> \
+        --out-dir <processed/s2>
 """
 
 import argparse

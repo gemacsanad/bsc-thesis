@@ -1,24 +1,4 @@
-"""
-Soft-prompt-only, step 0 — prove the prompt train.py and generate.py build is the one intended.
-
-With no references in the prompt there
-is no frozen bibliography to check against; what is left to go wrong silently is:
-
-  1. the chat wrapper — `apply_chat_template` derives it from tokenizer_config, so a tokenizer
-     update would move the prompt of every node in both arms without a word. The finished
-     string is written out below and compared exactly;
-  2. the prompt leaking the paper — it must contain no reference block and none of the
-     target's own abstract;
-  3. the training target — every frozen node needs a non-empty abstract (an empty one trains
-     on a lone EOS), the labels must mask exactly the prompt, and prompt + target + prefix
-     must fit MAX_LENGTH.
-
-Every frozen train / valid / eval node is checked; with a constant prompt that takes seconds.
-
-Usage:
-    cd src/adapter
-    python verify_graph_only_prompt.py
-"""
+"""Check that train.py and generate.py build the same, intended prompt for every paper."""
 
 import argparse
 import json
@@ -30,8 +10,7 @@ from config import (BASE_MODEL, CLEAN_TARGETS, DATASET, FROZEN_DIR, MAX_LENGTH,
                     MAX_NEW_TOKENS, NUM_PREFIX_TOKENS)
 from text import GRAPH_ONLY_SYSTEM, GRAPH_ONLY_USER, Corpus, encode, graph_only_example
 
-# The `<think>\n\n</think>\n\n` is not a mistake: `enable_thinking=False` emits an empty,
-# already-closed block, which is how Qwen3 is told to answer directly.
+# The empty <think> block is how enable_thinking=False tells Qwen3 to answer directly.
 EXPECTED = ("<|im_start|>system\n" + GRAPH_ONLY_SYSTEM + "<|im_end|>\n"
             "<|im_start|>user\n" + GRAPH_ONLY_USER + "<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n")

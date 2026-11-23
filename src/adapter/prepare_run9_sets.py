@@ -1,26 +1,7 @@
-"""
-Run 9 — the node set the embedding -> abstract decoder is trained on.
-
-Every train-split core paper, instead of the 7,750 sampled into training_sets_capped.json.
-Those 7,750 were sampled to a context budget and an out-degree quota, both inherited from the
-text arm; the decoder reads one embedding, so neither applies. The step-4 oracle saw 7,750
-papers ten times each; run 9 sees ~90k papers about once, at roughly the same compute, so the
-run measures variety rather than more training.
-
-Removed, and counted:
-  * the 945 eval and 806 validation seeds (none are train-split anyway; asserted, not assumed)
-  * abstracts under 30 words — rank.MIN_CANDIDATE_WORDS, the stub threshold run 8 already uses
-  * near-duplicates of an eval paper: same normalised title, or raw voyage cosine > 0.95 to
-    one. A training target that IS an eval paper under another id would be a leak the oracle
-    arm could not be blamed for.
-
-The validation nodes are kept from training_sets_capped.json unchanged, so the canary and the
-identifiability set are the papers every earlier run validated on.
-
-CPU only, ~1-2 minutes, ~0.6 GB: the 90k embedding rows are read through a memmap.
+"""Build the training set of the reader: every train-split paper with an abstract of at least
+30 words, excluding the evaluation and validation papers.
 
 Usage:
-    cd src/adapter
     python prepare_run9_sets.py            # writes data/frozen/training_sets_run9.json
 """
 

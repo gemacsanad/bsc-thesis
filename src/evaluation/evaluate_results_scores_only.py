@@ -1,25 +1,8 @@
-"""
-evaluate_results_scores_only.py
-
-Scores generated abstracts with ROUGE, BERTScore and an LLM judge that returns only numeric
-scores, with no free-text reasoning.
-
-Metrics added per row:
-  rouge1_f, rouge2_f, rougeL_f          — ROUGE F1 scores
-  bertscore_p, bertscore_r, bertscore_f1 — BERTScore
-  llm_accuracy  (1-10)                   — alignment with original objective/domain/methods
-  llm_coherence (1-10)                   — logical flow from problem to solution
-  llm_language  (1-10)                   — scientific register, terminology, no fluff
-
---dataset children scores children's book descriptions in the same three columns.
-
-Requires OPENAI_API_KEY in .env (or environment).
+"""ROUGE and BERTScore of generated abstracts against the original abstracts.
 
 Usage:
-    python evaluate_results_scores_only.py [--input test_results.csv] [--output evaluated_results_scores_only.csv]
-
-Install dependencies:
-    pip install rouge-score bert-score openai python-dotenv pandas torch
+    python evaluate_results_scores_only.py --no_llm --input <run>/generations.csv \
+        --output <run>/evaluated_result.csv
 """
 
 import argparse
@@ -37,8 +20,6 @@ from openai import (APIConnectionError, APITimeoutError, InternalServerError, Op
 load_dotenv(".env_local")
 
 # ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--input",  default="generations.csv")
 parser.add_argument("--output", default="scored_scores_only.csv")
@@ -55,8 +36,6 @@ parser.add_argument("--bertscore_batch_size", type=int, default=32,
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
-# Load
-# ---------------------------------------------------------------------------
 df = pd.read_csv(args.input)
 is_valid = (
     df["generated_abstract"].notna()
@@ -64,8 +43,6 @@ is_valid = (
 )
 print(f"Rows: {len(df)} total | {is_valid.sum()} valid | {(~is_valid).sum()} skipped (generation errors)")
 
-# ---------------------------------------------------------------------------
-# ROUGE
 # ---------------------------------------------------------------------------
 print("\nComputing ROUGE …")
 rouge = rs_lib.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
@@ -79,8 +56,6 @@ for idx, row in df[is_valid].iterrows():
     }
 print(f"  Done ({len(rouge_data)} rows).")
 
-# ---------------------------------------------------------------------------
-# BERTScore
 # ---------------------------------------------------------------------------
 print("\nComputing BERTScore (first run downloads ~1 GB model) …")
 valid_df   = df[is_valid].copy()
@@ -105,8 +80,6 @@ bertscore_data: dict[int, dict] = {
 print(f"  Done ({len(bertscore_data)} rows).")
 
 # ---------------------------------------------------------------------------
-# LLM judge — load existing scores for resume support
-# ---------------------------------------------------------------------------
 LLM_COLS = ["llm_accuracy", "llm_coherence", "llm_language"]
 
 llm_cache: dict[int, dict] = {}
@@ -119,8 +92,7 @@ if os.path.exists(args.output):
             llm_cache[nid] = {c: r.get(c) for c in LLM_COLS}
     print(f"\nLoaded {len(llm_cache)} cached LLM scores — will skip those rows.")
 
-# A stalled request otherwise waits the SDK default of 600 s, three times, and the run looks
-# frozen. Retries are handled in call_judge instead.
+# Fail fast; retries are handled in call_judge.
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"], timeout=60, max_retries=0)
 
 _JUDGE_SYSTEM = """\
@@ -143,10 +115,6 @@ background problem to a proposed solution, or does it feel like a disjointed lis
 domain terminology, appropriate passive/active voice, and absence of generic conversational fluff.\
 """
 
-# Children's books, in the same shape as the paper prompt. Accuracy names the aspects where the
-# GNN+LLM arms differ from the baselines: the specific
-# subject, the names, and the kind of book; review boilerplate is excluded because it gave the
-# GNN arms a false lead on names.
 _BOOK_JUDGE_SYSTEM = """\
 You are an experienced children's book editor. Given an original book description and a generated \
 description for the same book, evaluate the generated description on three metrics. \
@@ -201,8 +169,6 @@ def call_judge(original: str, generated: str, retries: int = 6) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Build output rows
-# ---------------------------------------------------------------------------
 print("\nRunning LLM judge …")
 
 rows = []
@@ -250,19 +216,12 @@ for idx, row in df.iterrows():
     rows.append(out)
 
 # ---------------------------------------------------------------------------
-# Add neighbor count — out-degree computed from the joint edges.csv (src cites
-# dst, so out-edges are the paper's own references). nodes_subset.csv only
-# covers the old 200-node test set, so joining against it leaves most rows
-# empty for the current eval sets.
-# ---------------------------------------------------------------------------
 edges = pd.read_csv(args.edges, usecols=["src_node_id"])
 out_degree = edges.groupby("src_node_id").size()
 df = pd.DataFrame(rows)
 df["num_of_neighbors"] = df["node_id"].map(out_degree).fillna(0).astype(int)
 print(f"num_of_neighbors added for {df['num_of_neighbors'].notna().sum()}/{len(df)} rows.")
 
-# ---------------------------------------------------------------------------
-# Save
 # ---------------------------------------------------------------------------
 df.to_csv(args.output, index=False)
 print(f"\nDone. Results written to {args.output}")

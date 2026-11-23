@@ -9,14 +9,8 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/s2_download_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Downloads the full Semantic Scholar bulk dataset (papers/abstracts/citations)
-# and joins it into mag_id-keyed papers.parquet / references.parquet.
-#
-# Runs on the "bigdata" partition rather than the "ai" GPU partition used by
-# run_generate.sh/run_train_graphsage_full.sh: this job is CPU/I/O-bound (no
-# GPU needed), and unlike the "ai" compute nodes, bigdata nodes have internet
-# access, so the download can run as a normal sbatch job instead of on the
-# login node.
+# Downloads the Semantic Scholar bulk datasets and joins them into papers.parquet and
+# references.parquet. Runs on the "bigdata" partition, whose nodes have internet access.
 
 set -euo pipefail
 
@@ -29,17 +23,10 @@ VENV_DIR=$BASE_DIR/.venv_s2_download
 
 mkdir -p "$RAW_DIR" "$PROC_DIR" "$BASE_DIR/logs"
 
-# The node's default python3 is too old for duckdb>=0.10 (only wheels up to
-# 0.8.1 are available for it), so load a newer Python module first.
+# The default python3 is too old for duckdb>=0.10.
 module load cray-python/3.11.7
 
-# Set up a small venv for the download scripts (requests/duckdb/dotenv only)
-# - lightweight enough not to need the GPU singularity container used by
-# run_generate.sh/run_train_graphsage_full.sh.
-# Use a marker file (only touched after a successful `pip install`) rather
-# than just checking the venv directory exists, so a venv left behind by a
-# previous run that failed mid-install (e.g. missing packages) gets rebuilt
-# instead of being reused as-is.
+# A small venv for the download scripts; the marker file is written only after a successful install.
 SETUP_MARKER="$VENV_DIR/.setup_complete"
 if [ ! -f "$SETUP_MARKER" ]; then
     rm -rf "$VENV_DIR"

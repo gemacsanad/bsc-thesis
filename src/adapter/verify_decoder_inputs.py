@@ -1,15 +1,4 @@
-"""
-Run 9 — CPU checks for everything new between the graph and the decoder.
-
-Each of these, if wrong, produces a run that trains and generates fluent text: a noise model
-that misses its cosine, a "reference mean" that includes the paper itself (a silent leak), an
-epoch slicer that repeats nodes, a scorer that ranks an empty string first. So each is checked
-on a synthetic graph, in seconds, before any GPU time — with a negative control where the check
-could otherwise pass vacuously.
-
-Usage:
-    cd src/adapter && python verify_decoder_inputs.py      # exits non-zero on any failure
-"""
+"""CPU checks of the inputs the reader receives: features, reference means and node sets."""
 
 import os
 import tempfile
@@ -48,8 +37,6 @@ check(abs(cos.mean() - 0.65) < 0.02 and abs(cos.median() - 0.65) < 0.03,
 check((corrupt_to_cosine(v, 1.0) - v).abs().max() < 1e-5, "min_cos 1.0 is the identity")
 
 # --- a synthetic reference graph -----------------------------------------------------------
-# Paper 0 cites 1, 2, 3; paper 1 cites 4; paper 5 cites nothing. 4 also cites 0 (a mutual
-# citation two hops out), which must not pull the seed's own row into its reference mean.
 citing_cited = [(0, 1), (0, 2), (0, 3), (1, 4), (4, 0)]
 x = F.normalize(torch.randn(6, 1024), dim=1)
 edge_index = torch.tensor([[c for _, c in citing_cited], [s for s, _ in citing_cited]])
@@ -74,7 +61,7 @@ seeds_only = next(iter(make_loader(data, [0, 1], 2, shuffle=False, hops=0)))
 check(seeds_only.num_nodes == 2 and seeds_only.edge_index.numel() == 0,
       "hops=0 returns the seeds alone (oracle training loads no neighbourhoods)")
 
-# --- run 10a: half the training papers are fed their reference mean -------------------------
+# --- REFS_MIX: a share of the training papers are fed their reference mean --------------------
 both = next(iter(make_loader(data, [0, 5], 2, shuffle=False, hops=1)))
 own = oracle_vector(both)
 draws = [mix_in_refs(both, own, 0.5) for _ in range(400)]
@@ -86,7 +73,7 @@ check(all(torch.equal(d[1], own[1]) for d in draws),
       "a paper with no references keeps its own embedding, never a zero vector")
 check(torch.equal(mix_in_refs(both, own, 0.0), own), "fraction 0 is the plain oracle")
 
-# --- the Stage-A arm loads the head, and normalises -------------------------------------------
+# --- the GNN-estimate arm loads the head, and normalises ---------------------------------------
 encoder, head = GraphEncoder(), nn.Linear(OUT_CHANNELS, OUT_CHANNELS)
 with tempfile.TemporaryDirectory() as tmp:
     path = os.path.join(tmp, "stage_a.pt")

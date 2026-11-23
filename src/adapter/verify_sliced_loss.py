@@ -1,30 +1,4 @@
-"""
-Stage 7, step 6 — prove the sliced `lm_head` computes the same loss as `labels=`.
-
-`step_loss` no longer asks the LLM for its own loss. It takes hidden states from `llm.model`
-and runs `lm_head` on the ~250 positions that actually carry a label, instead of on all ~3,400.
-The motive is memory: Qwen3's vocabulary is 151,936 tokens, 4.75× Vicuna's, and the discarded
-logits are what pushes a 29.6 GB model past a 40 GB card.
-
-The motive is memory, but the risk is arithmetic, and it is silent in the usual way. An
-off-by-one in the shift, a mean taken over the wrong denominator, or padding leaking into the
-selection all produce a plausible loss that falls during training. Nothing raises. So the claim
-"mathematically identical" is checked here against the `labels=` path itself rather than argued.
-
-Three checks, on a 4-layer random Qwen3 on CPU in float32 — the weights are irrelevant, only
-the bookkeeping is under test:
-
-  1. equivalence, no prefix — isolates the slicing from the injection;
-  2. equivalence through `PrefixCache`, the exact call `step_loss` makes;
-  3. padding neutrality — a right-padded batch of two unequal sequences must give the
-     token-weighted mean of the same two computed singly. This is the Stage-4 check, re-run
-     because the selection now indexes the label tensor directly, where a padded row would
-     be a wrong answer rather than an error.
-
-Usage:
-    cd src/adapter
-    python verify_sliced_loss.py     # ~10 s on a laptop CPU
-"""
+"""Check that the sliced `lm_head` computes the same loss as `labels=`."""
 
 import torch
 from transformers import Qwen3Config, Qwen3ForCausalLM
@@ -61,8 +35,7 @@ def our_loss(llm, input_ids, labels, mask, cache=None, cache_position=None):
 def main():
     torch.manual_seed(0)
 
-    # float32, not bf16: the tolerance is meant to catch a wrong denominator or a shifted
-    # window, and bf16 rounding would swamp both. sliding_window pinned off to match Qwen3-14B.
+    # float32, so bf16 rounding does not hide a wrong denominator or a shifted window.
     config = Qwen3Config(vocab_size=256, hidden_size=64, intermediate_size=128,
                          num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
                          head_dim=16, sliding_window=None, use_sliding_window=False)
@@ -95,8 +68,6 @@ def main():
     print(f"with prefix: {want.item():.6f} vs {got.item():.6f}  (error {error:.1e})")
 
     # --- 3. padding neutrality ------------------------------------------------
-    # Right-padded, exactly as collate() builds a batch: pad_token_id in input_ids, -100 in
-    # labels, zeros in the mask over the padding.
     singles = [make_example(config, n) for n in (40, 72)]
     width = max(ids.size(1) for ids, _ in singles)
 

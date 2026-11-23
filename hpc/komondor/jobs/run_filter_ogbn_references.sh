@@ -9,15 +9,8 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/s2_filter_ogbn_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Expands the ogbn-arxiv node set with the references those nodes make
-# (via the full data/processed/s2/references.parquet citation graph built
-# by run_download_dataset.sh) and writes papers_filtered.parquet /
-# references_subset.parquet.
-#
-# CPU/DuckDB-only (no GPU, no internet needed) - runs on "bigdata" purely
-# for the CPU/memory sizing, reusing the venv set up by
-# run_download_dataset.sh (must have been run at least once already so
-# data/processed/s2/{papers,references}.parquet exist).
+# Keeps the ogbn-arxiv papers and the papers they cite: papers_filtered.parquet and
+# references_subset.parquet. CPU only; run after run_download_dataset.sh, reusing its venv.
 
 set -euo pipefail
 

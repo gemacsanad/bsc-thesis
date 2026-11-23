@@ -1,7 +1,4 @@
-"""
-Usage:
-    python adapter/text.py          # freeze the subsets (needs the Vicuna tokenizer)
-"""
+"""The corpus, the prompt of the reader and the construction of the frozen node sets."""
 
 import argparse
 import json
@@ -17,24 +14,8 @@ from config import (BASE_MODEL, DATASET, FROZEN_DIR, GENERATION_RESERVE, JOINT_D
                     TRAIN_SUBSET, VALID_PER_DEGREE)
 from neighbour_cap import fit_refs
 
-# Which references a prompt shows was decided once, under the Vicuna tokenizer, and written
-# here. It used to be recomputed per call, which made the bibliography a function of the
-# *tokenizer*: Qwen3's BPE is more efficient on English than Vicuna's SentencePiece, so more
-# references would survive the same budget and the two models would silently read different
-# evidence.
 FROZEN_REFS = os.path.join(FROZEN_DIR, "prompt_refs_capped.json")
 
-# The freeze is defined by four things, all of which have to be pinned for it to stay
-# re-derivable: the Vicuna tokenizer, the Vicuna chat
-# wrapper (build_prompt_vicuna), GENERATION_RESERVE = 320, and this — the prefix width the
-# budget was computed against. NUM_PREFIX_TOKENS moved to 32 for Qwen3's GQA, and recomputing
-# with it drops a reference on some nodes (train node 32196: 14 -> 13). That does not make the
-# frozen lists wrong; it makes them *historical*, which is the point.
-#
-# The lists were therefore sized for a narrower prefix than the run now uses. That is safe but
-# not free, and it was checked rather than assumed: a check over all 9,501
-# nodes gives a largest prompt of 3,627 against a 3,744 budget at T = 32 under Qwen's
-# tokenizer — 117 to spare, because the BPE saves more than the 22 extra prefix tokens cost.
 FREEZE_PREFIX_TOKENS = 10
 
 _frozen_refs = None
@@ -49,17 +30,7 @@ def frozen_refs():
     return _frozen_refs
 
 
-# --- The live prompt: soft-prompt-only (2026-09-16) ------------------------------------------
-# No reference block. Everything the model learns about the target paper arrives through the
-# graph prefix, so the text is identical for every node and the prefix is the only thing that
-# differs between two papers.
-#
-# The system message is the era-4 instruction,
-# the best of the four under Qwen3-14B (5.333 vs era 1's 3.875 on 48 nodes), with the phrases
-# that pointed at a listed bibliography re-pointed at the context the prefix supplies.
-#
-# Everything below this block — SYSTEM, INSTRUCTION, build_prompt, capped_example — is the old
-# text path. train.py and generate.py no longer call it.
+# --- The prompt of the reader -------------------------------------------------------------------
 PROMPT = "graph-only"       # recorded in every checkpoint; the text-path runs had no such key
 
 GRAPH_ONLY_SYSTEM = (
@@ -83,10 +54,6 @@ GRAPH_ONLY_SYSTEM = (
 
 GRAPH_ONLY_USER = "Write the abstract."
 
-# DYTAG_DATASET=children: the same prompt, line for line, for a children's book whose
-# description is reconstructed from the books it was bought with. No word count: descriptions
-# run from 80 to over 700 words (paper abstracts sit near 170), so the length is left to
-# what training shows.
 if DATASET == "children":
     GRAPH_ONLY_SYSTEM = (
         "You are a children's book copywriter. "
@@ -108,10 +75,6 @@ if DATASET == "children":
     GRAPH_ONLY_USER = "Write the description."
 
 # --- The books' text arm: the neighbours as text, no prefix -----------------------------------
-# The comparison arm for the books. Unlike the papers' 09-10 text baseline, whose era-1 wording
-# differed from the graph prompt, this is the
-# graph prompt with "the context encodes" re-pointed at a listed block: the evidence is the only
-# difference. Which neighbours are listed is frozen in BOOK_TEXT_REFS.
 BOOK_TEXT_SYSTEM = (
     "You are a children's book copywriter. "
     "The books listed below are the books customers bought together with one children's "
@@ -157,11 +120,7 @@ def book_text_example(tokenizer, corpus, node_id, refs=None):
 
 
 def build_graph_only_prompt(tokenizer):
-    """The one prompt every node gets, in Qwen3's ChatML with thinking disabled.
-
-    A short user turn is kept rather than ending on the system message: a chat-tuned model
-    answering with no user turn at all is off-distribution, and the frozen arm would pay for it.
-    """
+    """The one prompt every node gets, in Qwen3's ChatML with thinking disabled."""
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": GRAPH_ONLY_SYSTEM},
          {"role": "user", "content": GRAPH_ONLY_USER}],
@@ -188,12 +147,7 @@ INSTRUCTION = (
 
 
 def user_message(neighbours):
-    """The experimental content: the instruction and the reference block.
-
-    `neighbours` is a list of (title, abstract) for the papers the target cites. This is the
-    part that must not change between the Vicuna and Qwen runs — only the chat delimiters
-    around it do. Kept separate for exactly that reason.
-    """
+    """The experimental content: the instruction and the reference block."""
     sources = "\n\n".join(f"- Title: {t}\n  Abstract: {a}" for t, a in neighbours)
     return (f"{INSTRUCTION}\n\n"
             f"Source publications:\n{sources or '(no neighbouring sources available)'}\n\n"
@@ -201,16 +155,7 @@ def user_message(neighbours):
 
 
 def build_prompt(tokenizer, neighbours):
-    """The user message wrapped in the model's own chat template.
-
-    Built through `apply_chat_template` rather than hand-rolled, so the delimiters come from
-    the tokenizer that will read them.
-
-    `enable_thinking=False` is mandatory. Qwen3 is a hybrid thinking model, and a `<think>`
-    block would poison both the training targets and the generations. Note it does not remove
-    the block: the template emits an *empty, already closed* `<think>\n\n</think>\n\n`,
-    which is how Qwen3 is told to answer directly.
-    """
+    """The user message wrapped in the model's own chat template."""
     return tokenizer.apply_chat_template(
         [{"role": "system", "content": SYSTEM},
          {"role": "user", "content": user_message(neighbours)}],
@@ -218,24 +163,12 @@ def build_prompt(tokenizer, neighbours):
 
 
 def build_prompt_vicuna(neighbours):
-    """The Vicuna wrapper, kept because the frozen reference lists were computed under it.
-
-    Not used by training or generation any more. `capped_example(frozen=False)` builds with
-    this, so data/frozen/prompt_refs_capped.json can still be re-derived
-    byte for byte — the freeze is defined by the Vicuna tokenizer *and* the Vicuna format,
-    and a script that cannot reproduce its own output is not much of a freeze.
-    """
+    """The Vicuna chat wrapper, under which the frozen reference lists were computed."""
     return f"{SYSTEM} USER: {user_message(neighbours)} ASSISTANT:"
 
 
 def encode(tokenizer, prompt, target):
-    """-> (input_ids, labels). Labels are -100 over the prompt, so only the abstract trains.
-
-    Qwen3 has no BOS (`bos_token is None`) and its chat template does not prepend one, so
-    `add_special_tokens` adds nothing here — unlike Vicuna, where this call carried BOS.
-    The appended `eos_token_id` is `<|im_end|>` (151645), which is what ends an assistant
-    turn in ChatML, so the target is terminated the way the model expects.
-    """
+    """-> (input_ids, labels). Labels are -100 over the prompt, so only the abstract trains."""
     prompt_ids = tokenizer(prompt).input_ids
     target_ids = tokenizer(target, add_special_tokens=False).input_ids + [tokenizer.eos_token_id]
     return prompt_ids + target_ids, [-100] * len(prompt_ids) + target_ids
@@ -246,38 +179,16 @@ def fits(input_ids):
     return len(input_ids) + NUM_PREFIX_TOKENS <= MAX_LENGTH
 
 
-# --- Run 8: target cleaning ------------------------------------------------------------------
-# Audited over the 7,750 capped training abstracts: inline maths in 13.5%, LaTeX commands in
-# 7.0%, super/subscripts in 6.2%, whitespace runs in 2.1%, escaped characters in 1.2%. No HTML,
-# no entities, no non-Latin text. So the corpus is clean apart from LaTeX and maths, which touch
-# roughly a fifth of it, and those documents score measurably worse on the eval set
-# (bertscore_f1 -0.0110, llm_accuracy -0.0839 across the 93 of 945 golds that carry markup).
-#
-# The stronger reason is a contradiction rather than a correlation: GRAPH_ONLY_SYSTEM instructs
-# "no markup, mathematical notation or headings", and 13.5% of the supervision contains exactly
-# that. The instruction and the targets have been disagreeing on a fifth of the training data.
-#
-# The delimiters go, the content stays: "$O(n^2)$" becomes "O(n^2)", not nothing. Deleting the
-# maths would delete the method, which is the thing the run exists to recover.
-#
-# Declared limitation: the voyage embeddings were computed on the RAW text and re-embedding
-# 384,756 documents is not on the table, so cleaning the targets introduces a mismatch between
-# the feature and the target. It is mild — the features are an input representation, not a
-# label — and it is stated rather than hidden. For the same reason generate.py builds its
-# Corpus with clean=False, so the evaluation golds stay byte-identical to all eight earlier
-# runs and the scores remain comparable.
+# --- Target cleaning ----------------------------------------------------------------------------
 _UNWRAP = re.compile(r"\\(?:textit|textbf|emph|texttt|textsc|textrm|mathrm|mathbf|mathit|text)"
                      r"\s*\{([^{}]*)\}")
-# The old switch form, "{\em text}" rather than "\emph{text}", which is common in abstracts
-# written before the 2000s. Without it the braces survive into the target as "{em text}".
+# The old switch form, "{\em text}".
 _UNWRAP_SWITCH = re.compile(r"\{\\(?:em|it|bf|tt|sl|sc|rm)\s+([^{}]*)\}")
 _MATH_DELIM = re.compile(r"(?<!\\)\$+")
-# The last four are the \( \) \[ \] inline- and display-maths delimiters, which are the same
-# class of thing as $ and go the same way: the delimiter is removed, the maths inside stays.
+# Maths delimiters are removed and the maths inside stays.
 _ESCAPES = {r"\%": "%", r"\&": "&", r"\_": "_", r"\$": "$", r"\#": "#", r"\\": " ",
             r"\ ": " ", r"\(": " ", r"\)": " ", r"\[": " ", r"\]": " "}
-# Accent escapes: "Verd\'u" -> "Verdu", "na\"ive" -> "naive". The mark goes rather than being
-# kept as punctuation, which would leave a stray quote in the middle of a word.
+# Accent escapes: "Verd\'u" -> "Verdu".
 _ACCENT = re.compile(r"""\\['"`^~=.]""")
 _BRACES = re.compile(r"[{}]")
 _COMMAND = re.compile(r"\\([a-zA-Z]+)\s*")
@@ -285,30 +196,7 @@ _WHITESPACE = re.compile(r"\s+")
 
 
 def clean_abstract(text):
-    r"""Strip LaTeX markup and maths delimiters, keeping their contents. -> str
-
-    The order of the six steps is load-bearing and each one is here because the previous one
-    would otherwise do damage:
-
-      1. unwrap the known text-styling commands, innermost first, in both the modern form
-         ("\emph{x}") and the old switch form ("{\em x}");
-      2. strip unescaped maths delimiters, BEFORE step 3 — otherwise a price written "US\$49"
-         becomes "US$49" and then loses its dollar sign along with the real delimiters;
-      3. resolve the remaining escapes to their literals;
-      4. un-backslash any control word that is left, keeping its NAME. Deleting it instead was
-         tried and is wrong: "$\Omega(N \log\log N)$" becomes "(N N)" under deletion and
-         "Omega (N log log N)" under this — the stray space before the bracket is accepted,
-         because every rule that removes it also glues "\log\log" into "loglog";
-      5. drop accent escapes and the grouping braces the commands leave behind
-         ("\tilde{O}" -> "tilde O");
-      6. collapse whitespace.
-
-    There is deliberately NO rule turning a literal "\n" or "\t" two-character sequence into
-    whitespace. It was in the first version and it was wrong: across 60,000 abstracts this
-    corpus has **10** bare "\n"/"\r" escapes and **5,172** LaTeX commands beginning with those
-    letters, so the rule fired almost exclusively on "\times", "\tilde" and "\rho" — turning
-    "a Z \times Z" into "a Z imes Z". Step 4 handles all of them.
-    """
+    r"""Strip LaTeX markup and maths delimiters, keeping their contents. -> str"""
     text = str(text)
     for _ in range(3):                       # nested \textbf{\textit{x}}; 3 covers the corpus
         text, n = _UNWRAP.subn(r"\1", text)
@@ -339,11 +227,7 @@ class Corpus:
         self.refs = pd.read_csv(edges).groupby("src_node_id")["dst_node_id"].apply(list)
 
     def example(self, tokenizer, node_id):
-        """-> (prompt, target_abstract) for one node, with every reference shown.
-
-        The legacy (uncapped) path. `tokenizer` is needed because the chat wrapper now comes
-        from the model's own template.
-        """
+        """-> (prompt, target_abstract) for one node, with every reference shown."""
         refs = self.refs.get(node_id, [])
         return (build_prompt(tokenizer, [(self.title[n], self.abstract[n]) for n in refs]),
                 self.abstract[node_id])
@@ -353,30 +237,7 @@ class Corpus:
 
 
 def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
-    """-> (prompt, target, kept_refs) for one node, trimmed to fit the context.
-
-    The single capped-prompt path: train.py builds training prompts with it, and generate.py builds eval prompts with
-    it. They must agree exactly — a node was selected on the assumption that these
-    references are the ones shown, and the failure mode of a mismatched budget is silent
-    (a fluent abstract written from the wrong sources, not an error).
-
-    `frozen=True` reads the reference list from FROZEN_REFS and raises KeyError if the node
-    is not in it. It deliberately does not fall back to recomputing: a node recomputed under
-    a different tokenizer would be shown a different bibliography and would still produce a
-    fluent abstract. `tokenizer` and `embeddings` go unused on this path, and stay in the
-    signature because every caller has both and the two paths must remain interchangeable.
-
-    `frozen=False` is the original computation, and is how FROZEN_REFS itself is built.
-    The budget leaves room for the prefix and for the abstract: the
-    node's own abstract when it is longer than GENERATION_RESERVE, so the training sequence
-    is complete, and never less than GENERATION_RESERVE, so generation has somewhere to write.
-
-    The two branches deliberately build **different prompt formats**. `frozen=True` is the
-    live path and uses the current model's chat template; `frozen=False` exists only to
-    re-derive the freeze, which was computed under the Vicuna tokenizer and the Vicuna
-    wrapper, so it pins both. They agree on the reference list, which is the thing the
-    freeze actually records — not on the string.
-    """
+    """-> (prompt, target, kept_refs) for one node, trimmed to fit the context."""
     target = corpus.abstract[node_id]
 
     if frozen:
@@ -384,8 +245,6 @@ def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     else:
         target_ids = tokenizer(target, add_special_tokens=False).input_ids
         reserve = max(GENERATION_RESERVE, len(target_ids) + 1)   # +1 for the EOS token
-        # FREEZE_PREFIX_TOKENS, not NUM_PREFIX_TOKENS: this branch re-derives a historical
-        # artifact and must use the width it was built under. See FREEZE_PREFIX_TOKENS above.
         budget = MAX_LENGTH - FREEZE_PREFIX_TOKENS - reserve
 
         all_refs = corpus.refs.get(node_id, [])
@@ -483,7 +342,7 @@ def main():
               f"median {lengths[len(lengths) // 2]:,}, "
               f"p99 {lengths[int(len(lengths) * 0.99)]:,}, max {lengths[-1]:,}")
 
-    # The eval set is frozen and is not filtered — Stage 5 has to handle its overflow.
+    # The eval set is frozen and is not filtered.
     over = sum(not fits(encode(tokenizer, *corpus.example(tokenizer, n))[0]) for n in eval_nodes)
     print(f"\neval set: {over}/{len(eval_nodes)} nodes overflow the context "
           f"({over / len(eval_nodes):.1%}) — left in place, Stage 5's problem")

@@ -1,15 +1,4 @@
-"""
-Download ogbn-arxiv Text-Attributed Graph (TA) dataset.
-
-Saves to ./data/raw/ogbn_arxiv/:
-  - nodes.csv         : node_id, mag_id, title, abstract, label, year
-  - edges.csv         : src_node_id, dst_node_id
-  - node_features.npy : (169343, 128) float32 word2vec embeddings
-  - splits.json       : train / val / test node ID lists
-
-Requirements:
-    pip install ogb torch torch_geometric requests
-"""
+"""Download ogbn-arxiv with titles and abstracts into data/raw/ogbn_arxiv/."""
 
 import os
 import json
@@ -102,7 +91,7 @@ nodes_path = os.path.join(OUT_DIR, "nodes.csv")
 nodes_df.to_csv(nodes_path, index=False)
 print(f"  Saved → {nodes_path}  ({len(nodes_df):,} rows)")
 
-# Step 4: build edges.csv
+# Build edges.csv
 print("Step 4 – Building edges.csv")
 
 edges_df = pd.DataFrame({
@@ -120,7 +109,7 @@ feat_path = os.path.join(OUT_DIR, "node_features.npy")
 np.save(feat_path, node_feat.astype(np.float32))
 print(f"  Saved → {feat_path}  shape={node_feat.shape}")
 
-# Step 6: save splits.json
+# Save splits.json
 splits = {
     "train": split_idx["train"].tolist(),
     "valid": split_idx["valid"].tolist(),

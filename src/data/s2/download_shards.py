@@ -1,28 +1,7 @@
-"""
-Download all shards of one or more Semantic Scholar bulk datasets to disk.
-
-Only the two metadata calls per dataset (release lookup is shared, then
-one shard-listing call) go through the rate-limited Datasets API. The
-shard files themselves are pre-signed URLs and are downloaded directly,
-with byte-level resume support so an interrupted run can just be
-re-executed.
-
-Shard URLs expire (pre-signed S3 URLs, commonly after roughly an hour).
-For datasets with many/large shards, downloading them one after another
-can easily exceed that window, so a fresh URL list is fetched right
-before each shard (not once for the whole dataset up front), and any
-403 (expired URL) encountered mid-download triggers another refetch.
-
-We need three datasets to build a mag_id-keyed (paper -> abstract,
-references) view without any full text:
-  - papers     : per-paper metadata, incl. externalids.MAG -> used to
-                 build the mag_id <-> corpusid mapping.
-  - abstracts  : corpusid -> abstract text.
-  - citations  : citingcorpusid -> citedcorpusid edges (the reference graph).
+"""Download the shards of Semantic Scholar bulk datasets, with resume. Needs S2_API_KEY.
 
 Usage:
-    python download_shards.py --out-dir /path/to/data/raw/s2
-    python download_shards.py --out-dir /path/to/data/raw/s2 --datasets papers abstracts
+    python download_shards.py --out-dir <raw/s2>
 """
 
 import argparse
@@ -60,9 +39,6 @@ def main():
             dest = os.path.join(raw_dir, f"{i:03d}.jsonl.gz")
             label = f"{dataset} {i + 1:03d}/{n_files:03d}"
 
-            # Fetch a fresh URL right before downloading this shard rather
-            # than reusing the list fetched at the top of the dataset loop,
-            # since that list can be stale/expired by the time we get here.
             url = get_dataset_files(release_id, dataset)[i]
             refresher = lambda i=i: get_dataset_files(release_id, dataset)[i]  # noqa: E731
 

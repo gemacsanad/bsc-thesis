@@ -1,13 +1,4 @@
-"""
-Run 11, phase 2 — pick the GNN that goes on to the reader.
-
-Reads every pretrain_encoder.py checkpoint in a directory, prints the comparison table (the
-thesis reports all variants by these numbers; only the winner is evaluated with the LLM), and
-copies the winner to <dir>/winner.pt.
-
-The winner is the highest VALIDATION mean cosine to the paper's own embedding — the quantity
-the judge score tracks — with validation top-1 breaking ties. Eval numbers are printed for the
-record and never read.
+"""Select the GNN variant with the highest validation cosine.
 
 Usage:
     python select_encoder.py ../../checkpoints/run11-gnn

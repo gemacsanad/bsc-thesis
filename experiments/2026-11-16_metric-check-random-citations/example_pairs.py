@@ -1,16 +1,4 @@
-"""Score constructed pairs of short scientific statements with ROUGE-L and BERTScore.
-
-Illustration for thesis §6.2, not data from the experiment: each pair was written for this
-purpose. Three pairs share almost all their words but state clearly different things (a
-reversed finding, swapped roles, a different application); one pair states the same thing in
-different words. Scored with the same settings as the experiment (ROUGE-L F1 with stemming;
-BERTScore F1, lang="en", i.e. roberta-large, no rescaling), text A as the reference.
-
-Writes example_pairs.csv.
-
-Usage (from the repository root):
-    python experiments/2026-11-16_metric-check-random-citations/example_pairs.py
-"""
+"""Score constructed pairs of short scientific statements with ROUGE-L and BERTScore."""
 
 from pathlib import Path
 

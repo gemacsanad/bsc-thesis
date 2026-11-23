@@ -1,20 +1,7 @@
-"""
-Run 11 — does a decoding fix stop sentence loops without costing identifiability?
-
-Reads generations.csv files written on the same papers (generate.py --subset) and prints, per
-file: the share of outputs that repeat a sentence of 5+ words, identifiability (identify.py,
-ranked against the golds of the same papers), and mean length. No judge: the loop fix is a
-decoding setting, and these are the two things it can change.
-
-Run 10a measured what loops cost: 17.6% of oracle outputs looped, scoring judge accuracy 2.87
-and coherence 3.8 against 3.52 and 7.7 for the rest.
-
-`--choose N` takes exactly two files, without the fix and with --no-repeat-ngram N, and prints
-the setting to use as its last line: N if the fix lowers the loop rate and costs at most
-MAX_TOP1_DROP of top-1, 0 otherwise. run11_all.sh reads it, so no one has to between phases.
+"""Compare generations with and without n-gram repetition blocking: sentence loops and
+identification.
 
 Usage:
-    python loop_check.py <generations.csv> [<generations.csv> ...]
     python loop_check.py --choose 6 <ngram0/generations.csv> <ngram6/generations.csv>
 """
 

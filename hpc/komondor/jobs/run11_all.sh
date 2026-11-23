@@ -10,38 +10,22 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/run11_all_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# RUN 11, EVERYTHING IN ONE JOB — one queue wait.
+# Run 11: the whole final pipeline in one job.
+#   1. CPU checks
+#   2. GNN grid: {GATv2, GraphSAGE} x {1, 2 layers} x {cosine, cosine + InfoNCE};
+#      select_encoder.py keeps the best validation cosine as $GNN_DIR/winner.pt
+#   3. the reader (own embedding, or the reference mean half of the time)
+#   4. decoding test with and without --no-repeat-ngram 6 (loop_check.py); the choice is used below
+#   5. the reader on the 945 evaluation papers: zero, GNN estimate, reference mean
+#   6. joint fine-tuning of the reader and the selected GNN
+#   7. the joint model on the 945 evaluation papers
+#   8. the reader from the paper's own embedding (oracle)
 #
-#   1. CPU verify scripts (seconds)
-#   2. phase 2, the GNN grid: {GATv2, GraphSAGE} x {1, 2 layers} x {cosine, cosine + InfoNCE},
-#      each predicting the paper's raw embedding from its masked neighbourhood. 30 epochs of the
-#      ~83k training papers that have references; a variant takes minutes. select_encoder.py
-#      prints the table and copies the best validation cosine to $GNN_DIR/winner.pt
-#   3. phase 1, the reader: run 10a's recipe from scratch (own embedding or, half the time, the
-#      reference mean; raw features; gate from 0; 6 epochs of 15,000 papers)
-#   4. the loop-fix test: the reader writes for 200 eval papers from their own embedding, with and
-#      without --no-repeat-ngram 6. loop_check.py --choose keeps 6 if it lowers the loop rate and
-#      costs at most 2 points of top-1, else 0; the choice is saved to $RUN_DIR/ngram and every
-#      evaluation arm below decodes with it
-#   5. the phase-1 reader on the 945 eval papers: zero (floor, minutes), gnn (the phase-2 winner —
-#      THE SEPARATELY TRAINED PIPELINE), refs-mean (the no-training baseline)
-#   6. phase 3: reader and winning GNN fine-tuned together (train.py --reader), 3 epochs of
-#      15,000 papers; LM loss + 1 x (1 - cosine to the own embedding); GNN at lr 1e-5
-#   7. the joint model on the 945 eval papers — THE RUN-11 RESULT
-#   8. the phase-1 reader from the own embedding (oracle), last: a ceiling, not a result
+# Resubmitting resumes: finished steps are skipped and evaluation appends only missing rows.
+# If a reader stop rule fired (exit 3), $READER_DIR/STOPPED blocks further submissions.
 #
-# WALLTIME 72 h. Estimates: grid ~1 h, reader ~12 h (run 10a: 11.6 h), loop test ~3 h, four
-# 945-paper arms ~7 h each, joint ~6 h: ~50 h.
-#
-# RESUBMITTING IS ALWAYS SAFE, AND IS HOW A TIMEOUT IS HANDLED: finished GNN variants are skipped,
-# both trainings resume from their newest epoch (or say "nothing to do"), the loop choice is read
-# back from $RUN_DIR/ngram, and every evaluation appends only its missing rows.
-#
-# THE ONE CASE NOT TO RESUBMIT: a reader stop rule fired (exit 3). $READER_DIR/STOPPED is written
-# and every later submission refuses to start until it is removed, as in run 10a.
-#
-# Prerequisites: adapter-qwen-gpu.sif; data/frozen/training_sets_run9.json;
-# data/processed/joint/node_embeddings.npy; .env with WANDB_KEY; Qwen/Qwen3-14B in .hf_cache.
+# Needs: adapter-qwen-gpu.sif, data/frozen/training_sets_run9.json,
+# data/processed/joint/node_embeddings.npy, .env with WANDB_KEY, Qwen/Qwen3-14B in .hf_cache.
 
 BASE_DIR=/project/c_gnn42/csanad_thesis/baseline
 SIF=$BASE_DIR/adapter-qwen-gpu.sif
@@ -69,8 +53,7 @@ if [ -n "$LATEST" ]; then
     echo "joint fine-tune resumes from $LATEST"
 fi
 
-# Fixed on the first submission and reused by every later one, so evaluation always resumes
-# into the same experiment directories.
+# Fixed on the first submission, so evaluation resumes into the same experiment directories.
 [ -f "$RUN_DIR/eval_tag" ] || echo "$(date +%F)-${SLURM_JOB_ID:-manual}" > "$RUN_DIR/eval_tag"
 echo "evaluation tag: $(cat "$RUN_DIR/eval_tag")"
 
@@ -101,10 +84,7 @@ singularity exec --nv -B $BASE_DIR:/app "$SIF" bash -lc '
     [ -f /app/data/processed/joint/node_embeddings.npy ] || { echo "missing raw features"; exit 1; }
 
     # --- 2. phase 2: the GNN grid -------------------------------------------------------------
-    # InfoNCE is weighted by tau (0.05): its gradient on a cosine is scaled by 1/tau, so this puts
-    # it on the cosine loss scale instead of letting it take over. VICReg off, contrast gate off
-    # (1): the targets are real embeddings, which cannot collapse, and the refs-mean input the
-    # reader decodes well sits at output cosine 0.66, above the old 0.40 gate.
+    # InfoNCE is weighted by tau (0.05) to put it on the scale of the cosine loss.
     for CONV in gatv2 sage; do for LAYERS in 1 2; do for LOSS in cos cosnce; do
         NAME=$CONV-l$LAYERS-$LOSS
         [ -f "$GNN_DIR/$NAME.pt" ] && { echo "=== $NAME already trained, skipped ==="; continue; }

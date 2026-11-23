@@ -1,15 +1,4 @@
-"""Generate both conditions' abstracts with gpt-5.6-luna (a different model from the judge).
-
-Reads test_set.csv and writes <condition>/generations.csv with the four columns every run
-directory uses (node_id, mag_id, original_abstract, generated_abstract). Same model, prompt
-and decoding settings in both conditions. Temperature is not sent: the 5.6 models reject it.
-
-Resumable: a rerun only sends the rows missing from the output. A failed call is written as
-"ERROR: ..." and excluded from scoring.
-
-Usage (from the repository root, so .env_local is found):
-    python experiments/2026-11-16_metric-check-random-citations/generate.py
-"""
+"""Generate both conditions' abstracts with gpt-5.6-luna (a different model from the judge)."""
 
 import argparse
 import csv

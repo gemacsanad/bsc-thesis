@@ -1,60 +1,8 @@
-"""
-Stage 10a — pretrain the graph encoder with InfoNCE, before the LLM ever sees it.
+"""Train the GNN estimator: predict a paper's own text embedding from its references.
 
-The task: from a node's masked neighbourhood, pick that node out of a large candidate pool.
-Anchor is the encoder's seed output, positive is the seed's own voyage embedding — which
-`model.oracle_vector` already returns — and negatives are other nodes' embeddings.
-
-Why this is worth a separate stage
------------------------------------
-The encoder's only learning signal has always travelled through the adapter, forty
-transformer layers, and a token-level cross-entropy dominated by generic English. That path
-is long, noisy, and points the wrong way: step 6 reached the project's lowest LM loss while
-its graph channel was worth ~0.001 nats. Here the gradient path is encoder -> head -> loss.
-
-Two things become possible without the 14B model on the card, and both matter:
-
-  * **batches of hundreds** rather than 1, so InfoNCE has real negatives;
-  * **every eligible node**, not just the 7,750 sampled for LM training — this stage needs a
-    graph and embeddings, not prompts, targets or a context budget.
-
-It is an initialisation and a diagnostic, never a result. Reporting its retrieval score as
-an outcome of the method would be reporting how well voyage embeddings predict themselves.
-
-What it is allowed to be capped by
------------------------------------
-Training the anchor toward `voyage(target)` means information about the target that is not
-in `voyage(target)` gets no gradient. That is a real ceiling, and a learned head on the
-target side would not remove it — anything applied to `voyage(abstract)` is bounded by
-`voyage(abstract)`.
-
-It is accepted here for one measured reason: a plain untrained mean of a node's reference
-embeddings already retrieves that node at **64.34% top-1** out of 945, while the full
-pipeline delivers 0.32%. The ceiling is roughly fifty times above where we are, so it cannot
-bind yet. Stage B drops voyage entirely and ranks real abstracts instead (rank.py).
-
-The number to beat is therefore 64.34%, and this stage is meaningless reported without it:
-an encoder that cannot match a plain mean is destroying signal, and that is the finding.
-
-Run 11: imitation on the raw features
--------------------------------------
-Run 11 trains the GNN as phase 2 of a three-phase pipeline:
-predict the paper's own RAW voyage embedding, which is what its reader was trained
-to decode. The main loss is cosine to that embedding (`--lambda-cos`), because the judge score
-tracks exactly that cosine (+0.6 judge per +0.1 on run 10a's refs-mean arm); InfoNCE becomes
-optional (`--lambda-nce`). Every run trains on papers with at least one reference and selects
-its epoch on VALIDATION mean cosine — before run 11 it selected on eval-set top-1, which read
-the test set. The plain reference mean of the same papers is scored alongside, since a GNN that
-cannot beat it has nothing to report.
-
-Usage:
-    python pretrain_encoder.py --out ../../checkpoints/encoder-gatv2.pt
-    python pretrain_encoder.py --gnn-conv sage --out ../../checkpoints/encoder-sage.pt
-
-    # run 11 — cosine imitation of the raw embedding, no InfoNCE, no VICReg:
+Usage (the final run trains eight variants this way, see hpc/komondor/jobs/run11_all.sh):
     python pretrain_encoder.py --sets run9 --features raw --lambda-cos 1 --lambda-nce 0 \
-        --vicreg-var 0 --vicreg-cov 0 --cosine-gate 1 \
-        --out ../../checkpoints/run11-gnn/gatv2-l2-cos.pt
+        --vicreg-var 0 --vicreg-cov 0 --cosine-gate 1 --out ../../checkpoints/run11-gnn/gatv2-l2-cos.pt
 """
 
 import argparse
@@ -80,17 +28,7 @@ EVAL = {"children": "eval_nodes.json"}
 
 
 def info_nce(z, positives, negatives, positive_ids, negative_ids, tau):
-    """-> (loss, top-1 accuracy over the batch).
-
-    Candidates are the batch's own positives followed by the sampled negatives, so anchor i
-    is contrasted against every other anchor's target for free. Everything is L2-normalised,
-    which makes the dot product a cosine and the temperature meaningful.
-
-    False negatives are masked rather than tolerated: a sampled negative can be another
-    anchor's positive, and with 256 anchors drawn from a 7,750-node pool that is not rare
-    enough to ignore. Scoring a node's own target as a negative teaches the encoder to push
-    away the thing it is supposed to retrieve.
-    """
+    """-> (loss, top-1 accuracy over the batch)."""
     z = F.normalize(z, dim=-1)
     candidates = F.normalize(torch.cat([positives, negatives]), dim=-1)
     logits = z @ candidates.T / tau
@@ -105,26 +43,7 @@ def info_nce(z, positives, negatives, positive_ids, negative_ids, tau):
 
 
 def vicreg(z, gamma=VICREG_GAMMA):
-    """-> (variance hinge, off-diagonal covariance) over the batch. Bardes, Ponce & LeCun 2021.
-
-    Why InfoNCE alone is not enough, measured rather than argued: stage 10a scored 67% top-1
-    on a representation the adapter reads as a constant. `info_nce` normalises z and divides by
-    tau = 0.05, which is a 20x amplification of cosine differences — so the objective is
-    *invariant* to the anisotropy that made the downstream channel useless. It can rank
-    perfectly on a representation squeezed into a handful of directions.
-
-    These are the two terms that cannot be satisfied that way:
-
-      * variance — a hinge on each dimension's standard deviation across the batch. A collapsed
-        dimension carries no information about which node it came from, and the hinge says so;
-      * covariance — off-diagonal covariance driven to zero, which spreads the information out
-        across dimensions instead of letting a few of them carry everything.
-
-    Computed on the head output BEFORE normalisation. After F.normalize every row is on the
-    unit sphere and the per-dimension standard deviation no longer means what the hinge
-    assumes. Batch 256 is large enough for both estimates; at batch 1 neither would exist,
-    which is why this belongs in Stage A and not in Stage B.
-    """
+    """-> (variance hinge, off-diagonal covariance) over the batch. Bardes, Ponce & LeCun 2021."""
     z = z - z.mean(dim=0)
     std = torch.sqrt(z.var(dim=0) + 1e-4)
     variance = F.relu(gamma - std).mean()
@@ -135,13 +54,7 @@ def vicreg(z, gamma=VICREG_GAMMA):
 
 @torch.no_grad()
 def retrieval(encoder, head, data, node_ids, device, gnn_layers, batch_size, refs_mean=False):
-    """Top-1/top-5/median rank of each node's own embedding among the held-out set.
-
-    The same quantity as for an untrained mean-pool, so the
-    two are directly comparable — which is the whole point of running it. `refs_mean` scores
-    that mean-pool itself (model.refs_mean_vector) instead of the encoder: the baseline every
-    run-11 variant is read against, on the same nodes.
-    """
+    """Top-1/top-5/median rank of each node's own embedding among the held-out set."""
     encoder.eval()
     head.eval()
     anchors, targets = [], []
@@ -161,9 +74,6 @@ def retrieval(encoder, head, data, node_ids, device, gnn_layers, batch_size, ref
     scores = a @ t.T
     order = scores.argsort(dim=1, descending=True)
     ranks = (order == torch.arange(len(a)).unsqueeze(1)).float().argmax(dim=1) + 1
-    # The gate top-1 cannot see. Two nodes can be ranked perfectly against each other and still
-    # sit at cosine 0.99, and a downstream LayerNorm normalises per sample across features —
-    # it cannot remove a component shared BETWEEN nodes. That is what step 7 shipped.
     pairwise = a @ a.T
     n = len(a)
     return {"top1": (ranks == 1).float().mean().item(),
@@ -222,18 +132,13 @@ def main():
     eval_nodes = eval_nodes["nodes"] if isinstance(eval_nodes, dict) else eval_nodes
 
     data = load_graph(FEATURES[args.features])
-    # A paper with no references has nothing but the [MASK] row to estimate from; training on it
-    # only teaches the encoder the mean embedding. 8% of the run-9 training papers.
+    # Papers without references have only the [MASK] row to estimate from and are dropped.
     train_nodes = with_references(data, sets["train"])
     print(f"{len(train_nodes):,} train ({len(sets['train']) - len(train_nodes):,} without "
           f"references dropped) / {len(sets['valid']):,} valid / {len(eval_nodes):,} eval nodes; "
           f"graph {data.num_nodes:,} nodes, {args.features} features")
 
     encoder = GraphEncoder(num_layers=args.gnn_layers, conv=args.gnn_conv).to(device)
-    # A single linear on the anchor side, identity on the target side. That keeps the trained
-    # vector in voyage space, so retrieval here is directly comparable to the 64.34% mean-pool
-    # baseline — an MLP projection head would score a space no baseline exists for. It is also
-    # the vector PrefixAdapter consumes, so the guarantee applies where it is needed.
     head = nn.Linear(OUT_CHANNELS, OUT_CHANNELS).to(device)
     params = list(encoder.parameters()) + list(head.parameters())
     print(f"{args.gnn_layers}-layer {args.gnn_conv} encoder + linear head: "
@@ -273,9 +178,6 @@ def main():
 
             positives = oracle_vector(batch)
             positive_ids = batch.n_id[:b]
-            # Negatives are rows of the embedding matrix — no encoder pass, so thousands of
-            # them cost nothing. This asymmetry is what lets the same loss survive into
-            # Stage B at micro-batch 1.
             negative_ids = torch.randint(data.num_nodes, (args.negatives,))
             negatives = data.x[negative_ids].to(device)
 
@@ -310,9 +212,6 @@ def main():
                      "pretrain/covariance": cov_total / seen,
                      **{f"pretrain/{k}": v for k, v in stats.items()}, "pretrain/epoch": epoch})
 
-        # Selection is on cosine to the paper's own embedding — what the judge score tracks —
-        # AND on contrast. An encoder that ranks well and emits near-identical vectors is
-        # exactly what stage 10a shipped last time, and the adapter cannot recover from it.
         if stats["output_cosine"] > args.cosine_gate:
             continue
         if stats["mean_cosine"] > best:
@@ -327,8 +226,6 @@ def main():
                        args.out)
 
     if best < 0:
-        # Nothing was saved, so Stage B would either crash on a missing file or silently train
-        # a random encoder. Both are worse than stopping here.
         if run is not None:
             run.finish()
         raise SystemExit(

@@ -9,17 +9,8 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/s2_add_titles_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# Adds `title` and `year` columns to data/processed/s2/papers_filtered.parquet
-# by re-reading the raw 'papers' shards (already downloaded by
-# run_download_dataset.sh) - build_dataset.py only ever kept corpusid /
-# externalids.MAG from those shards, so title/year never made it into
-# papers.parquet / papers_filtered.parquet.
-#
-# CPU/DuckDB-only (no GPU, no internet needed) - runs on "bigdata" purely
-# for the CPU/memory sizing, reusing the venv set up by
-# run_download_dataset.sh. Requires data/raw/s2/papers/*.jsonl.gz (from
-# run_download_dataset.sh) and data/processed/s2/papers_filtered.parquet
-# (from run_filter_ogbn_references.sh) to already exist.
+# Adds title and year to data/processed/s2/papers_filtered.parquet from the raw papers shards.
+# CPU only; reuses the venv of run_download_dataset.sh.
 
 set -euo pipefail
 

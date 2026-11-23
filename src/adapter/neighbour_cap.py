@@ -1,35 +1,4 @@
-"""
-Stage 2b — fit the prompt neighbourhood to the context window.
-
-A node may cite far more papers than fit in Vicuna's 4,096 tokens. The GNN still reads
-the whole neighbourhood; only the *prompt* is trimmed, by keeping the references closest
-to the centroid of the node's own reference set — the ones most representative of what
-the paper cites.
-
-Distance is defined as:
-
-    cosine_distance = (1 - cosine_similarity(reference, centroid)) / 2
-
-with L2-normalised embeddings, so it lies in [0, 1]: 0 means aligned with the centroid,
-1 means opposite. The old filter kept edges with `distance <= threshold`; here the
-budget is per node instead of a global threshold.
-
-Two limits apply, in this order:
-
-  1. at most PROMPT_MAX_REFS references — the closest to the centroid;
-  2. the farthest of those is dropped, one at a time, until the prompt fits the caller's
-     token budget.
-
-So a prompt never overflows: 15 is a ceiling, not a target, and `fit_refs` returns
-however many actually fit — which is the point of the exercise, since 15 full-length
-abstracts exceed the context about half the time.
-
-Kept references stay in edges.csv order, so a trimmed prompt lists its sources in the
-same order an untrimmed one would.
-
-Usage:
-    python adapter/neighbour_cap.py   # check the distances against the frozen
-                                      # centroid_cosine_distance column
+"""Select which references of a paper fit into its neighbourhood, by distance from their centroid.
 """
 
 import os
@@ -64,12 +33,7 @@ def rank_refs(refs, embeddings, max_refs=PROMPT_MAX_REFS):
 
 
 def fit_refs(refs, embeddings, measure, budget, max_refs=PROMPT_MAX_REFS):
-    """-> the references that go in the prompt, in edges.csv order.
-
-    Keeps the `max_refs` closest to the centroid, then drops the farthest of them one at
-    a time until `measure(kept)` — the caller's token count for the assembled prompt —
-    fits `budget`. Returns [] if not even the single closest reference fits.
-    """
+    """-> the references that go in the prompt, in edges.csv order."""
     refs = list(refs)
     ranked = rank_refs(refs, embeddings, max_refs)
 

@@ -1,17 +1,5 @@
-"""Repeat test of the LLM judge: score the same outputs three times and measure the variation.
-
-100 of the 945 GNN-estimate generations of run 11 (fixed seed), each scored 3 times with
-  content — the unchanged comparison call evaluate_detailed.compare (subfield, problem, task, 0-3);
-  quality — a new call that sees only the generated abstract (coherence, language, anchored 0-3),
-            QUALITY_SYSTEM below. Thesis §6.4 describes this scale; the configurations still
-            have to be re-scored with it (thesis/plans/06-evaluation.md, "Needs to be run").
-Judge gpt-5.4-mini, temperature 0. Resumable: rows already in scores.csv are skipped.
-
-Writes scores.csv (node_id, repeat, the five aspects) and summary.csv (per aspect: mean of each
-repeat, mean per-paper standard deviation, share of papers scored identically in all repeats).
-
-Usage (from the repository root, so .env_local is found):
-    python experiments/2026-11-16_judge-repeat-test/run.py
+"""
+Repeat test of the LLM judge: score the same outputs three times and measure the variation.
 """
 
 import os

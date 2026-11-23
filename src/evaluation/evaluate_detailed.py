@@ -1,39 +1,5 @@
-"""
-evaluate_detailed.py
-
-evaluate_results_scores_only.py with its single llm_accuracy score split into separate metrics,
-so that what a model gets right can be read dimension by dimension. Everything else it reports
-is kept unchanged: ROUGE, BERTScore, llm_coherence, llm_language (same rubric text, now asked in
-the group-B call) and num_of_neighbors.
-
-Four groups, from four kinds of judge call (one call per group per paper; the groups differ in
-what the judge is allowed to see, which is why they are separate):
-
-  A. Blind facets — the judge labels ONE abstract from fixed lists, without seeing the other.
-     Run on the gold once (cached in --gold-facets, shared by every arm) and on each generation.
-       field_match, contribution_match, method_family_match  (0/1)
-       modality_jaccard                                       (0-1)
-  B. Comparison — the judge sees the gold and the generation.
-       subfield, problem, task                                (0-3, anchored)
-       claims_total, claims_supported, claims_contradicted, claim_precision
-       llm_coherence, llm_language                            (1-10, unchanged rubric)
-  C. Identification — the judge sees the generation and five real abstracts (the gold and its
-     four nearest papers by Voyage embedding, never its own references) and ranks them.
-       id_rank (1-5), id_correct (0/1)
-  D. Pairwise (only with --against) — gold + this arm + another arm, judged in both orders.
-       pair_score (1 = this arm better in both orders, 0.5 = split or tie, 0 = worse)
-
-Two metrics need no judge (TF-IDF, the instrument of src/adapter/identify.py):
-       tfidf_rank                       — rank of the own gold among all golds in the file
-       ontarget_gold_sim, ontarget_max_ref_sim, ontarget_margin
-                                        — similarity to the gold minus the highest similarity
-                                          to any of the paper's reference abstracts
-
-Requires OPENAI_API_KEY in .env_local (or environment). Resumes from --output if it exists.
-
-Usage:
-    python src/evaluation/evaluate_detailed.py --input generations.csv --output detailed.csv
-    python src/evaluation/evaluate_detailed.py --input a.csv --output a_vs_b.csv --against b.csv
+"""Judge prompts and API calls of the LLM judge. judge_scores.py uses them to score the
+content aspects (subfield, problem, task) and the writing quality (coherence, language).
 """
 
 import argparse
@@ -58,8 +24,7 @@ from identify import ranks  # noqa: E402
 # Papers judged in parallel; the output is saved every SAVE_EVERY papers so a crash loses little.
 WORKERS = 8
 SAVE_EVERY = 50
-# Distractors more similar than this to the gold are near-duplicates (other versions of the
-# same paper reach 0.996), which no reader could tell apart.
+# More similar distractors are near-duplicates (other versions of the same paper).
 DUPLICATE_COSINE = 0.95
 MIN_DISTRACTOR_WORDS = 50
 N_DISTRACTORS = 4
@@ -250,9 +215,10 @@ def compare(gold, gen, model):
 
 # --- group C ---------------------------------------------------------------------------------
 def distractors(node_ids, nodes, references):
-    """-> {node_id: [4 distractor node_ids]}: the gold's nearest papers by Voyage embedding,
-    excluding itself, its references, near-duplicates and abstracts under 50 words. Depends
-    only on the gold, so every arm gets the same options."""
+    """-> {node_id: [4 distractor node_ids]}: the gold's nearest papers by Voyage embedding, excluding
+    itself, its references, near-duplicates and abstracts under 50 words. Depends only on the gold,
+    so every arm gets the same options.
+    """
     emb = np.load("data/processed/joint/node_embeddings.npy", mmap_mode="r")
     query = np.asarray(emb[node_ids])
     words = nodes["abstract"].fillna("").str.split().str.len().to_numpy()
@@ -274,8 +240,9 @@ def distractors(node_ids, nodes, references):
 
 
 def identify(nid, gen, gold, options, nodes, model):
-    """Options are shuffled with the node_id as seed, so the gold's position is fixed per paper
-    and the same in every arm."""
+    """Options are shuffled with the node_id as seed, so the gold's position is fixed per paper and the
+    same in every arm.
+    """
     ids = [nid] + options
     order = np.random.default_rng(nid).permutation(len(ids))
     letters = "ABCDE"
@@ -328,8 +295,9 @@ def rouge_bertscore(df):
 
 # --- no judge --------------------------------------------------------------------------------
 def tfidf_metrics(df, nodes, references):
-    """tfidf_rank as in identify.py; on-target margin with a vectoriser fitted on the golds and
-    every reference abstract, so both similarities are on one scale."""
+    """tfidf_rank as in identify.py; on-target margin with a vectoriser fitted on the golds and every
+    reference abstract, so both similarities are on one scale.
+    """
     gens = df["generated_abstract"].astype(str).tolist()
     golds = df["original_abstract"].astype(str).tolist()
     out = pd.DataFrame({"tfidf_rank": ranks(gens, golds)}, index=df.index)

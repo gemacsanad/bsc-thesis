@@ -1,17 +1,4 @@
-"""Judge scores of one configuration on the thesis scale (Ch. 6 §6.4).
-
-For every row of <run>/generations.csv, two calls to the judge (gpt-5.4-mini, temperature 0):
-  content — the unchanged evaluate_detailed.compare call: subfield, problem, task (0-3);
-            the call's other fields (claims, 1-10 coherence and language) are not kept;
-  quality — QUALITY_SYSTEM of experiments/2026-11-16_judge-repeat-test/run.py, imported so the
-            prompt is the one the repeat test measured: coherence, language (0-3).
-
-With --reuse-content, subfield/problem/task are taken from <run>/evaluated_result_detailed.csv
-(the same compare call, judge and temperature, run 2026-10-13) and only the quality call is made.
-
-Writes <run>/judge_scores.csv (node_id, subfield, problem, task, coherence, language).
-Resumable: rows already in the file are skipped; a failed call leaves the row out, so a rerun
-retries it. Progress is printed every 50 papers.
+"""Judge scores (0-3) of one configuration, written to <run_dir>/judge_scores.csv.
 
 Usage (from the repository root, so .env_local is found):
     python src/evaluation/judge_scores.py experiments/2026-10-09-14541449_run11-joint

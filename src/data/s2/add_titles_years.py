@@ -1,36 +1,8 @@
-"""
-Add `title` and `year` columns to papers_filtered.parquet (built by
-filter_ogbn_references.py) by re-reading the raw 'papers' shards
-(downloaded by download_shards.py) - build_dataset.py only ever kept
-`corpusid` and `externalids.MAG` from those shards, so title/year were
-dropped at that stage and never made it into papers.parquet /
-papers_filtered.parquet.
-
-Raw 'papers' shard schema (Semantic Scholar bulk Datasets API, one JSON
-object per line, gzip-compressed): unlike the Graph API's camelCase
-fields, the bulk dataset fields are lowercase, e.g. `corpusid`,
-`externalids` (with an upper-case `MAG` key inside), `title`, `year`.
-Confirmed via a live Graph API lookup (same underlying fields, camelCased
-there) plus the public Datasets API docs. This mirrors exactly the
-`corpusid` / `externalids.MAG` columns build_dataset.py already reads
-from these same shards.
-
-Pipeline:
-  1. mag_title_map <- DISTINCT corpusid, externalids.MAG (as mag_id),
-                       title, year FROM raw papers/*.jsonl.gz
-                       (only rows with a non-null MAG id)
-  2. mag_title_map deduped to one (title, year) per mag_id (ANY_VALUE -
-     a mag_id could in principle appear on more than one corpusid record)
-  3. papers_filtered LEFT JOIN mag_title_map ON mag_id -> adds title, year
-  4. Result overwrites papers_filtered.parquet (written to a .tmp file
-     first, then renamed into place, so a crash mid-write can't corrupt
-     the existing file)
+"""Add the title and year of every paper to papers_filtered.parquet, from the raw
+Semantic Scholar 'papers' shards.
 
 Usage:
-    python add_titles_years.py \
-        --raw-dir /path/to/data/raw/s2 \
-        --papers-filtered /path/to/data/processed/s2/papers_filtered.parquet \
-        --tmp-dir /path/to/duckdb_tmp
+    python add_titles_years.py --raw-dir <raw/s2> --papers-filtered <processed/s2/papers_filtered.parquet>
 """
 
 import argparse
