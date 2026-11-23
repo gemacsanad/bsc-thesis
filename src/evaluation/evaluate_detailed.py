@@ -4,8 +4,7 @@ evaluate_detailed.py
 evaluate_results_scores_only.py with its single llm_accuracy score split into separate metrics,
 so that what a model gets right can be read dimension by dimension. Everything else it reports
 is kept unchanged: ROUGE, BERTScore, llm_coherence, llm_language (same rubric text, now asked in
-the group-B call) and num_of_neighbors. Every metric is described,
-with its reasoning, in docs/detailed_evaluation.md.
+the group-B call) and num_of_neighbors.
 
 Four groups, from four kinds of judge call (one call per group per paper; the groups differ in
 what the judge is allowed to see, which is why they are separate):

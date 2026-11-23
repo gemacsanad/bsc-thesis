@@ -10,8 +10,7 @@
 #SBATCH --error=/project/c_gnn42/csanad_thesis/baseline/logs/run11_all_%j.err
 #SBATCH --mail-type=END,FAIL
 
-# RUN 11, EVERYTHING IN ONE JOB — one queue wait. Plan and reasoning:
-# docs/run9_embedding_decoder.md, section "Run 11".
+# RUN 11, EVERYTHING IN ONE JOB — one queue wait.
 #
 #   1. CPU verify scripts (seconds)
 #   2. phase 2, the GNN grid: {GATv2, GraphSAGE} x {1, 2 layers} x {cosine, cosine + InfoNCE},

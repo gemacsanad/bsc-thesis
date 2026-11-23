@@ -4,8 +4,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 
 # --- Which dataset ------------------------------------------------------------
-# DYTAG_DATASET=children runs the same pipeline on the CS-TAG Books-Children co-purchase graph
-# (src/data/children_books/): a book's description from its co-purchased books, instead of a
+# DYTAG_DATASET=children runs the same pipeline on the CS-TAG Books-Children co-purchase graph:
+# a book's description from its co-purchased books, instead of a
 # paper's abstract from its references. Every path below and the prompt in text.py follow it;
 # the scripts take `--sets children` with it and refuse any other combination (check_sets).
 DATASET = os.environ.get("DYTAG_DATASET", "papers")
@@ -22,15 +22,13 @@ CHECKPOINT_DIR = os.path.join(ROOT, "checkpoints")
 EXPERIMENTS_DIR = os.path.join(ROOT, "experiments")            # one directory per run
 ENV_FILE = os.path.join(ROOT, ".env")
 
-# The frozen LLM, everywhere: train.py, generate.py, and the three scripts that only need
-# its tokenizer to measure prompt lengths (text.py, prepare_data_capped.py,
-# verify_capped_prompts.py). It was written out in all five before.
+# The frozen LLM, everywhere: train.py, generate.py, and text.py, which only needs its
+# tokenizer to measure prompt lengths.
 #
 # Stage 7 (2026-09-03): was "lmsys/vicuna-7b-v1.5". The Vicuna runs are reproduced by checking
 # out the commit before this one — not by flipping this back, because the architecture
 # constants below move with it. Which references a prompt shows is *not* tokenizer-dependent
-# any more; that was frozen under the Vicuna tokenizer in data/frozen/prompt_refs_capped.json
-# and freeze_prompt_refs.py pins its own tokenizer rather than reading this.
+# any more; that was frozen under the Vicuna tokenizer in data/frozen/prompt_refs_capped.json.
 BASE_MODEL = "Qwen/Qwen3-14B"
 
 # --- Stage 1: eligible nodes and the frozen evaluation set -------------------
@@ -53,7 +51,7 @@ CAPPED_EVAL_PER_DEGREE = 10
 # Sampling depth is not a free parameter: a SAGEConv layer whose inputs come from an
 # unsampled hop aggregates incomplete neighbourhoods and fails silently, so the hop count
 # is derived from GNN_LAYERS rather than written down separately. -1 = take every neighbour
-# at that hop; measured sizes are in docs/adapter.md.
+# at that hop.
 PROMPT_MAX_REFS = 15        # ceiling on references shown in the prompt; the GNN still sees all
 # Tokens held back for the abstract, = generate.py's --max-new-tokens. Raised from 256 on
 # 2026-08-19: 317 of the 945 capped eval golds are longer than 256 tokens (median gold is 170
@@ -103,14 +101,14 @@ HEAD_DIM = 128              # read off config.head_dim, which Qwen3 states expli
 #   Qwen3,  T=32:  40 x 2 x  8 x 32 x 128 = 2,621,440   (identical)
 # What it cannot restore is addressability: 8 KV heads serve 40 query heads, so the prefix can
 # no longer say different things to different heads within a group. No workaround exists for a
-# GQA model — it is recorded as a limitation, not fixed. See docs/model_swap_qwen.md §3.
+# GQA model — it is recorded as a limitation, not fixed.
 # Costs 22 more of the 4,096 context tokens, and only in the adapter arm.
 NUM_PREFIX_TOKENS = 32
 # Stage 8 step 2 (2026-09-17): were 768 and 96, with one decoder shared by keys and values.
 # 1024 means nothing is compressed between the encoder output and the codes (768 kept 99.83% of
 # the variance of reference centroids, so this closes a question more than a measured loss);
 # 192 doubles the directions each (layer, role) can use. Adapter 12,494,672 -> 32,065,616
-# parameters. See docs/soft_prompt_only.md, step 2.
+# parameters.
 TRUNK_DIM = 1024
 CODE_DIM = 192
 BASE_INIT_STD = 0.02        # the base model's own initializer_range; 0.02 for both Llama-2
@@ -263,7 +261,7 @@ GATE_INIT_FRACTION = 0.2    # target ||gate*delta|| / ||base|| at initialisation
 # vectors has norm 0.5975 where isotropy would give ~0.006. Two thirds of the pooled reference
 # vector is one direction shared by every node, PrefixAdapter.trunk's LayerNorm normalises per
 # sample and cannot remove a between-node component, so the adapter received a near-constant
-# and greedy decoding emitted a near-constant. See docs/step8_representation_plan.md.
+# and greedy decoding emitted a near-constant.
 #
 # ZCA whitening of the *inputs* is the correction, measured on the 945 eval nodes by
 # pooled-reference retrieval: 64.34% raw -> 78.52% whitened. It is placed here, in the
@@ -271,7 +269,6 @@ GATE_INIT_FRACTION = 0.2    # target ||gate*delta|| / ||base|| at initialisation
 # the features — so the GNN, the neighbour tokens and the oracle are all treated identically
 # and the arms stay comparable.
 #
-# whiten_features.py writes the file and refuses to if it does not clear the retrieval gate.
 # Point NODE_EMBEDDINGS back at node_embeddings.npy to reproduce every run up to step 7.
 RAW_NODE_EMBEDDINGS = os.path.join(JOINT_DIR, "node_embeddings.npy")
 NODE_EMBEDDINGS = os.path.join(JOINT_DIR, "node_embeddings_whitened.npy")
@@ -333,7 +330,7 @@ CANARY_TOKENS = 48          # past the 8-word opening the collapse is measured o
 # Run 9 splits the task in two. The LLM side is trained to write a paper's abstract from that
 # paper's OWN (whitened) embedding, on every train-split core paper rather than 7,750 of them;
 # the graph side — estimating that embedding from the references — needs no LLM and is joined
-# only at evaluation. See docs/run9_embedding_decoder.md.
+# only at evaluation.
 #
 # The decoder will be handed an *estimate* at evaluation, so it is trained on corrupted
 # embeddings: each one is rotated to a cosine drawn uniformly from [ORACLE_MIN_COS, 1] with the
@@ -372,7 +369,7 @@ VAL_ID_MIN_LIFT = 10        # this many times chance (1 / VAL_ID_NODES)
 # adapter's input at once relative to step 4: whitened features, gate-init 0.2 and synthetic
 # noise. Run 10a returns to step 4's raw features and gate 0, and replaces the noise with the
 # real estimate: each training paper is fed its reference mean with probability REFS_MIX, its
-# own embedding otherwise. See docs/run9_embedding_decoder.md, "Run 10a".
+# own embedding otherwise.
 FEATURES = {"raw": RAW_NODE_EMBEDDINGS, "whitened": NODE_EMBEDDINGS}
 REFS_MIX = 0.5
 
@@ -381,7 +378,7 @@ REFS_MIX = 0.5
 # recipe; (2) GNNs imitating the paper's raw embedding (pretrain_encoder.py), one winner chosen
 # on validation cosine; (3) both fine-tuned together (train.py --reader). The 10a oracle arm
 # showed the reader is close to the text baseline given a perfect vector (judge 3.41 vs 3.59),
-# so the estimate is the bottleneck. See docs/run9_embedding_decoder.md, "Run 11".
+# so the estimate is the bottleneck.
 
 # Phase 3. The cosine term keeps the GNN estimate in the space the reader decodes while the LM
 # loss pulls on it; the GNN moves at a tenth of the reader's rate because it arrives trained.

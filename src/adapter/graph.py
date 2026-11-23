@@ -17,7 +17,7 @@ only from work it cites — never from papers citing it, which are published lat
 and would not exist at generation time.
 
 Hop 1 is then exactly the node's reference list, so the graph matches the 5-15
-out-degree filter in prepare_data.py rather than cutting across it.
+out-degree filter used to select the nodes rather than cutting across it.
 
 Sampling
 --------
@@ -51,9 +51,8 @@ from config import (FROZEN_DIR, GNN_LAYERS, JOINT_DIR, NODE_EMBEDDINGS,
 def load_graph(embeddings=None, edges=None):
     """Build the directed reference graph with voyage embeddings as node features.
 
-    Since run 8 the default is the ZCA-whitened features (config.NODE_EMBEDDINGS), written by
-    whiten_features.py. The raw voyage features are anisotropic enough that the adapter read
-    them as a constant — see docs/step8_representation_plan.md. Every arm loads through here,
+    Since run 8 the default is the ZCA-whitened features (config.NODE_EMBEDDINGS). The raw
+    voyage features are anisotropic enough that the adapter read them as a constant. Every arm loads through here,
     so the oracle, the GNN and the neighbour tokens all get the same treatment.
     """
     embeddings = embeddings or NODE_EMBEDDINGS
@@ -126,7 +125,7 @@ def centroid_distances(x):
     The torch twin of neighbour_cap.centroid_distances, which is numpy and runs on the CPU
     over frozen reference lists. This one runs per training step on whatever device the
     batch is on, so a round trip through numpy would cost a sync every step. The two must
-    agree; verify_neighbour_tokens.py is what holds them to it.
+    agree.
     """
     normed = F.normalize(x.float(), dim=1)
     centroid = F.normalize(normed.mean(0), dim=0)

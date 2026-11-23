@@ -1,8 +1,8 @@
 """
 evaluate_results_scores_only.py
 
-Same as evaluate_results.py, but the LLM judge returns only the numeric scores —
-no free-text reasoning, and no reason-categorisation stage.
+Scores generated abstracts with ROUGE, BERTScore and an LLM judge that returns only numeric
+scores, with no free-text reasoning.
 
 Metrics added per row:
   rouge1_f, rouge2_f, rougeL_f          — ROUGE F1 scores
@@ -17,8 +17,6 @@ Requires OPENAI_API_KEY in .env (or environment).
 
 Usage:
     python evaluate_results_scores_only.py [--input test_results.csv] [--output evaluated_results_scores_only.csv]
-    python evaluate_results_scores_only.py --dataset children --edges data/children_books/edges.csv \
-        --input experiments/<run>/generations.csv --output experiments/<run>/scored_scores_only.csv
 
 Install dependencies:
     pip install rouge-score bert-score openai python-dotenv pandas torch

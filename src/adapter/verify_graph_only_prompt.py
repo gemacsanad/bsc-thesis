@@ -1,7 +1,7 @@
 """
 Soft-prompt-only, step 0 — prove the prompt train.py and generate.py build is the one intended.
 
-Replaces verify_capped_prompts.py in both job scripts. With no references in the prompt there
+With no references in the prompt there
 is no frozen bibliography to check against; what is left to go wrong silently is:
 
   1. the chat wrapper — `apply_chat_template` derives it from tokenizer_config, so a tokenizer

@@ -6,14 +6,14 @@ Produces one CSV per condition, over the same nodes, with the same prompts, in t
     --mode baseline   frozen Qwen3-14B, nothing else                 -> generations.csv
     --mode adapter    GraphSAGE + prefix adapter + frozen Qwen3-14B  -> generations.csv
     --mode text       books only: frozen Qwen3-14B reading the co-purchased books as text,
-                      no prefix (text.book_text_example, frozen by freeze_book_refs.py)
+                      no prefix (text.book_text_example)
 
 Each mode writes into its own directory under experiments/; pass --output to name the run.
 
 Since the soft-prompt-only change (2026-09-16) the prompt carries no references, so
 `--mode baseline` receives no information about the paper at all: under greedy decoding it
 writes the same abstract for every node. It is a floor, not a control. The comparison arm for
-the graph-only adapter is the 2026-09-10 text-path Qwen baseline — see docs/soft_prompt_only.md.
+the graph-only adapter is the 2026-09-10 text-path Qwen baseline.
 
 The two runs differ in exactly one thing — whether a graph-conditioned KV prefix is present.
 Everything else is held fixed on purpose:
@@ -160,7 +160,7 @@ def load_adapter(path, device, sets, llm, oracle, embeddings):
         f"{path} was trained {'with' if was_oracle else 'without'} --oracle but generation "
         f"has --oracle {'set' if oracle else 'not set'}; the adapter would be fed a kind of "
         f"vector it was never trained on")
-    # Whitened and raw node features have identical shapes (run 8, whiten_features.py), so a
+    # Whitened and raw node features have identical shapes (run 8), so a
     # mismatch loads cleanly and runs a trained encoder on a distribution it has never seen.
     was_features = checkpoint.get("node_embeddings", "node_embeddings.npy")
     assert was_features == os.path.basename(embeddings), (

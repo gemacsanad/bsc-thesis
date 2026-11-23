@@ -5,7 +5,7 @@ Every train-split core paper, instead of the 7,750 sampled into training_sets_ca
 Those 7,750 were sampled to a context budget and an out-degree quota, both inherited from the
 text arm; the decoder reads one embedding, so neither applies. The step-4 oracle saw 7,750
 papers ten times each; run 9 sees ~90k papers about once, at roughly the same compute, so the
-run measures variety rather than more training. See docs/run9_embedding_decoder.md.
+run measures variety rather than more training.
 
 Removed, and counted:
   * the 945 eval and 806 validation seeds (none are train-split anyway; asserted, not assumed)

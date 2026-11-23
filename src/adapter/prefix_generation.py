@@ -132,7 +132,7 @@ def prefill_neighbours(llm, cache, neighbour_tokens):
     Splitting the pass at this boundary is exact, not an approximation: attention is causal,
     so a neighbour token's keys and values depend only on the KV prefix and the neighbour
     tokens at or before it — never on the prompt that follows. The two-pass cache is therefore
-    the one-pass cache. verify_neighbour_tokens.py holds that claim numerically.
+    the one-pass cache.
 
     -> the number of positions appended.
     """

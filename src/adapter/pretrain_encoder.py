@@ -38,8 +38,8 @@ an encoder that cannot match a plain mean is destroying signal, and that is the 
 
 Run 11: imitation on the raw features
 -------------------------------------
-Run 11 trains the GNN as phase 2 of a three-phase pipeline (docs/run9_embedding_decoder.md,
-"Run 11"): predict the paper's own RAW voyage embedding, which is what its reader was trained
+Run 11 trains the GNN as phase 2 of a three-phase pipeline:
+predict the paper's own RAW voyage embedding, which is what its reader was trained
 to decode. The main loss is cosine to that embedding (`--lambda-cos`), because the judge score
 tracks exactly that cosine (+0.6 judge per +0.1 on run 10a's refs-mean arm); InfoNCE becomes
 optional (`--lambda-nce`). Every run trains on papers with at least one reference and selects

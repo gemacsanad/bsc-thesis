@@ -14,7 +14,7 @@ Usage:
         --gate-init 0.2 --lambda-rank 1.0
     python adapter/train.py --lambda-rank 0 --gate-init 0   # the step-6 objective, for ablation
 
-    # run 9 — the embedding -> abstract decoder (docs/run9_embedding_decoder.md):
+    # run 9 — the embedding -> abstract decoder:
     python adapter/train.py --oracle --lora --sets run9 --oracle-noise 0.3 --epoch-size 15000 \
         --neighbour-tokens 0 --lambda-rank 0 --epochs 6
 
@@ -71,7 +71,7 @@ SETS = {
     "legacy": "training_sets.json",
     # Run 9: every train-split core paper (prepare_run9_sets.py), same 806 validation nodes.
     "run9": "training_sets_run9.json",
-    # DYTAG_DATASET=children: src/data/children_books/prepare_sets.py.
+    # DYTAG_DATASET=children.
     "children": "training_sets.json",
 }
 

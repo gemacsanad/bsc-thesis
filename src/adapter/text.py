@@ -21,18 +21,18 @@ from neighbour_cap import fit_refs
 # here. It used to be recomputed per call, which made the bibliography a function of the
 # *tokenizer*: Qwen3's BPE is more efficient on English than Vicuna's SentencePiece, so more
 # references would survive the same budget and the two models would silently read different
-# evidence. See docs/model_swap_qwen.md §5 step 2.
+# evidence.
 FROZEN_REFS = os.path.join(FROZEN_DIR, "prompt_refs_capped.json")
 
 # The freeze is defined by four things, all of which have to be pinned for it to stay
-# re-derivable: the Vicuna tokenizer (freeze_prompt_refs.FREEZE_TOKENIZER), the Vicuna chat
+# re-derivable: the Vicuna tokenizer, the Vicuna chat
 # wrapper (build_prompt_vicuna), GENERATION_RESERVE = 320, and this — the prefix width the
 # budget was computed against. NUM_PREFIX_TOKENS moved to 32 for Qwen3's GQA, and recomputing
 # with it drops a reference on some nodes (train node 32196: 14 -> 13). That does not make the
 # frozen lists wrong; it makes them *historical*, which is the point.
 #
 # The lists were therefore sized for a narrower prefix than the run now uses. That is safe but
-# not free, and it was checked rather than assumed: verify_capped_prompts.py over all 9,501
+# not free, and it was checked rather than assumed: a check over all 9,501
 # nodes gives a largest prompt of 3,627 against a 3,744 budget at T = 32 under Qwen's
 # tokenizer — 117 to spare, because the BPE saves more than the 22 extra prefix tokens cost.
 FREEZE_PREFIX_TOKENS = 10
@@ -59,8 +59,7 @@ def frozen_refs():
 # that pointed at a listed bibliography re-pointed at the context the prefix supplies.
 #
 # Everything below this block — SYSTEM, INSTRUCTION, build_prompt, capped_example — is the old
-# text path. train.py and generate.py no longer call it; it stays so freeze_prompt_refs.py,
-# prepare_data_capped.py and verify_capped_prompts.py still run. See docs/soft_prompt_only.md.
+# text path. train.py and generate.py no longer call it.
 PROMPT = "graph-only"       # recorded in every checkpoint; the text-path runs had no such key
 
 GRAPH_ONLY_SYSTEM = (
@@ -110,9 +109,9 @@ if DATASET == "children":
 
 # --- The books' text arm: the neighbours as text, no prefix -----------------------------------
 # The comparison arm for the books. Unlike the papers' 09-10 text baseline, whose era-1 wording
-# differed from the graph prompt (docs/soft_prompt_only.md measured that confound), this is the
+# differed from the graph prompt, this is the
 # graph prompt with "the context encodes" re-pointed at a listed block: the evidence is the only
-# difference. Which neighbours are listed is frozen in BOOK_TEXT_REFS (freeze_book_refs.py).
+# difference. Which neighbours are listed is frozen in BOOK_TEXT_REFS.
 BOOK_TEXT_SYSTEM = (
     "You are a children's book copywriter. "
     "The books listed below are the books customers bought together with one children's "
@@ -206,8 +205,7 @@ def build_prompt(tokenizer, neighbours):
     """The user message wrapped in the model's own chat template.
 
     Built through `apply_chat_template` rather than hand-rolled, so the delimiters come from
-    the tokenizer that will read them. verify_capped_prompts.py freezes the resulting string,
-    so a tokenizer update cannot move it silently.
+    the tokenizer that will read them.
 
     `enable_thinking=False` is mandatory. Qwen3 is a hybrid thinking model, and a `<think>`
     block would poison both the training targets and the generations. Note it does not remove
@@ -224,7 +222,7 @@ def build_prompt_vicuna(neighbours):
     """The Vicuna wrapper, kept because the frozen reference lists were computed under it.
 
     Not used by training or generation any more. `capped_example(frozen=False)` builds with
-    this, so freeze_prompt_refs.py can still re-derive data/frozen/prompt_refs_capped.json
+    this, so data/frozen/prompt_refs_capped.json can still be re-derived
     byte for byte — the freeze is defined by the Vicuna tokenizer *and* the Vicuna format,
     and a script that cannot reproduce its own output is not much of a freeze.
     """
@@ -358,8 +356,7 @@ class Corpus:
 def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     """-> (prompt, target, kept_refs) for one node, trimmed to fit the context.
 
-    The single capped-prompt path: prepare_data_capped.py freezes node sets with it,
-    train.py builds training prompts with it, and generate.py builds eval prompts with
+    The single capped-prompt path: train.py builds training prompts with it, and generate.py builds eval prompts with
     it. They must agree exactly — a node was selected on the assumption that these
     references are the ones shown, and the failure mode of a mismatched budget is silent
     (a fluent abstract written from the wrong sources, not an error).
@@ -370,8 +367,8 @@ def capped_example(tokenizer, corpus, embeddings, node_id, frozen=True):
     fluent abstract. `tokenizer` and `embeddings` go unused on this path, and stay in the
     signature because every caller has both and the two paths must remain interchangeable.
 
-    `frozen=False` is the original computation, and is how FROZEN_REFS itself is built
-    (freeze_prompt_refs.py). The budget leaves room for the prefix and for the abstract: the
+    `frozen=False` is the original computation, and is how FROZEN_REFS itself is built.
+    The budget leaves room for the prefix and for the abstract: the
     node's own abstract when it is longer than GENERATION_RESERVE, so the training sequence
     is complete, and never less than GENERATION_RESERVE, so generation has somewhere to write.
 
